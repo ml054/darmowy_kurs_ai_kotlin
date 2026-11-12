@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.5 Timeouty, retry, fallback – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="1.5">
+<main>
+<p class="meta">Lekcja 1.5 · ok. 60 min</p>
+<h1>Timeouty, retry, limity dostawców, fallback</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Rozpoznawać awarie API modeli, także „ciche”, i wiedzieć, które ponawiać.</li>
+  <li>Wyliczyć timeout z <code>max_tokens</code> i rozpisać budżet czasu na warstwy.</li>
+  <li>Ustawić retry i fallback w jednej warstwie (LiteLLM) i wyłączyć je w Spring AI.</li>
+  <li>Chronić aplikację circuit breakerem, bulkheadem i limitami na użytkownika i tenanta.</li>
+  <li>Zaprojektować degradację, przetestować awarie i wiedzieć, co monitorować.</li>
+</ul></div>
+
+<h2>Zależność, która zawodzi inaczej niż baza</h2>
+<p>Postgres odpowiada w milisekundach i albo działa, albo nie. <dfn data-t="llm">LLM</dfn> wywoływany przez API odpowiada w sekundach, ma twarde limity przepustowości, bywa przeciążony w godzinach szczytu, a czasem zwraca kod 200 z treścią, której nie da się użyć. Do tego płacisz za każde wywołanie, także nieudane.</p>
+<p>Żądanie przechodzi drogę React → Spring Boot → <dfn data-t="proxy">proxy LiteLLM</dfn> (lekcja 1.3, <dfn data-t="alias">aliasy</dfn> <code>helpdesk-default</code>, <code>helpdesk-fast</code>, <code>helpdesk-default-backup</code>, <code>helpdesk-local</code>) → dostawca. Zasada przewodnia: <strong>każda warstwa ma jedno zadanie</strong>. Proxy ponawia i przełącza dostawców. Backend pilnuje budżetu czasu, chroni się przed przeciążeniem i degraduje funkcję. Frontend informuje użytkownika i pozwala mu zdecydować o ponowieniu. Gdy wszystkie warstwy robią wszystko, system przy pierwszej awarii dostawcy sam siebie dobija.</p>
+
+<h2>Taksonomia awarii API modeli</h2>
+<p><dfn data-t="rate-limit">Rate limit</dfn> to limit zużycia narzucony przez dostawcę na konto lub klucz. Ma dwie główne odmiany: <strong>RPM</strong> (żądania na minutę) i <strong>TPM</strong> (<dfn data-t="token">tokeny</dfn>, czyli fragmenty tekstu, na minutę). Część dostawców liczy osobno tokeny wejścia i wyjścia (u Anthropic ITPM i OTPM), część dodaje limity dzienne lub limit równoczesnych żądań.</p>
+<p>Przykład: konto ma 200 000 TPM. Pytanie do asystenta z narzędziami to dwie iteracje po ok. 6 000 tokenów wejścia plus kilkaset wyjścia, razem ok. 13 000. Limit wystarcza na ok. 15 pytań na minutę. O 9:00, gdy 30 agentów prosi o streszczenia, dostawca odpowiada 429, choć RPM jest daleko od limitu.</p>
+<div class="box warn"><span class="label">Pułapka: max_tokens a TPM</span><p>Niektórzy dostawcy rezerwują TPM z góry jako wejście plus <dfn data-t="max-tokens"><code>max_tokens</code></dfn> (górny limit długości odpowiedzi). <code>max_tokens: 4000</code> „na wszelki wypadek” zjada wtedy limit, nawet gdy odpowiedzi mają 200 tokenów. Sprawdź, jak liczy Twój dostawca.</p></div>
+<table>
+  <tr><th>Objaw</th><th>Przyczyna</th><th>Ponawiać?</th></tr>
+  <tr><td>429</td><td>RPM/TPM dostawcy, limit klucza w LiteLLM, wszystkie wdrożenia w cooldownie</td><td>Tak, z backoffem, respektując <code>Retry-After</code></td></tr>
+  <tr><td>429 <code>insufficient_quota</code> / budżet</td><td>Brak środków lub budżet klucza</td><td>Nie; alarm, degradacja</td></tr>
+  <tr><td>500, 502, 503, 504</td><td>Awaria dostawcy lub bramki</td><td>Tak, 1–2 razy, potem fallback</td></tr>
+  <tr><td>529 <code>overloaded_error</code></td><td>Przeciążenie (np. Anthropic)</td><td>Tak, dłuższy backoff; fallback, bo trwa minuty</td></tr>
+  <tr><td>Connect timeout / refused</td><td>Żądanie nie zostało wysłane</td><td>Tak, tanio</td></tr>
+  <tr><td>Read timeout</td><td>Długa generacja, zawieszone połączenie</td><td>Ostrożnie: tokeny mogły już zostać naliczone</td></tr>
+  <tr><td>400 za długi kontekst</td><td>Prompt i <code>max_tokens</code> przekraczają <dfn data-t="context">okno kontekstu</dfn> (limit tokenów na wywołanie)</td><td>Nie; przytnij historię (2.5) lub większy model</td></tr>
+  <tr><td>400 zły format</td><td>Błędny schemat narzędzia, zły parametr</td><td>Nie; to błąd w kodzie</td></tr>
+  <tr><td>400 filtr treści</td><td>Filtr dostawcy (np. Azure OpenAI)</td><td>Nie na tym modelu</td></tr>
+  <tr><td>401, 403, 404</td><td>Klucz odwołany, brak dostępu, literówka w aliasie, model wycofany</td><td>Nie; alarm natychmiast</td></tr>
+  <tr><td>Błąd w trakcie <dfn data-t="streaming">streamingu</dfn></td><td>Zerwane połączenie, zdarzenie <code>error</code> przy statusie 200</td><td>Nie przezroczyście</td></tr>
+  <tr><td>200, pusta lub ucięta</td><td><code>max_tokens</code>, filtr, odmowa modelu</td><td>Zależy: sprawdzaj <code>finish_reason</code></td></tr>
+</table>
+<p>Kod HTTP nie zawsze wystarcza: 429 znaczy „poczekaj sekundę” albo „skończyły się pieniądze”, więc czytaj też typ błędu z treści (LiteLLM tłumaczy błędy na format OpenAI i własne typy, np. <code>ContextWindowExceededError</code>). 429 pochodzi też z trzech miejsc: od dostawcy, z limitu klucza w LiteLLM (<code>rpm_limit</code> z 1.3) albo z limitera aplikacji. W metrykach te źródła muszą być rozróżnialne.</p>
+
+<h2>„Ciche” awarie: finish_reason i puste odpowiedzi</h2>
+<p>Najbardziej zdradliwe awarie kończą się statusem 200. Każda odpowiedź ma <dfn data-t="finish-reason"><code>finish_reason</code></dfn>, czyli powód zakończenia generowania: <code>stop</code> (normalnie), <code>tool_calls</code> (model prosi o narzędzie, <dfn data-t="tool-calling">tool calling</dfn> z modułu 2), <code>length</code> (ucięcie na <code>max_tokens</code> w pół zdania) i <code>content_filter</code> (blokada filtra). LiteLLM mapuje na nie natywne wartości innych dostawców (np. <code>stop_reason</code> Anthropic); mapowanie rzadkich przypadków sprawdź testem. Do tego dochodzą odpowiedzi puste, które przy dziesiątkach tysięcy wywołań dziennie zdarzą się na pewno.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/ResponseInspector.kt">
+  sealed interface Inspected {
+      data class Ok(val text: String) : Inspected
+      data class Truncated(val text: String) : Inspected
+      data object Filtered : Inspected
+      data object Empty : Inspected
+  }
+
+  object ResponseInspector {
+      fun inspect(response: ChatResponse?): Inspected {
+          val gen = response?.result ?: return Inspected.Empty
+          val finish = gen.metadata.finishReason?.lowercase()   // Spring AI dla OpenAI: "STOP", "LENGTH"…
+          val text = gen.output.text.orEmpty()
+          return when {
+              finish == "length" -> Inspected.Truncated(text)
+              finish == "content_filter" -> Inspected.Filtered
+              text.isBlank() && !gen.output.hasToolCalls() -> Inspected.Empty
+              else -> Inspected.Ok(text)
+          }
+      }
+  }
+</script>
+<p>Pustą odpowiedź warto ponowić raz, bo to zwykle przypadek losowy. Ucięta tekstowa idzie do użytkownika z dopiskiem „odpowiedź skrócona”, a ucięty JSON jest błędem, bo nie da się go sparsować. Ponowienie z tym samym <code>max_tokens</code> nic nie da: częste ucięcia oznaczają zbyt rozwlekły prompt albo za niski limit.</p>
+<div class="box bug"><span class="label">Błąd produkcyjny</span><p>Po zmianie promptu triage uzasadnienia urosły i 3% odpowiedzi kończyło się <code>length</code>. Parser JSON rzucał wyjątek, kod ustawiał kategorię „inne”. Żadne żądanie nie zwróciło błędu HTTP, więc nikt nie zauważył przez dwa tygodnie. Obrona: sprawdzenie <code>finish_reason</code> przed parsowaniem i metryka ucięć z alertem.</p></div>
+
+<h2>Model opóźnienia: TTFT i generowanie</h2>
+<p>Czas odpowiedzi to <dfn data-t="ttft">TTFT</dfn> (czas do pierwszego tokenu: sieć, kolejka u dostawcy, przetworzenie całego wejścia; rośnie z długością promptu) plus generowanie tokenów wyjściowych, jeden po drugim, z prędkością od kilkudziesięciu do ponad stu tokenów na sekundę. Wzór: <code>czas ≈ TTFT + tokeny_wyjścia / prędkość</code>. Wartości ilustracyjne dla <code>helpdesk-default</code> (własne zmierzysz w 2.6):</p>
+<table>
+  <tr><th>Scenariusz</th><th>TTFT</th><th>Tokeny wyjścia</th><th>Prędkość</th><th>Czas</th></tr>
+  <tr><td>Typowa odpowiedź</td><td>0,8 s</td><td>250</td><td>80 tok/s</td><td>ok. 4 s</td></tr>
+  <tr><td>Najgorszy realny (p99)</td><td>2,5 s</td><td>800 (= <code>max_tokens</code>)</td><td>40 tok/s</td><td>22,5 s</td></tr>
+  <tr><td>p99 przy <code>max_tokens: 4000</code></td><td>2,5 s</td><td>4000</td><td>40 tok/s</td><td>102,5 s</td></tr>
+</table>
+<p>Wniosek: <strong>timeout wynika z <code>max_tokens</code></strong>, więc te wartości ustawiasz razem. Dla 800 tokenów sensowny limit jednej próby to ok. 25 s. Przy 10 s zrywasz poprawne długie odpowiedzi, za które i tak płacisz. Zwiększenie <code>max_tokens</code> bez zmiany timeoutu da timeouty przy każdej dłuższej odpowiedzi. Polski tekst zużywa więcej tokenów niż angielski, więc mierz na odpowiedziach po polsku. W praktyce trzymasz pary per funkcja: klasyfikacja (100 tokenów, 8 s), czat (800, 25 s), streszczenie długiego wątku (1500, 45 s).</p>
+
+<h2>Budżet czasu: frontend &gt; backend &gt; proxy</h2>
+<p>Timeouty warstw tworzą <dfn data-t="time-budget">budżet czasu</dfn>: łączny limit na żądanie, z którego warstwy wewnętrzne dostają coraz mniejsze części. Zasada: <strong>timeout warstwy zewnętrznej jest dłuższy niż suma wszystkich prób warstwy wewnętrznej</strong>. Inaczej frontend zrezygnuje, a backend i proxy nadal będą ponawiać i płacić za odpowiedź, której nikt nie odbierze.</p>
+<table>
+  <tr><th>Warstwa</th><th>Limit (czat bez streamingu)</th><th>Uzasadnienie</th></tr>
+  <tr><td>Frontend (<code>fetch</code>)</td><td>60 s</td><td>Dłużej użytkownik nie czeka</td></tr>
+  <tr><td>Backend → LiteLLM</td><td>55 s</td><td>Backend zdąży zwrócić czytelny błąd zamiast zerwanego połączenia</td></tr>
+  <tr><td>LiteLLM: jedna próba</td><td>25 s</td><td>Z <code>max_tokens: 800</code></td></tr>
+  <tr><td>LiteLLM: łącznie</td><td>2 × 25 s + backoff ≈ 52 s</td><td>Próba na modelu głównym i jedna na zapasowym</td></tr>
+</table>
+<p>Z tabeli wynika nieoczywista decyzja: <strong>w ścieżce interaktywnej nie ponawiamy timeoutów na tym samym modelu</strong>, bo druga próba po 25 s przekracza budżet. Ponawiamy błędy przychodzące szybko (429, 503, 529, connection refused), a timeout kończy się od razu fallbackiem. Zadania w tle mają budżet znacznie większy.</p>
+<p>Rodzaje timeoutów: <strong>connect</strong> (nawiązanie połączenia, 2–3 s), <strong>read</strong> (oczekiwanie na dane; bez streamingu LiteLLM wysyła odpowiedź dopiero po wygenerowaniu całości, więc działa jak limit całego wywołania), <strong>całkowity</strong> i <strong>bezczynności</strong> (maksymalna przerwa między porcjami danych). Przy streamingu potrzebujesz trzech: na pierwszy token (10 s), na bezczynność (15 s) i całkowitego (90 s). Pojedynczy „read timeout 30 s” albo zerwie długą, poprawnie płynącą odpowiedź, albo pozwoli wisieć zawieszonemu strumieniowi.</p>
+
+<h2>Timeouty i błędy HTTP w Spring AI</h2>
+<p>Spring AI wysyła zwykłe wywołania przez <code>RestClient</code>, a streaming przez reaktywny <code>WebClient</code>, biorąc buildery z kontekstu. Globalny <code>RestClientCustomizer</code> (albo właściwości <code>spring.http.client.*</code> w nowszych Spring Boot) działa na <em>każdy</em> <code>RestClient.Builder</code>: integracja płatności, która powinna mieć 5 s, dostaje nagle 55 s. Lepszy jest dedykowany klient dla LLM:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/LlmClientConfig.kt">
+  @ConfigurationProperties("helpdesk.ai.http")
+  data class LlmHttpProperties(
+      val connectTimeout: Duration = Duration.ofSeconds(3),
+      val readTimeout: Duration = Duration.ofSeconds(55),
+      val streamIdleTimeout: Duration = Duration.ofSeconds(15),
+  )
+
+  @Configuration
+  @EnableConfigurationProperties(LlmHttpProperties::class)
+  class LlmClientConfig {
+      @Bean
+      fun llmOpenAiApi(p: LlmHttpProperties, errors: LlmResponseErrorHandler,
+                       @Value("\${spring.ai.openai.base-url}") baseUrl: String,
+                       @Value("\${spring.ai.openai.api-key}") apiKey: String): OpenAiApi {
+          val jdk = HttpClient.newBuilder().connectTimeout(p.connectTimeout)
+              .version(HttpClient.Version.HTTP_1_1).build()      // bez próby h2c na http://
+          val netty = reactor.netty.http.client.HttpClient.create()
+              .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, p.connectTimeout.toMillis().toInt())
+              .responseTimeout(p.streamIdleTimeout)            // Reactor Netty: maks. przerwa między odczytami
+          return OpenAiApi.builder().baseUrl(baseUrl).apiKey(apiKey)
+              .restClientBuilder(RestClient.builder()
+                  .requestFactory(JdkClientHttpRequestFactory(jdk).apply { setReadTimeout(p.readTimeout) }))
+              .webClientBuilder(WebClient.builder().clientConnector(ReactorClientHttpConnector(netty)))
+              .responseErrorHandler(errors)
+              .build()
+      }
+
+      @Bean
+      fun openAiChatModel(api: OpenAiApi, observations: ObservationRegistry): OpenAiChatModel =
+          OpenAiChatModel.builder().openAiApi(api)
+              .defaultOptions(OpenAiChatOptions.builder().model("helpdesk-default").maxTokens(800).build())
+              .retryTemplate(RetryTemplate.builder().maxAttempts(1).build())   // retry robi proxy
+              .observationRegistry(observations)                               // nie gub tracingu z 1.4
+              .build()
+  }
+</script>
+<p>Własny bean <code>OpenAiChatModel</code> zastępuje autokonfigurację (porównaj ją ze swoją wersją Spring AI, żeby nie zgubić obserwacji ani narzędzi; nazwy metod builderów zmieniały się w 1.x). <code>responseTimeout</code> w Reactor Netty to mimo nazwy maksymalna przerwa między odczytami, czyli timeout bezczynności strumienia.</p>
+<p>Domyślnie Spring AI zamienia błędy na <code>TransientAiException</code> (5xx) i <code>NonTransientAiException</code> (4xx), więc 429 ląduje razem z 400 i 401, a <code>Retry-After</code> przepada. Własny handler daje typy, na które da się sensownie reagować:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/LlmResponseErrorHandler.kt">
+  import pl.example.helpdesk.assistant.LlmBadRequestException.Reason
+
+  sealed class LlmException(msg: String) : RuntimeException(msg)
+  class LlmRateLimitedException(val retryAfter: Duration?) : LlmException("Limit dostawcy")
+  class LlmUnavailableException(status: Int) : LlmException("LLM niedostępny: $status")
+  class LlmAuthException(status: Int) : LlmException("Uwierzytelnienie LLM: $status")
+  class LlmBadRequestException(val reason: Reason) : LlmException("Błędne żądanie: $reason") {
+      enum class Reason { CONTEXT_TOO_LONG, CONTENT_FILTER, BUDGET_EXCEEDED, OTHER }
+  }
+
+  @Component
+  class LlmResponseErrorHandler : ResponseErrorHandler {
+      override fun hasError(response: ClientHttpResponse) = response.statusCode.isError
+
+      // Spring 6.2+; w 6.1 nadpisz handleError(response)
+      override fun handleError(url: URI, method: HttpMethod, response: ClientHttpResponse) {
+          val status = response.statusCode.value()
+          val body = response.body.readNBytes(4096).toString(Charsets.UTF_8)
+          throw when {
+              status == 429 && "budget" in body.lowercase() -> LlmBadRequestException(Reason.BUDGET_EXCEEDED)
+              status == 429 -> LlmRateLimitedException(response.headers.getFirst("Retry-After")?.toLongOrNull()?.let(Duration::ofSeconds))
+              status == 401 || status == 403 -> LlmAuthException(status)
+              status >= 500 -> LlmUnavailableException(status)
+              "ContextWindowExceeded" in body -> LlmBadRequestException(Reason.CONTEXT_TOO_LONG)
+              "ContentPolicy" in body || "content_filter" in body -> LlmBadRequestException(Reason.CONTENT_FILTER)
+              else -> LlmBadRequestException(Reason.OTHER)
+          }
+      }
+  }
+</script>
+<p>Klasyfikacja po treści jest krucha, dlatego test z WireMock (dalej) sprawdza ją na odpowiedziach skopiowanych z Twojego LiteLLM. Handler dotyczy tylko <code>RestClient</code>; błędy streamingu przychodzą jako <code>WebClientResponseException</code> albo jako zdarzenie w strumieniu.</p>
+
+<h2>Retry: backoff, jitter i Retry-After</h2>
+<p>Przeciążony dostawca nie wyzdrowieje w 10 ms, więc ponawiasz z odstępem. Standardem jest <dfn data-t="backoff">exponential backoff z jitterem</dfn>: odstęp rośnie wykładniczo z każdą próbą, a jitter (losowy rozrzut) sprawia, że klienci nie wracają w tej samej chwili. Wariant „full jitter”:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="wzór">
+  opóźnienie(n) = losowo(0, min(cap, base × 2^n))         base = 0,5 s, cap = 8 s
+
+  n = 0 → 0–0,5 s    n = 1 → 0–1 s    n = 2 → 0–2 s    n = 3 → 0–4 s    n ≥ 4 → 0–8 s
+</script>
+<p>Bez jittera 500 żądań odrzuconych o 9:00:00 wróci razem o 9:00:01, potem o 9:00:03, za każdym razem tworząc falę, która znowu przekroczy limit. Z jitterem rozkładają się równomiernie i dostawca obsługuje je po kolei.</p>
+<p>Gdy odpowiedź ma nagłówek <code>Retry-After</code>, dostawca mówi wprost, kiedy wrócić, i to on ma pierwszeństwo przed wzorem. Jeśli jest dłuższy niż pozostały budżet czasu, nie czekasz wcale: od razu fallback albo błąd. LiteLLM według dokumentacji honoruje <code>Retry-After</code> (z górnym limitem), a gdy w grupie są inne zdrowe wdrożenia, przełącza się na nie bez czekania. W aplikacji backoff przyda się w zadaniach w tle (moduł 5): przy przeciążeniu nie usypiają wątku, tylko planują się ponownie na <code>teraz + opóźnienie(liczba_prób)</code>.</p>
+
+<h2>Retry w jednej warstwie</h2>
+<p>Spring AI ma własny retry, LiteLLM ma retry, ktoś dopisał pętlę w serwisie, a TanStack Query na froncie domyślnie ponawia zapytania (dla AI ustaw tam <code>retry: false</code>). Trzy warstwy po trzy próby to 3 × 3 × 3 = 27 wywołań modelu na jedno kliknięcie, kilka minut czekania i opłata za każde. Domyślne <code>spring.ai.retry.*</code> są zaprojektowane pod przetwarzanie wsadowe: <code>max-attempts</code> 10, <code>backoff.initial-interval</code> 2 s, <code>multiplier</code> 5, <code>max-interval</code> 3 min; do tego <code>on-client-errors</code> (czy ponawiać 4xx, domyślnie nie) oraz listy <code>on-http-codes</code> i <code>exclude-on-http-codes</code>. Najgorszy przypadek przy 503: 2 + 10 + 50 + 180 × 6 = 1142 s, czyli ok. 19 minut samego czekania, a każda próba trafia do LiteLLM, które samo ponawia. W ścieżce interaktywnej wyłączasz więc retry Spring AI:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  spring:
+    ai:
+      retry:
+        max-attempts: 1          # jedna próba = brak ponowień; retry i fallback robi LiteLLM
+        on-client-errors: false
+</script>
+<p>Spring AI 1.x korzysta tu ze Spring Retry; przyszłe wersje mogą przejść na retry ze Spring Framework z inną semantyką, więc po aktualizacji sprawdź tę właściwość. Sprawdź też, czy retry w Twojej wersji obejmuje streaming (zwykle nie).</p>
+<div class="box tip"><span class="label">Zasada jednej warstwy i jej jedyny wyjątek</span><p>Retry i fallback robi proxy, bo zna wszystkich dostawców i ich stan. Aplikacja nie ponawia wywołań modelu, poza jednym przypadkiem: błąd <em>nawiązania połączenia</em> z proxy. Żądanie nigdzie nie dotarło, więc jedna szybka próba na drugi egzemplarz LiteLLM jest bezpieczna i darmowa. Frontend ponawia tylko na prośbę użytkownika.</p></div>
+<p><strong><dfn data-t="retry-storm">Burza ponowień</dfn></strong> to sytuacja, w której ponowienia stają się głównym źródłem ruchu: dostawca odrzuca 30% żądań, każde wraca trzy razy, ruch rośnie do ok. 190% i spirala się nakręca. Obrona: jitter, małe limity prób, cooldown w LiteLLM, <dfn data-t="circuit-breaker">circuit breaker</dfn>, ograniczenie współbieżności, a w dużych systemach budżet ponowień (np. najwyżej 10% ruchu).</p>
+<p><strong>Ponowienia kosztują.</strong> 429 zwykle nic nie kosztuje, ale timeout po 25 s generowania tak: tokeny zostaną naliczone, a każda próba od nowa przetwarza całe wejście. Przy cenach ilustracyjnych 3 USD za milion tokenów wejścia i 15 USD za milion wyjścia (sprawdź aktualny cennik) pytanie z kontekstem 20 000 i odpowiedzią 800 tokenów kosztuje 0,072 USD, a trzy próby zakończone timeoutem ok. 0,22 USD bez żadnej odpowiedzi. Fallback na innego dostawcę traci przy tym <dfn data-t="prompt-caching">prompt caching</dfn> (tańsze przetwarzanie powtarzalnego początku promptu), bo cache jest u każdego dostawcy osobny.</p>
+<p><strong>Kiedy retry jest niebezpieczne.</strong> Samo wywołanie modelu nie ma skutków ubocznych. Ale w module 3 asystent dostanie narzędzia zapisu. Jeśli ponowisz całą turę rozmowy (albo frontend ponowi całe żądanie HTTP) po tym, jak narzędzie już dodało komentarz, komentarz pojawi się dwa razy. Ponawiamy więc tylko pojedyncze wywołania modelu, nigdy sekwencji z akcjami, a narzędzia zapisu dostaną klucze <dfn data-t="idempotency">idempotencji</dfn> (powtórzona operacja daje ten sam efekt co jednokrotna), o czym w lekcji 3.5.</p>
+
+<h2>LiteLLM router: retry, cooldown, fallbacki</h2>
+<p>Router LiteLLM wybiera dla aliasu konkretne wdrożenie (model u konkretnego dostawcy z kluczem), a w razie błędu ponawia i przełącza. Według dokumentacji najpierw wyczerpuje ponowienia w grupie wdrożeń o tym samym <code>model_name</code>, a potem przechodzi do fallbacków.</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml">
+  model_list:
+    - model_name: helpdesk-default                    # pula: ten sam model u dwóch dostawców chmurowych
+      litellm_params:
+        model: anthropic/claude-sonnet-4-5            # przykładowe nazwy – zmieniają się
+        api_key: os.environ/ANTHROPIC_API_KEY
+        timeout: 25                                   # sekundy na jedną próbę
+        stream_timeout: 10
+    - model_name: helpdesk-default
+      litellm_params:
+        model: bedrock/anthropic.claude-sonnet-4-5
+        aws_region_name: eu-central-1
+        timeout: 25
+        stream_timeout: 10
+    - model_name: helpdesk-default-backup             # inny dostawca, inny model
+      litellm_params: { model: openai/gpt-4.1, api_key: os.environ/OPENAI_API_KEY, timeout: 25 }
+    - model_name: helpdesk-local                      # Globex: dane nie opuszczają firmy
+      litellm_params: { model: ollama_chat/qwen2.5:14b, api_base: "http://ollama:11434", timeout: 40 }
+
+  litellm_settings:
+    num_retries: 2
+    request_timeout: 30
+    fallbacks:
+      - helpdesk-default: ["helpdesk-default-backup"]
+    content_policy_fallbacks:
+      - helpdesk-fast: ["helpdesk-default"]
+    # default_fallbacks: CELOWO nieustawione – objęłoby też helpdesk-local
+
+  router_settings:
+    allowed_fails: 3            # po 3 błędach w oknie cooldown_time…
+    cooldown_time: 30           # …wdrożenie wypada z ruchu na 30 s
+    retry_policy:
+      RateLimitErrorRetries: 2
+      InternalServerErrorRetries: 1
+      TimeoutErrorRetries: 0    # timeout → od razu fallback (budżet czasu)
+      BadRequestErrorRetries: 0
+      AuthenticationErrorRetries: 0
+      ContentPolicyViolationErrorRetries: 0
+    context_window_fallbacks:
+      - helpdesk-fast: ["helpdesk-default"]
+    enable_pre_call_checks: true
+</script>
+<ul>
+  <li><strong><code>num_retries</code></strong> (domyślnie 2): ponowienia w grupie; mogą trafić na inne wdrożenie, co ratuje przy awarii regionu.</li>
+  <li><strong><code>retry_policy</code></strong>: nadpisuje <code>num_retries</code> per typ błędu, realizując tabelę „co ponawiać”. Nazwy pól sprawdź w dokumentacji swojej wersji.</li>
+  <li><strong><code>timeout</code>, <code>stream_timeout</code></strong>: limit jednej próby wdrożenia, zgodny z <code>max_tokens</code>.</li>
+  <li><strong><code>allowed_fails</code>, <code>cooldown_time</code></strong>: prosty breaker per wdrożenie. Domyślny cooldown to tylko 5 s. Gdy wszystkie wdrożenia grupy są w cooldownie, router od razu zwraca 429 bez wołania dostawcy.</li>
+  <li><strong><code>fallbacks</code></strong>: grupy zapasowe po wyczerpaniu ponowień (5xx, timeout, 429).</li>
+  <li><strong><code>context_window_fallbacks</code></strong>: osobna ścieżka dla za długiego kontekstu; przełącza tylko wtedy, gdy ma to sens. <code>enable_pre_call_checks</code> pomija wdrożenia z za małym oknem już przed wywołaniem.</li>
+  <li><strong><code>content_policy_fallbacks</code></strong>: przełączenie po blokadzie filtra treści. Wysłanie zablokowanej treści do dostawcy z łagodniejszym filtrem to decyzja biznesowa i prawna (filtry blokują też zwykłe ostre skargi), więc ją zapisz i przeglądaj przykłady.</li>
+</ul>
+<p>Podział kluczy między <code>litellm_settings</code> i <code>router_settings</code> odpowiada przykładom z dokumentacji; nowsze wersje akceptują część kluczy w obu sekcjach, więc po zmianie sprawdź w logach startowych proxy, że ustawienia zostały wczytane.</p>
+
+<h2>Fallback: kiedy pomaga, kiedy szkodzi</h2>
+<p><dfn data-t="fallback">Fallback</dfn> to automatyczne przełączenie na zapasowy model lub dostawcę. Ma dwa zasadniczo różne rodzaje:</p>
+<table>
+  <tr><th></th><th>Ten sam model, inny region/konto</th><th>Inny dostawca lub model</th></tr>
+  <tr><td>Zachowanie</td><td>Identyczne</td><td>Inny styl, długość, użycie narzędzi, odporność na prompt injection</td></tr>
+  <tr><td>Koszt</td><td>Zwykle ten sam</td><td>Inny cennik, zimny prompt cache</td></tr>
+  <tr><td>Chroni przed</td><td>Awarią regionu, limitem konta</td><td>Awarią całego dostawcy</td></tr>
+  <tr><td>Dane i RODO</td><td>Sprawdź, czy region jest w UE</td><td>Nowy podmiot przetwarzający: umowa, zgoda klienta</td></tr>
+</table>
+<p>Na Azure naturalną pierwszą linią jest ten sam model Azure OpenAI w dwóch regionach UE (np. Sweden Central i France Central) jako jedna pula: odporność bez zmiany zachowania. Inny dostawca jest drugą linią.</p>
+<div class="box bug"><span class="label">Pułapka: fallback a zgoda tenanta</span><p>Globex nie zgodził się na zewnętrznych dostawców (<code>tenants.external_llm_allowed = false</code>), więc jego żądania idą do <code>helpdesk-local</code> (1.6). Jeśli ktoś ustawi <code>default_fallbacks</code> albo fallback z <code>helpdesk-local</code> na <code>helpdesk-default</code>, awaria Ollamy po cichu wyśle zgłoszenia Globex na zewnątrz. Obrona: brak fallbacków poza sieć firmy dla aliasów lokalnych, test konfiguracji w CI i osobny klucz wirtualny dla ruchu lokalnego. Nie zakładaj bez sprawdzenia, że lista dozwolonych modeli klucza zablokuje fallback.</p></div>
+<p>Model zapasowy obsługuje ruch rzadko, ale zawsze w najgorszym momencie, więc <dfn data-t="eval">evale</dfn> (automatyczne testy jakości na zestawie przykładów, 2.8) uruchamiasz także na nim. Jeśli wypada wyraźnie gorzej, komunikat „asystent niedostępny” bywa lepszy niż złe odpowiedzi. Odpowiedź z fallbacku musi być widoczna w <dfn data-t="trace">trace</dfn> (zapisie przebiegu żądania, 1.4) i w metrykach, inaczej nie wyjaśnisz, czemu „we wtorek po 14 asystent odpowiadał dziwnie”. LiteLLM zwraca w polu <code>model</code> faktyczny model, a w nagłówku <code>x-litellm-model-id</code> konkretne wdrożenie (nowsze wersje dodają nagłówki z liczbą prób i fallbacków). W aplikacji wystarczy mały <code>FallbackDetector</code>: porównuje <code>response.metadata.model</code> z listą oczekiwanych modeli głównych z konfiguracji, ustawia na bieżącym spanie atrybuty <code>llm.response_model</code> i <code>llm.fallback</code> i zwiększa licznik <code>helpdesk.ai.fallback</code>.</p>
+
+<h2>Circuit breaker w aplikacji (Resilience4j)</h2>
+<p>Cooldown LiteLLM nie pomoże, gdy padnie samo proxy albo wszyscy dostawcy: każde żądanie czeka do timeoutu i zajmuje połączenie na nic. Circuit breaker po serii błędów na chwilę przestaje wywoływać zależność. Stany:</p>
+<ul>
+  <li><strong>CLOSED</strong>: ruch normalny; breaker liczy sukcesy, błędy i wolne wywołania w oknie przesuwnym (ostatnie N wywołań lub N sekund).</li>
+  <li><strong>OPEN</strong>: po przekroczeniu progu przez zadany czas od razu rzuca <code>CallNotPermittedException</code>, bez wywołania. Użytkownik dostaje komunikat w milisekundach, dostawca ma czas wrócić.</li>
+  <li><strong>HALF_OPEN</strong>: po tym czasie przepuszcza kilka próbnych wywołań. Udane: powrót do CLOSED; nieudane: znowu OPEN.</li>
+</ul>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  # implementation("io.github.resilience4j:resilience4j-spring-boot3") + spring-boot-starter-aop + actuator
+  resilience4j:
+    circuitbreaker:
+      instances:
+        llm:
+          sliding-window-type: COUNT_BASED
+          sliding-window-size: 20
+          minimum-number-of-calls: 10
+          failure-rate-threshold: 50           # ≥ 50% błędów → OPEN
+          slow-call-duration-threshold: 25s
+          slow-call-rate-threshold: 80         # ≥ 80% wolnych → OPEN
+          wait-duration-in-open-state: 30s
+          permitted-number-of-calls-in-half-open-state: 3
+          record-exceptions:                   # tylko te są awarią
+            - pl.example.helpdesk.assistant.LlmUnavailableException
+            - pl.example.helpdesk.assistant.LlmRateLimitedException
+            - pl.example.helpdesk.assistant.LlmAuthException
+            - org.springframework.web.client.ResourceAccessException   # timeouty, brak połączenia
+          ignore-exceptions:                   # ani sukces, ani błąd
+            - pl.example.helpdesk.assistant.LlmBadRequestException
+            - io.github.resilience4j.bulkhead.BulkheadFullException
+            - pl.example.helpdesk.assistant.AssistantRateLimitedException
+</script>
+<p>Kluczowe jest, <strong>co uznać za awarię</strong>. „Za długi kontekst” dotyczy konkretnego pytania: kilku użytkowników z długimi zgłoszeniami otworzyłoby breaker wszystkim. Odrzucenia przez nasz limiter i bulkhead też się nie liczą. 401 liczy się celowo: przy zepsutym kluczu każde wywołanie skończy się tak samo.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantService.kt">
+  @Service
+  class AssistantService(
+      private val chat: ChatClient,
+      private val fallbacks: FallbackDetector,
+      private val meters: MeterRegistry,
+  ) {
+      @CircuitBreaker(name = "llm", fallbackMethod = "breakerOpen")
+      @Bulkhead(name = "llm-interactive")
+      fun answer(user: CurrentUser, question: String): AssistantAnswer {
+          val response = chat.prompt().user(question).call().chatResponse()
+          response?.let { fallbacks.record("helpdesk-default", it) }
+          val r = ResponseInspector.inspect(response)
+          count(r.javaClass.simpleName.lowercase())                     // ok / truncated / filtered / empty
+          return when (r) {
+              is Inspected.Ok -> AssistantAnswer.ok(r.text)
+              is Inspected.Truncated -> AssistantAnswer.ok(r.text, truncated = true)
+              Inspected.Filtered -> AssistantAnswer.refused("Nie mogę odpowiedzieć na to pytanie.")
+              Inspected.Empty -> throw LlmUnavailableException(200)
+          }
+      }
+
+      /** Tylko dla CallNotPermittedException (breaker OPEN); pozostałe wyjątki lecą dalej bez zmian. */
+      @Suppress("unused")
+      fun breakerOpen(user: CurrentUser, question: String, ex: CallNotPermittedException): AssistantAnswer {
+          count("breaker_open")
+          throw AssistantUnavailableException(retryAfter = Duration.ofSeconds(30))
+      }
+
+      private fun count(outcome: String) =
+          meters.counter("helpdesk.ai.calls", "feature", "chat", "outcome", outcome).increment()
+  }
+</script>
+<p>Metoda fallbacku ma te same parametry plus wyjątek na końcu i ten sam typ zwracany. Resilience4j wybiera ją według typu wyjątku; gdy żaden nie pasuje, oryginalny wyjątek leci dalej (np. <code>LlmBadRequestException</code> do handlera).</p>
+<div class="box warn"><span class="label">Kotlin i AOP: trzy pułapki</span><ul>
+  <li><strong>Klasy finalne.</strong> Adnotacje działają przez proxy, które dziedziczy po Twojej klasie, a w Kotlinie wszystko jest domyślnie <code>final</code>. Plugin <code>kotlin("plugin.spring")</code> otwiera klasy z <code>@Component</code> (i pochodnymi), <code>@Transactional</code>, <code>@Async</code>, <code>@Cacheable</code>, ale nie reaguje na <code>@CircuitBreaker</code>. Klasa tworzona metodą <code>@Bean</code> zostanie finalna. Najgorszy wariant to otwarta klasa z finalną metodą: aplikacja startuje, a breaker po cichu nie działa.</li>
+  <li><strong>Wywołanie z tej samej klasy</strong> (<code>this.answer()</code>) omija proxy.</li>
+  <li><strong>Kolejność aspektów.</strong> Domyślnie Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( metoda ) ) ) ) ). Bulkhead jest wewnątrz breakera, więc jego odrzucenia trafiłyby do statystyk, gdyby nie <code>ignore-exceptions</code>.</li>
+</ul></div>
+
+<h2>Bulkhead i limity: współbieżność, TPM, użytkownik, tenant</h2>
+<p>Breaker reaguje na awarie, a limity im zapobiegają. <dfn data-t="bulkhead">Bulkhead</dfn> (gródź, od przegród w kadłubie statku) ogranicza liczbę równoczesnych wywołań, żeby wolny LLM nie zajął wszystkich zasobów aplikacji. Rate limiter ogranicza liczbę wywołań lub tokenów w czasie.</p>
+<p>Ile równoczesnych wywołań? Z prawa Little'a: współbieżność = przepustowość × średni czas. Przy 200 000 TPM i 13 000 tokenów na pytanie to 0,25 pytania na sekundę, a przy średnio 8 s daje 2 równoczesne wywołania. Bulkhead 10–20 pokrywa szczyty, a nie pozwoli 300 zawieszonym żądaniom zjeść puli połączeń. Przy wątkach wirtualnych (Java 21) jawny bulkhead jest jeszcze ważniejszy, bo wątki przestają być naturalnym limitem.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  resilience4j:
+    bulkhead:
+      instances:
+        llm-interactive: { max-concurrent-calls: 15, max-wait-duration: 0 }    # czat: od razu odmów
+        llm-background:  { max-concurrent-calls: 5,  max-wait-duration: 30s }  # triage nie zabierze miejsca czatowi
+</script>
+<p>Jeden użytkownik ze skryptem albo jeden duży tenant nie może zużyć TPM pozostałych. Bucket4j implementuje algorytm token bucket: wiadro o pojemności N żetonów uzupełnia się w stałym tempie, a każde żądanie zabiera żetony. Ten sam mechanizm chroni limit TPM, jeśli zamiast 1 zabierasz szacowaną liczbę tokenów:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantRateLimiter.kt">
+  import pl.example.helpdesk.assistant.AssistantRateLimitedException.Scope
+  // implementation("com.bucket4j:bucket4j_jdk17-core:8.14.0")   // nazwa artefaktu zależy od wersji
+  class AssistantRateLimitedException(val scope: Scope, val retryAfter: Duration) : RuntimeException() {
+      enum class Scope { USER, TENANT, GLOBAL_TPM }
+  }
+
+  @Component
+  class AssistantRateLimiter(private val tenantSettings: TenantSettingsApi) {
+      private val perUser = Caffeine.newBuilder().expireAfterAccess(Duration.ofMinutes(30)).build<UUID, Bucket>()
+      private val perTenant = Caffeine.newBuilder().expireAfterAccess(Duration.ofMinutes(30)).build<UUID, Bucket>()
+      private val tpm = bucket(160_000, Duration.ofMinutes(1))   // 80% limitu klucza, reszta to zapas
+
+      fun acquire(user: CurrentUser, tenantId: UUID, estimatedTokens: Long) {
+          take(perTenant.get(tenantId) { bucket(tenantSettings.get(it).aiQuestionsPerMinute, Duration.ofMinutes(1)) }, 1, Scope.TENANT)
+          take(perUser.get(user.userId) { bucket(10, Duration.ofMinutes(1)) }, 1, Scope.USER)
+          take(tpm, estimatedTokens, Scope.GLOBAL_TPM)
+      }
+
+      private fun take(b: Bucket, n: Long, scope: Scope) {
+          val probe = b.tryConsumeAndReturnRemaining(n)
+          if (!probe.isConsumed) throw AssistantRateLimitedException(scope,
+              Duration.ofNanos(probe.nanosToWaitForRefill).coerceAtLeast(Duration.ofSeconds(1)))
+      }
+
+      private fun bucket(n: Long, period: Duration) = Bucket.builder()
+          .addLimit(Bandwidth.builder().capacity(n).refillGreedy(n, period).build()).build()
+  }
+
+  /** Zgrubnie: ok. 3 znaki na token po polsku + pełne max_tokens. */
+  fun estimateTokens(promptChars: Int, maxTokens: Int): Long = promptChars / 3L + maxTokens
+</script>
+<p>Wiadra w pamięci działają per instancja: przy trzech replikach limit jest trzy razy większy. Rozwiązania: podzielić limity przez liczbę replik, rozproszony Bucket4j (Redis, Postgres) albo limity w LiteLLM per klucz i pole <code>user</code> (1.3). W HelpDesk: limity per tenant i użytkownik w aplikacji (tylko ona zna tenanta i plan), twardy limit TPM per klucz wirtualny w LiteLLM.</p>
+<p><strong>Odrzucić czy zakolejkować?</strong> Na czat czeka człowiek: brak limitu to natychmiastowe 429 z czasem ponowienia. Na triage nikt nie czeka: przy braku limitu lub otwartym breakerze zadanie wraca do kolejki (PENDING) z terminem z backoffu. Osobne bulkheady lub klucze wirtualne gwarantują, że zadania w tle nie zabiorą przepustowości użytkownikom.</p>
+<p>Frontend dostaje <dfn data-t="problem-detail">ProblemDetail</dfn> (standardowy JSON błędu z 1.1). Czas ponowienia jest w nagłówku <code>Retry-After</code> i w treści, bo przy żądaniach z innej domeny przeglądarka ukrywa nagłówki spoza <code>Access-Control-Expose-Headers</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantExceptionHandler.kt">
+  import pl.example.helpdesk.assistant.AssistantRateLimitedException.Scope
+
+  @RestControllerAdvice(assignableTypes = [AssistantController::class, AssistantStreamController::class])
+  class AssistantExceptionHandler {
+
+      @ExceptionHandler(AssistantRateLimitedException::class)
+      fun rateLimited(e: AssistantRateLimitedException) = problem(HttpStatus.TOO_MANY_REQUESTS, "assistant-rate-limited",
+          e.retryAfter, if (e.scope == Scope.USER) "Zadajesz pytania zbyt szybko." else "Asystent jest mocno obciążony.")
+
+      @ExceptionHandler(AssistantUnavailableException::class, BulkheadFullException::class,
+                        LlmUnavailableException::class, LlmRateLimitedException::class, ResourceAccessException::class)
+      fun unavailable(e: Exception) = problem(HttpStatus.SERVICE_UNAVAILABLE, "assistant-unavailable", Duration.ofSeconds(30),
+          "Asystent jest chwilowo niedostępny. Zgłoszenia możesz przeglądać i edytować normalnie.")
+
+      private fun problem(status: HttpStatus, type: String, retryAfter: Duration, detail: String) =
+          ResponseEntity.status(status)
+              .header(HttpHeaders.RETRY_AFTER, retryAfter.seconds.toString())
+              .body(ProblemDetail.forStatusAndDetail(status, detail).apply {
+                  this.type = URI.create("https://helpdesk.example/problems/$type")
+                  setProperty("retryAfterSeconds", retryAfter.seconds)
+              })
+  }
+</script>
+<p>Komunikat nie zdradza szczegółów („HTTP 529 from upstream”), tylko mówi, co zrobić. 429 od dostawcy (po ponowieniach LiteLLM) zamieniamy na 503, bo to system jest przeciążony, a nie użytkownik pyta za szybko. <code>LlmBadRequestException</code> mapujemy na 422 („rozmowa jest za długa, rozpocznij nową”).</p>
+
+<h2>Degradacja i przełączniki AI</h2>
+<p>Najważniejsza decyzja architektoniczna lekcji: <strong>funkcja AI jest dodatkiem, HelpDesk działa bez niej</strong>. Widok zgłoszenia nie czeka na AI (panel „sugerowana odpowiedź” ładuje się osobno i tylko on pokazuje błąd), triage przy niedostępnym modelu kieruje zgłoszenie do ręcznej kolejki, a żaden endpoint niezwiązany z AI nie ma modelu w ścieżce wywołania.</p>
+<p><code>tenants.ai_enabled</code> z 1.1 wyłącza AI jednemu klientowi. Brakuje globalnego <dfn data-t="feature-flag">feature flag</dfn> (przełącznika funkcji zmienianego bez deployu), który wyłączy AI wszystkim, np. w czasie incydentu kosztowego. To szerszy mechanizm niż <dfn data-t="kill-switch">kill switch</dfn> z 3.2, który zatrzyma tylko akcje zapisu agenta. Trzymamy go w tabeli <code>system_settings(key, value, updated_at, updated_by)</code>, zmienianej endpointem ADMIN z audytem:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AiAvailability.kt">
+  enum class AiStatus { AVAILABLE, DISABLED_GLOBALLY, DISABLED_FOR_TENANT, TEMPORARILY_UNAVAILABLE }
+
+  @Service
+  class AiAvailability(private val jdbc: JdbcTemplate, private val tenants: TenantSettingsApi, breakers: CircuitBreakerRegistry) {
+      private val breaker = breakers.circuitBreaker("llm")
+      private val global = Caffeine.newBuilder().expireAfterWrite(Duration.ofSeconds(15))   // zmiana działa po ≤ 15 s
+          .build<String, Boolean> { jdbc.queryForObject("select value from system_settings where key = ?", String::class.java, it).toBoolean() }
+
+      fun status(tenantId: UUID): AiStatus = when {
+          global.get("ai.enabled") != true -> AiStatus.DISABLED_GLOBALLY
+          !tenants.get(tenantId).aiEnabled -> AiStatus.DISABLED_FOR_TENANT
+          breaker.state == CircuitBreaker.State.OPEN -> AiStatus.TEMPORARILY_UNAVAILABLE
+          else -> AiStatus.AVAILABLE
+      }
+  }
+</script>
+<p>Frontend pyta <code>GET /api/assistant/status</code> przy wejściu i co minutę i na tej podstawie ukrywa lub wyłącza przycisk asystenta, zamiast pozwolić kliknąć i dostać błąd. Komunikat zależy od przyczyny: „nie jest włączony dla Twojej organizacji”, „tymczasowo wyłączony”, „chwilowo niedostępny, zgłoszenia możesz przeglądać normalnie”.</p>
+
+<h2>Streaming a odporność</h2>
+<p>Przy streamingu (lekcja 2.3) odpowiedź płynie fragmentami przez <dfn data-t="sse">SSE</dfn> (jednokierunkowy strumień zdarzeń z serwera do przeglądarki). Zmienia to trzy rzeczy:</p>
+<ul>
+  <li><strong>Status 200 przychodzi na początku.</strong> Gdy dostawca zawiedzie w połowie, kod HTTP już nic nie powie, więc błąd przekazujesz jako zdarzenie w strumieniu. Niektórzy dostawcy robią tak samo: Anthropic potrafi wysłać w trakcie strumienia zdarzenie <code>error</code> typu <code>overloaded_error</code>.</li>
+  <li><strong>Nie da się przezroczyście ponowić.</strong> Użytkownik przeczytał połowę odpowiedzi, a ponowienie wygeneruje inną, więc nie dokleisz drugiej połowy. LiteLLM ponawia strumień tylko wtedy, gdy zerwie się przed wysłaniem pierwszej treści. Potem jedyna uczciwa reakcja to oznaczyć odpowiedź jako przerwaną i dać przycisk „spróbuj ponownie”.</li>
+  <li><strong>Anulowanie oszczędza pieniądze.</strong> Gdy użytkownik zamknie panel, przeglądarka zamyka połączenie. Jeśli backend przekaże anulowanie dalej (do LiteLLM, a ono do dostawcy), generowanie się zatrzyma i nie zapłacisz za resztę tokenów. Blokujący <code>RestClient</code> bez streamingu tego nie potrafi: wątek czeka do końca, a Ty płacisz za odpowiedź, której nikt nie przeczyta.</li>
+</ul>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantStreamController.kt">
+  @PostMapping("/api/assistant/stream", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+  fun stream(user: CurrentUser, @Valid @RequestBody req: AskRequest): Flux<ServerSentEvent<String>> {
+      availability.require(req.tenantId)                  // przed otwarciem strumienia: zwykłe 403/503
+      limiter.acquire(user, req.tenantId, estimateTokens(req.question.length, 800))
+      val started = System.nanoTime()
+
+      return chat.prompt().user(req.question).stream().content()
+          .timeout(Mono.delay(limits.firstToken)) { Mono.delay(limits.idle) }   // TTFT 10 s, potem bezczynność 15 s
+          .take(limits.total)                             // 90 s: anuluje źródło i kończy strumień normalnie
+          .map { ServerSentEvent.builder(it).event("delta").build() }
+          .concatWith(Mono.fromCallable {
+              val cut = Duration.ofNanos(System.nanoTime() - started) >= limits.total
+              ServerSentEvent.builder(if (cut) "truncated" else "ok").event("done").build()
+          })
+          .onErrorResume { e -> Mono.just(ServerSentEvent.builder(errorCode(e)).event("error").build()) }
+          .doOnCancel { log.info("Klient anulował – zamykamy połączenie do LLM") }
+  }
+
+  private fun errorCode(e: Throwable) = when (e) {
+      is TimeoutException -> "timeout"
+      is WebClientResponseException -> if (e.statusCode.value() == 429) "rate_limited" else "unavailable"
+      else -> "interrupted"
+  }
+</script>
+<p><code>timeout(pierwszy, kolejne)</code> daje osobny limit na pierwszy element i na każdą przerwę (TTFT i bezczynność). <code>take(Duration)</code> to limit całkowity: anuluje źródło i kończy strumień normalnie, więc ucięcie oznaczamy w <code>done</code>. Rozłączenie klienta anuluje subskrypcję aż do <code>WebClient</code>; Spring MVC wykrywa je dopiero przy zapisie, więc przy długim TTFT wysyłaj co kilka sekund komentarz SSE. Adnotacje breakera i bulkheadu nie obejmują dobrze metod zwracających <code>Flux</code>; Resilience4j ma do tego operatory reaktywne (<code>CircuitBreakerOperator</code>), które dodamy w 2.3.</p>
+
+<h2>Frontend: timeout, anulowanie, komunikaty</h2>
+<p>Hook realizuje cztery zasady: nowe pytanie anuluje poprzednie, jest twardy timeout dłuższy niż backendu, 429 i 503 dają konkretne komunikaty z czasem, a ponowienie robi użytkownik, nie kod.</p>
+<script type="text/x-code" data-lang="typescript" data-title="hooks/useAsk.ts">
+  export type AskState =
+    | { kind: "idle" } | { kind: "loading" } | { kind: "timeout" }
+    | { kind: "done"; answer: string; truncated: boolean }
+    | { kind: "rate-limited" | "unavailable"; message: string; retryAt: number }
+    | { kind: "error"; message: string };
+
+  const TIMEOUT_MS = 60_000;                               // > timeout backendu (55 s)
+
+  export function useAsk() {
+    const { token } = useAuth();
+    const [state, setState] = useState<AskState>({ kind: "idle" });
+    const current = useRef<AbortController | null>(null);
+    const last = useRef<string | null>(null);
+
+    useEffect(() => () => current.current?.abort(), []);   // odmontowanie anuluje żądanie
+
+    const ask = useCallback(async (question: string) => {
+      current.current?.abort();                            // nowe pytanie anuluje poprzednie
+      const mine = new AbortController();
+      current.current = mine;
+      last.current = question;
+      setState({ kind: "loading" });
+      try {
+        const res = await api<AnswerDto>("/api/assistant/ask", {
+          token, method: "POST", body: JSON.stringify({ question }),
+          signal: AbortSignal.any([mine.signal, AbortSignal.timeout(TIMEOUT_MS)]),
+        });
+        if (current.current === mine) setState({ kind: "done", answer: res.answer, truncated: res.truncated });
+      } catch (e) {
+        if (current.current === mine) setState(toState(e));   // ignoruj wyniki zastąpionych pytań
+      }
+    }, [token]);
+
+    const retry = useCallback(() => { if (last.current) void ask(last.current); }, [ask]);  // tylko na kliknięcie
+    return { state, ask, retry, cancel: () => current.current?.abort() };
+  }
+
+  function toState(e: unknown): AskState {
+    if (e instanceof DOMException && e.name === "TimeoutError") return { kind: "timeout" };
+    if (e instanceof DOMException && e.name === "AbortError") return { kind: "idle" };
+    if (e instanceof ApiError && (e.status === 429 || e.status === 503)) {
+      return {
+        kind: e.status === 429 ? "rate-limited" : "unavailable",
+        message: e.problem.detail ?? "Asystent jest chwilowo niedostępny.",
+        retryAt: Date.now() + Number(e.problem.retryAfterSeconds ?? 10) * 1000,
+      };
+    }
+    return { kind: "error", message: "Nie udało się uzyskać odpowiedzi." };
+  }
+</script>
+<p><code>AbortSignal.any</code> łączy anulowanie z timeoutem, a nazwa błędu (<code>TimeoutError</code> lub <code>AbortError</code>) pozwala je odróżnić (Safari od 17.4; starsze przeglądarki: <code>setTimeout</code> z <code>abort()</code>). <code>api</code> to klient z 1.1. Przy <code>rate-limited</code> i <code>unavailable</code> komponent pokazuje przycisk „Spróbuj ponownie”, nieaktywny z odliczaniem do <code>retryAt</code>.</p>
+
+<h2>Testowanie awarii</h2>
+<p>Kod obsługi awarii uruchamia się rzadko, więc bez testów zepsuje się niezauważony. WireMock to serwer HTTP zwracający zaprogramowane odpowiedzi: kierujesz na niego <code>spring.ai.openai.base-url</code> i symulujesz błędy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/LlmResilienceIT.kt">
+  // testImplementation("org.wiremock:wiremock-standalone")
+  @SpringBootTest(properties = [
+      "resilience4j.circuitbreaker.instances.llm.sliding-window-size=4",
+      "resilience4j.circuitbreaker.instances.llm.minimum-number-of-calls=4",
+  ])
+  @Testcontainers
+  class LlmResilienceIT(@Autowired val assistant: AssistantService, @Autowired val breakers: CircuitBreakerRegistry) {
+      companion object {
+          // + kontener Postgresa z @ServiceConnection jak w TenantIsolationIT (1.1)
+          @RegisterExtension @JvmStatic
+          val llm: WireMockExtension = WireMockExtension.newInstance().options(wireMockConfig().dynamicPort()).build()
+
+          @DynamicPropertySource @JvmStatic
+          fun props(r: DynamicPropertyRegistry) {
+              r.add("spring.ai.openai.base-url") { llm.baseUrl() }
+              r.add("spring.ai.openai.api-key") { "test" }
+          }
+          val CHAT = urlPathEqualTo("/v1/chat/completions")
+      }
+      private val agent = CurrentUser(UUID.randomUUID(), setOf(ACME), setOf(Role.AGENT))
+
+      @BeforeEach fun reset() { llm.resetAll(); breakers.circuitBreaker("llm").reset() }
+
+      @Test
+      fun `aplikacja nie ponawia 429 i przekazuje Retry-After`() {
+          llm.stubFor(post(CHAT).willReturn(aResponse().withStatus(429).withHeader("Retry-After", "7")
+              .withBody("""{"error":{"message":"Rate limit","type":"rate_limit_error"}}""")))
+
+          val ex = assertThrows<LlmRateLimitedException> { assistant.answer(agent, "Status?") }
+
+          assertThat(ex.retryAfter).isEqualTo(Duration.ofSeconds(7))
+          llm.verify(1, postRequestedFor(CHAT))            // jedno wywołanie: brak mnożenia ponowień
+      }
+
+      @Test
+      fun `seria 503 otwiera breaker i kolejne wywolania nie ida do dostawcy`() {
+          llm.stubFor(post(CHAT).willReturn(aResponse().withStatus(503)))
+          repeat(4) { assertThrows<LlmUnavailableException> { assistant.answer(agent, "q$it") } }
+
+          assertThat(breakers.circuitBreaker("llm").state).isEqualTo(CircuitBreaker.State.OPEN)
+          assertThrows<AssistantUnavailableException> { assistant.answer(agent, "kolejne") }
+          llm.verify(4, postRequestedFor(CHAT))            // piąte odrzucone bez ruchu sieciowego
+      }
+  }
+</script>
+<p>Treści błędów w stubach skopiuj z prawdziwego LiteLLM, bo handler klasyfikuje je po treści. Dopisz też test, że dziesięć błędów „ContextWindowExceeded” zostawia breaker w stanie CLOSED. WireMock symuluje opóźnienie (<code>withFixedDelay</code>: czy timeout zadziałał w budżecie?), zerwane połączenie (<code>withFault</code>), powolne wysyłanie (<code>withChunkedDribbleDelay</code>) i sekwencje odpowiedzi (scenariusze). Odpowiedź 200 z <code>"finish_reason":"length"</code> sprawdzi oznaczanie ucięć.</p>
+<p>Toxiproxy to proxy TCP między backendem a LiteLLM, któremu w locie dodajesz „toksyny”, np. zerwanie strumienia w połowie. W testach automatycznych użyjesz modułu Testcontainers, ręcznie CLI:</p>
+<script type="text/x-code" data-lang="bash" data-title="toxiproxy – scenariusze">
+  toxiproxy-cli create -l 0.0.0.0:4100 -u litellm:4000 litellm    # backend: LLM_BASE_URL=http://localhost:4100
+  toxiproxy-cli toxic add -t latency -a latency=20000 litellm      # wolny dostawca
+  toxiproxy-cli toxic add -t limit_data -a bytes=3000 litellm      # strumień zerwany po 3 kB
+  toxiproxy-cli toxic add -t timeout -a timeout=0 litellm          # dane przestają płynąć, połączenie wisi
+  toxiproxy-cli toggle litellm                                     # proxy LLM niedostępne
+</script>
+<p>Konfiguracji LiteLLM i całego systemu nie sprawdzi test jednostkowy. Raz na kwartał zrób na środowisku testowym ćwiczenie awarii: zły klucz głównego dostawcy (czy ruch przeszedł na backup i widać to w trace'ach?), bardzo niski <code>rpm_limit</code> klucza (czy czat dostaje 429, a triage czeka?), zatrzymany LiteLLM (czy breaker się otwiera, a zgłoszenia działają?), zatrzymana Ollama (czy dane Globex na pewno <em>nie</em> wyszły na zewnątrz?). Fallback wymusisz też parametrem <code>mock_testing_fallbacks</code> (sprawdź w swojej wersji LiteLLM).</p>
+
+<h2>Monitoring i alerty</h2>
+<p>Mechanizmy odporności ukrywają awarie przed użytkownikiem, ale nie przed zespołem. Fallback działający od tygodnia, bo ktoś zepsuł konfigurację głównego modelu, to cicha awaria jakości i kosztów.</p>
+<table>
+  <tr><th>Metryka</th><th>Co mówi</th></tr>
+  <tr><td><code>resilience4j_circuitbreaker_state{name="llm"}</code></td><td>Stan breakera (gauge 0/1 per stan)</td></tr>
+  <tr><td><code>resilience4j_circuitbreaker_not_permitted_calls_total</code></td><td>Wywołania odrzucone przez otwarty breaker</td></tr>
+  <tr><td><code>resilience4j_bulkhead_available_concurrent_calls</code></td><td>Stale bliskie 0: za mały limit albo wolny dostawca</td></tr>
+  <tr><td><code>helpdesk_ai_calls_total{outcome}</code></td><td><code>ok</code>, <code>truncated</code>, <code>filtered</code>, <code>empty</code>, <code>breaker_open</code></td></tr>
+  <tr><td><code>helpdesk_ai_fallback_total{alias,model}</code></td><td>Odsetek odpowiedzi z modelu zapasowego</td></tr>
+  <tr><td><code>helpdesk_ai_rejected_total{scope}</code></td><td>Odrzucenia przez limiter: użytkownik, tenant, TPM</td></tr>
+</table>
+<p>Do tego metryki LiteLLM (fallbacki, cooldowny, błędy per wdrożenie; zakres zależy od wersji) oraz czasy i TTFT z trace'ów (1.4), które mówią, czy timeouty są dobrze dobrane.</p>
+<p>Uważaj na kardynalność tagów: tenant przy kilkudziesięciu tenantach jest akceptowalny, <code>userId</code> nie (trzymaj go w trace'ach i logach).</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts/helpdesk-ai.rules.yml (Prometheus)">
+  groups:
+    - name: helpdesk-ai
+      rules:
+        - alert: LlmCircuitBreakerOpen
+          expr: max(resilience4j_circuitbreaker_state{name="llm", state="open"}) == 1
+          for: 2m
+          labels: { severity: page }
+        - alert: LlmFallbackRateHigh
+          expr: sum(rate(helpdesk_ai_fallback_total[15m])) / sum(rate(helpdesk_ai_calls_total[15m])) > 0.05
+          for: 15m
+          labels: { severity: ticket }
+</script>
+<p>Dyżurnego wzywasz (<code>page</code>) tylko, gdy użytkownicy już nie mogą korzystać z funkcji: otwarty breaker, 401, wyczerpany budżet. Wzrost fallbacków, ucięć (<code>outcome="truncated"</code>) i odrzuceń to zgłoszenia na godziny pracy. W Azure Monitor zbudujesz te same reguły na metrykach z Micrometera w Application Insights.</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Zmierz TTFT i prędkość generowania <code>helpdesk-default</code> na 20 pytaniach po polsku. Policz timeout dla <code>max_tokens</code> 300, 800 i 1500 i rozpisz budżet czasu frontend → backend → LiteLLM tak, żeby każda warstwa wewnętrzna kończyła się przed zewnętrzną.</li>
+  <li>Ustaw <code>api_base</code> wdrożenia w LiteLLM na WireMock zwracający 503 i policz, ile żądań wywołuje jedno pytanie. Wyłącz retry Spring AI i powtórz pomiar.</li>
+  <li>Usuń <code>kotlin("plugin.spring")</code> z buildu (albo zrób metodę <code>final</code>) i sprawdź, czy test „seria 503 otwiera breaker” wykrywa, że breaker przestał działać.</li>
+  <li>Napisz test, który parsuje <code>litellm.yaml</code> i sprawdza, że żaden łańcuch fallbacków z <code>helpdesk-local</code> nie prowadzi do zewnętrznego dostawcy, a <code>default_fallbacks</code> nie jest ustawione.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Spring AI ma 3 próby, LiteLLM 3 próby, a frontend automatycznie ponawia 3 razy. Ile wywołań modelu może wygenerować jedno kliknięcie i co z tym zrobić?</p>
+  <button>3, bo próby się nie sumują</button>
+  <button>9, i to jest akceptowalne</button>
+  <button>27; retry zostawiasz w jednej warstwie (proxy), w pozostałych je wyłączasz</button>
+  <p class="explain">Ponowienia mnożą się: 3 × 3 × 3 = 27 wywołań, wielominutowe czekanie i koszt każdej próby. Retry i fallback robi LiteLLM, Spring AI ma <code>max-attempts: 1</code>, a frontend ponawia tylko na prośbę użytkownika.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Czat ma <code>max_tokens: 800</code>. W najgorszym realnym przypadku TTFT wynosi 2,5 s, a model generuje 40 tokenów na sekundę. Jaki timeout na jedną próbę jest rozsądny?</p>
+  <button>Ok. 25 s</button>
+  <button>5 s, bo użytkownicy nie lubią czekać</button>
+  <button>5 minut, żeby żadna odpowiedź nie została przerwana</button>
+  <p class="explain">2,5 s + 800 / 40 = 22,5 s, plus margines. Krótszy timeout zrywa poprawne odpowiedzi, za które i tak płacisz. Dłuższy nie mieści się w budżecie frontendu. Żeby było szybciej, zmniejsz <code>max_tokens</code> albo użyj streamingu.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Odpowiedź ma status 200 i <code>finish_reason = "length"</code>. Co to znaczy dla triage, który oczekuje JSON?</p>
+  <button>Wszystko w porządku, odpowiedź była po prostu długa</button>
+  <button>Odpowiedź ucięto na <code>max_tokens</code>, JSON jest niekompletny; to błąd do zliczenia, nie „kategoria inne”</button>
+  <button>Trzeba natychmiast ponowić z tym samym promptem i limitem</button>
+  <p class="explain">„Length” oznacza ucięcie w pół odpowiedzi, a ponowienie z tym samym limitem zwykle da to samo. Sprawdzaj <code>finish_reason</code> przed parsowaniem, licz takie przypadki w metryce i popraw prompt lub limit.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Dlaczego <code>LlmBadRequestException</code> (np. za długi kontekst) jest w <code>ignore-exceptions</code> circuit breakera?</p>
+  <button>Bo Resilience4j nie obsługuje wyjątków z kodem 400</button>
+  <button>Bo te błędy i tak ponawia LiteLLM</button>
+  <button>Bo dotyczą konkretnego żądania, a nie stanu dostawcy; kilku użytkowników z długimi rozmowami otworzyłoby breaker wszystkim</button>
+  <p class="explain">Breaker reaguje na awarie zależności (5xx, timeouty, brak połączenia, 401). Błędy wynikające z treści żądania oraz odrzucenia przez nasz bulkhead i limiter nic nie mówią o zdrowiu dostawcy.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">W trakcie streamingu, po wyświetleniu połowy odpowiedzi, połączenie z dostawcą zostało zerwane. Co powinien zrobić system?</p>
+  <button>Po cichu ponowić żądanie i dokleić dalszą część nowej odpowiedzi</button>
+  <button>Wysłać zdarzenie błędu w strumieniu, oznaczyć odpowiedź jako przerwaną i pozwolić użytkownikowi zapytać ponownie</button>
+  <button>Zwrócić HTTP 503 zamiast strumienia</button>
+  <p class="explain">Status 200 już wysłano, więc błąd musi przyjść jako zdarzenie w strumieniu. Nowa odpowiedź byłaby inna niż przerwana, więc doklejenie da niespójny tekst. LiteLLM ponawia strumień tylko wtedy, gdy zerwie się przed pierwszą treścią.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

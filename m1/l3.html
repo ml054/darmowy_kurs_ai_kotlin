@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.3 LiteLLM jako proxy – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="1.3">
+<main>
+<p class="meta">Lekcja 1.3 · ok. 60 min</p>
+<h1>LiteLLM jako proxy: klucze, dostawcy, aliasy</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć, co psuje się w produkcji przy bezpośrednich wywołaniach dostawców i jak rozwiązuje to LLM gateway.</li>
+  <li>Napisać kompletny <code>config.yaml</code> LiteLLM: aliasy, pule wdrożeń, routing, Azure OpenAI, ustawienia produkcyjne.</li>
+  <li>Zbudować trzypoziomowy model kluczy z budżetami i limitami.</li>
+  <li>Śledzić koszty per funkcja i tenant, przekazując metadane ze Spring AI.</li>
+  <li>Wdrożyć proxy tak, żeby nie stało się pojedynczym punktem awarii, i bezpiecznie wymieniać model pod aliasem.</li>
+</ul></div>
+
+<h2>Co się psuje przy bezpośrednich wywołaniach dostawcy</h2>
+<p>W lekcji 1.2 backend wysłał pierwsze zapytanie do modelu. Na demo wystarczy klucz dostawcy w <code>application.yml</code> i nazwa modelu w opcjach. Po kilku miesiącach produkcji ta prostota zaczyna kosztować:</p>
+<ul>
+  <li><strong>Klucze.</strong> Klucz API dostawcy (sekret uprawniający do wywołań na koszt firmy) leży w backendzie, w CI do evali, na laptopach i w skrypcie importu. Wyciek jednego oznacza nieograniczony koszt, bo dostawca limituje wydatki zwykle tylko dla całego konta. Rotacja wymaga deployu wszystkiego naraz.</li>
+  <li><strong>Koszty.</strong> Faktura przychodzi raz w miesiącu jako jedna kwota. Nie wiadomo, czy 4000 USD zjadł czat, triage, czy nocna pętla skryptu, i nie da się powiedzieć „triage wydaje maksymalnie 100 USD”.</li>
+  <li><strong>Zmiana modelu.</strong> Nazwa modelu jest w konfiguracji każdej aplikacji. Dostawcy wycofują stare wersje, więc zmiana jest wymuszona z zewnątrz i wymaga skoordynowanego deployu.</li>
+  <li><strong>Fallback.</strong> Przy awarii dostawcy lub <dfn data-t="rate-limit">HTTP 429</dfn> każda aplikacja sama przełącza się na zapasowy model. Każdy zespół robi to inaczej, część wcale.</li>
+  <li><strong>Logi.</strong> Na pytanie „ile wywołań skończyło się wczoraj błędem?” nie ma jednej odpowiedzi.</li>
+  <li><strong>Wielu dostawców.</strong> Czat chodzi na Anthropic, triage na Azure OpenAI, a zgłoszenia Globexu (bez zgody na zewnętrzne LLM) na modelu lokalnym. To trzy biblioteki, trzy sposoby uwierzytelnienia i trzy formaty.</li>
+</ul>
+<p>API dostawców wyglądają podobnie, ale różnią się w miejscach, które psują kod:</p>
+<table>
+  <tr><th>Element</th><th>OpenAI</th><th>Anthropic</th><th>Azure OpenAI</th></tr>
+  <tr><td>Endpoint</td><td><code>/v1/chat/completions</code></td><td><code>/v1/messages</code></td><td><code>/openai/deployments/{wdrożenie}/chat/completions?api-version=…</code></td></tr>
+  <tr><td>Uwierzytelnienie</td><td><code>Authorization: Bearer</code></td><td><code>x-api-key</code> + <code>anthropic-version</code></td><td><code>api-key</code> albo token Entra ID</td></tr>
+  <tr><td>System prompt</td><td>Wiadomość z rolą <code>system</code></td><td>Osobne pole <code>system</code></td><td>Jak OpenAI</td></tr>
+  <tr><td>Zużycie</td><td><code>prompt_tokens</code>, <code>completion_tokens</code></td><td><code>input_tokens</code>, <code>output_tokens</code></td><td>Jak OpenAI</td></tr>
+  <tr><td>Powód zakończenia</td><td><code>finish_reason: tool_calls</code></td><td><code>stop_reason: tool_use</code></td><td>Jak OpenAI</td></tr>
+  <tr><td>Wybór modelu</td><td>Pole <code>model</code></td><td>Pole <code>model</code></td><td>Nazwa wdrożenia w URL</td></tr>
+</table>
+<h3>Czym jest LLM gateway</h3>
+<p><dfn data-t="proxy">LLM gateway (proxy)</dfn> to usługa sieciowa między aplikacjami a dostawcami modeli, przez którą przechodzi każde wywołanie. Aplikacja zna jego adres, jeden format API i własny klucz. Gateway odpowiada za resztę: tłumaczenie formatów, <dfn data-t="alias">aliasy modeli</dfn> (aplikacja prosi o <code>helpdesk-fast</code>, gateway wie, jaki to dziś model), klucze dostawców, limity i budżety, routing, retry i <dfn data-t="fallback">fallback</dfn> (lekcja 1.5), koszty i logi.</p>
+
+<h2>LiteLLM: architektura i tryby pracy</h2>
+<p>LiteLLM to projekt open source w Pythonie w dwóch postaciach:</p>
+<table>
+  <tr><th>Tryb</th><th>Co to jest</th><th>Kiedy</th></tr>
+  <tr><td>SDK</td><td>Biblioteka Pythona: <code>litellm.completion(model="anthropic/…")</code>. Tłumaczenie w procesie aplikacji.</td><td>Skrypty i usługi w Pythonie. Brak centralnych kluczy i budżetów.</td></tr>
+  <tr><td>Proxy server</td><td>Serwer HTTP z API zgodnym z OpenAI, API administracyjnym (<code>/key/*</code>, <code>/team/*</code>, <code>/spend/*</code>) i panelem <code>/ui</code>.</td><td>Aplikacje w innych językach, wiele aplikacji, kontrola kosztów. Nasz przypadek.</td></tr>
+</table>
+<p>„Zgodne z API OpenAI” znaczy, że proxy przyjmuje i zwraca to samo co <code>api.openai.com</code>. Dlatego Spring AI z modułem OpenAI rozmawia z LiteLLM bez specjalnego klienta.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="droga żądania przez LiteLLM">
+  Spring AI ──► POST /v1/chat/completions, Bearer sk-…, model: helpdesk-fast
+                 1. uwierzytelnienie klucza wirtualnego (cache, nie DB przy każdym żądaniu)
+                 2. dostęp do aliasu? budżet? RPM/TPM?
+                 3. router wybiera wdrożenie z puli „helpdesk-fast”
+                 4. tłumaczenie formatu (np. OpenAI → Anthropic) ──► dostawca
+                 5. tłumaczenie odpowiedzi, wyliczenie kosztu z cennika
+          ◄──── 6. odpowiedź + nagłówki x-litellm-*
+                 7. w tle: zapis logu kosztów do Postgresa (wsadowo), callbacki (lekcja 1.4)
+</script>
+<ul>
+  <li><strong>Postgres</strong> przechowuje klucze wirtualne (jako skróty), zespoły, budżety i logi kosztów. Bez bazy działa tylko master key, bez kluczy wirtualnych i budżetów. Schemat tworzy przy starcie ORM Prisma, a obsługiwany jest PostgreSQL, więc nawet przy firmowym SQL Serverze proxy potrzebuje Postgresa (w Azure: Flexible Server).</li>
+  <li><strong>Redis</strong> (magazyn klucz-wartość w pamięci) trzyma wspólne liczniki RPM/TPM i stan wdrożeń wyłączonych po błędach. Bez niego przy 3 replikach każda liczy limity osobno, więc realny limit jest 3 razy wyższy od ustawionego.</li>
+</ul>
+<div class="box warn"><span class="label">Licencja</span><p>Rdzeń jest open source, ale część funkcji (SSO do panelu, część raportów, automatyczna rotacja kluczy) wymaga licencji Enterprise. Granica przesuwa się między wersjami, więc sprawdź ją w dokumentacji przed zaplanowaniem procesu.</p></div>
+
+<h2>config.yaml: model_list i aliasy</h2>
+<p>Każdy wpis w <code>model_list</code> to jedno <em>wdrożenie</em>: konkretny model u konkretnego dostawcy, z kluczem i adresem. Nazwy modeli są przykładowe i się zmieniają.</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – model_list">
+  model_list:
+    - model_name: helpdesk-default                 # ALIAS używany przez aplikację
+      litellm_params:                              # jak dotrzeć do modelu
+        model: anthropic/claude-sonnet-4-5         # <prefiks dostawcy>/<model>
+        api_key: os.environ/ANTHROPIC_API_KEY      # wartość ze zmiennej środowiskowej
+      model_info:
+        id: default-anthropic-v1                   # stały identyfikator wdrożenia
+
+    - model_name: helpdesk-fast
+      litellm_params:
+        model: azure/gpt-41-mini-eu                # azure/<nazwa WDROŻENIA w Azure>
+        api_base: os.environ/AZURE_OPENAI_ENDPOINT_SWC
+        api_version: "2024-10-21"
+      model_info: { id: fast-azure-swc-v1, base_model: azure/gpt-4.1-mini }
+
+    - model_name: helpdesk-default-backup          # inny dostawca niż helpdesk-default
+      litellm_params:
+        model: azure/gpt-41-eu
+        api_base: os.environ/AZURE_OPENAI_ENDPOINT_SWC
+        api_version: "2024-10-21"
+      model_info: { id: backup-azure-swc-v1, base_model: azure/gpt-4.1 }
+
+    - model_name: helpdesk-local                   # dane nie opuszczają naszej sieci
+      litellm_params:
+        model: ollama_chat/qwen2.5:14b
+        api_base: http://ollama:11434
+      model_info: { id: local-ollama-v1 }
+</script>
+<table>
+  <tr><th>Pole</th><th>Znaczenie i pułapka</th></tr>
+  <tr><td><code>model_name</code></td><td>Alias, czyli wartość pola <code>model</code> w żądaniu aplikacji. Kilka wpisów z tą samą nazwą to pula, a nie błąd.</td></tr>
+  <tr><td><code>litellm_params.model</code></td><td>Prefiks (<code>anthropic/</code>, <code>azure/</code>, <code>ollama_chat/</code>) wybiera tłumacza formatu. Dla Azure po prefiksie jest nazwa <em>wdrożenia</em>, nie modelu.</td></tr>
+  <tr><td><code>api_key</code>, <code>api_base</code></td><td>Składnia <code>os.environ/NAZWA</code> czyta zmienną środowiskową. Klucz wpisany wprost trafi do Gita.</td></tr>
+  <tr><td>Inne <code>litellm_params</code></td><td>Domyślne parametry i limity wdrożenia: <code>max_tokens</code>, <code>timeout</code>, <code>rpm</code>, <code>tpm</code>, <code>weight</code>.</td></tr>
+  <tr><td><code>model_info</code></td><td><code>id</code> wraca w nagłówku <code>x-litellm-model-id</code>; bez niego LiteLLM generuje skrót zmieniający się przy każdej zmianie parametrów. <code>base_model</code> służy do wyceny.</td></tr>
+</table>
+<div class="box tip"><span class="label">Alias to kontrakt</span><p>Aplikacja i proxy umawiają się na <em>przeznaczenie</em> aliasu („szybki model do klasyfikacji, structured output, odpowiedź w 2 s”), a nie na model. Model wymienisz bez deployu aplikacji, ale musisz pilnować, żeby nowy nadal spełniał kontrakt.</p></div>
+
+<h2>Azure OpenAI jako dostawca</h2>
+<p>W Azure tworzysz zasób Azure OpenAI (lub AI Foundry) w regionie, a w nim <em>wdrożenie</em> modelu z własną nazwą i limitem TPM. Stąd trzy parametry: <code>model: azure/&lt;nazwa-wdrożenia&gt;</code> (warto zawrzeć w niej model i region), <code>api_base</code> (adres zasobu, np. <code>https://helpdesk-aoai-swc.openai.azure.com/</code>) i <code>api_version</code> (wersja API jako data; nowsze funkcje bywają tylko w nowszych wersjach, sprawdź aktualną w dokumentacji Azure).</p>
+<p>W przykładzie nie ma <code>api_key</code> dla Azure celowo. <dfn data-t="managed-identity">Managed identity</dfn> to tożsamość nadawana przez Azure zasobowi (np. kontenerowi z proxy), dla której Entra ID wydaje krótkotrwałe tokeny bez sekretu w konfiguracji. Nadajesz jej rolę <em>Cognitive Services OpenAI User</em> na zasobie, a w LiteLLM włączasz <code>enable_azure_ad_token_refresh: true</code> w <code>litellm_settings</code>; brak klucza oznacza użycie <code>DefaultAzureCredential</code> (lokalnie zadziała <code>az login</code>). Wariant z service principalem (<code>tenant_id</code>, <code>client_id</code>, <code>client_secret</code>) znów wymaga sekretu. Nazwy opcji Entra ID zmieniały się między wersjami, więc sprawdź je w dokumentacji swojej wersji.</p>
+<ul>
+  <li><code>base_model</code>: Azure zwraca nazwę modelu, z której LiteLLM nie zawsze znajdzie cenę. Bez <code>base_model</code> koszty w raportach mogą być błędne albo zerowe.</li>
+  <li><strong>Rezydencja danych</strong>: dla Acme (zgoda na zewnętrzne LLM pod warunkiem przetwarzania w UE) wybierasz region europejski i typ wdrożenia przetwarzający dane w UE (np. „Data Zone” EU). Gwarancje sprawdź w dokumentacji Azure.</li>
+</ul>
+
+<h2>Pule wdrożeń i strategie routingu</h2>
+<p>Wpisy z tym samym <code>model_name</code> tworzą <strong>pulę</strong>, a router wybiera z niej jedno wdrożenie na żądanie. Typowo na Azure: ten sam model w dwóch regionach, żeby zsumować limity i przetrwać problem regionu.</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – pula w dwóch regionach">
+  model_list:
+    - model_name: helpdesk-fast
+      litellm_params:
+        model: azure/gpt-41-mini-eu
+        api_base: os.environ/AZURE_OPENAI_ENDPOINT_SWC   # Sweden Central
+        api_version: "2024-10-21"
+        tpm: 200000
+        rpm: 1200
+      model_info: { id: fast-azure-swc-v1, base_model: azure/gpt-4.1-mini }
+    - model_name: helpdesk-fast
+      litellm_params:
+        model: azure/gpt-41-mini-eu
+        api_base: os.environ/AZURE_OPENAI_ENDPOINT_WEU   # West Europe
+        api_version: "2024-10-21"
+        tpm: 100000
+        rpm: 600
+      model_info: { id: fast-azure-weu-v1, base_model: azure/gpt-4.1-mini }
+
+  router_settings:
+    routing_strategy: simple-shuffle
+    redis_host: os.environ/REDIS_HOST                    # wspólne liczniki dla replik
+    redis_port: os.environ/REDIS_PORT
+    redis_password: os.environ/REDIS_PASSWORD
+</script>
+<p>Limit TPM wdrożenia w Azure jest twardy (przekroczenie to 429), więc wpisz go też jako <code>tpm</code>. Przy <code>simple-shuffle</code> wybór jest wtedy losowy ważony limitami: pierwsze wdrożenie dostanie ok. 2/3 ruchu. Zamiast limitów można podać wagę <code>weight</code>.</p>
+<table>
+  <tr><th><code>routing_strategy</code></th><th>Jak wybiera</th><th>Kiedy</th></tr>
+  <tr><td><code>simple-shuffle</code> (domyślna)</td><td>Losowo, z wagą z <code>weight</code> lub <code>rpm</code>/<code>tpm</code>; bez stanu, najszybsza</td><td>Domyślnie; dokumentacja poleca ją na produkcję</td></tr>
+  <tr><td><code>least-busy</code></td><td>Najmniej żądań w toku</td><td>Wywołania o bardzo różnym czasie trwania</td></tr>
+  <tr><td><code>latency-based-routing</code></td><td>Najniższy średni czas odpowiedzi z ostatniego okresu</td><td>Funkcje interaktywne, wdrożenia w różnych regionach</td></tr>
+  <tr><td><code>usage-based-routing-v2</code></td><td>Najmniejsze bieżące zużycie TPM, pomija wdrożenia bliskie limitu; liczniki w Redisie</td><td>Gdy limity TPM są wąskim gardłem; koszt: praca Redisa przy każdym żądaniu</td></tr>
+</table>
+<p>Starsza <code>usage-based-routing</code> (bez „v2”) jest w dokumentacji opisana jako przestarzała i niezalecana na produkcję. Listę strategii sprawdź dla swojej wersji.</p>
+<div class="box warn"><span class="label">Pula to nie fallback</span><p>Pula rozkłada ruch między <em>zamienne</em> wdrożenia: ten sam model, inne regiony lub klucze. Gdybyś dorzucił do <code>helpdesk-fast</code> inny model „bo ma wolne limity”, co któreś zgłoszenie byłoby klasyfikowane inaczej, a logi pokazywałyby tylko alias. Inny model to inny alias, a przełączanie między aliasami to fallback z lekcji 1.5.</p></div>
+
+<h2>Pozostałe sekcje config.yaml</h2>
+<p><code>litellm_settings</code> dotyczy każdego wywołania modelu, <code>router_settings</code> wyboru wdrożenia, a <code>general_settings</code> samego serwera (uwierzytelnienie, baza, alerty).</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – ustawienia produkcyjne">
+  litellm_settings:
+    drop_params: true            # parametr nieobsługiwany przez dostawcę jest pomijany zamiast błędu
+    request_timeout: 60          # sekundy; domyślna wartość jest bardzo długa
+    num_retries: 0               # retry układamy świadomie w lekcji 1.5
+    json_logs: true
+    enable_azure_ad_token_refresh: true
+
+  router_settings:
+    routing_strategy: simple-shuffle
+    allowed_fails: 3             # błędy w ciągu minuty, po których wdrożenie idzie na cooldown
+    cooldown_time: 30            # sekundy przerwy dla takiego wdrożenia
+
+  general_settings:
+    master_key: os.environ/LITELLM_MASTER_KEY     # musi zaczynać się od "sk-"
+    database_url: os.environ/DATABASE_URL          # albo sama zmienna DATABASE_URL
+    proxy_batch_write_at: 60                       # koszty zapisywane wsadowo co 60 s
+    database_connection_pool_limit: 10            # per proces (worker)
+    background_health_checks: true                 # /health z cache zamiast pytać modele
+</script>
+<ul>
+  <li><code>drop_params</code> to wygoda z ryzykiem: parametr, którego model nie obsługuje, znika po cichu. Krytyczne parametry (np. format odpowiedzi) weryfikuj evalami.</li>
+  <li>Pula połączeń liczy się per proces: 3 repliki × limit 10 to 30 połączeń. Policz to, jeśli serwer Postgresa jest współdzielony.</li>
+  <li><code>proxy_batch_write_at: 60</code> oznacza, że raporty są spóźnione o minutę, a budżet może zostać przekroczony o koszt żądań z tego okna.</li>
+</ul>
+<table>
+  <tr><th>Zmienna</th><th>Po co</th></tr>
+  <tr><td><code>LITELLM_SALT_KEY</code></td><td>Szyfruje dane uwierzytelniające zapisane w bazie. Ustaw przed pierwszym startem i nigdy nie zmieniaj, bo zapisane dane staną się nieczytelne.</td></tr>
+  <tr><td><code>LITELLM_LOG=ERROR</code></td><td>Mniej szumu. Poziom <code>DEBUG</code> może logować treść promptów, czyli dane klientów.</td></tr>
+</table>
+<div class="box warn"><span class="label">Jedno źródło prawdy</span><p>Modele można dodawać też przez panel <code>/ui</code> (opcja <code>store_model_in_db</code>). Wtedy część konfiguracji żyje w Gicie, a część w bazie, i nikt nie wie, co działa na produkcji. W HelpDesk modele są wyłącznie w <code>config.yaml</code>, a panel służy do kluczy i raportów.</p></div>
+
+<h2>Nazewnictwo aliasów według przeznaczenia</h2>
+<p>Schemat: <code>&lt;system&gt;-&lt;klasa zadania&gt;[-&lt;wariant&gt;]</code>. Nazwa mówi, <em>do czego</em> alias służy, a nie jaki model dziś się za nim kryje.</p>
+<table>
+  <tr><th>Alias</th><th>Kontrakt</th><th>Kto używa</th></tr>
+  <tr><td><code>helpdesk-default</code></td><td>Najlepsze rozumowanie i <dfn data-t="tool-calling">tool calling</dfn>, polski, kilka sekund</td><td>Czat asystenta</td></tr>
+  <tr><td><code>helpdesk-fast</code></td><td>Tani i szybki, poprawny structured output</td><td>Triage, streszczenia</td></tr>
+  <tr><td><code>helpdesk-default-backup</code></td><td>Zastępstwo dla default u <em>innego dostawcy</em></td><td>Fallback w proxy, evale; aplikacja nie woła wprost</td></tr>
+  <tr><td><code>helpdesk-local</code></td><td>Dane nie opuszczają infrastruktury; niższa jakość</td><td>Tenanci z <code>external_llm_allowed = false</code></td></tr>
+</table>
+<p>Alias <code>gpt-4.1-mini</code> za pół roku zacznie kłamać, bo pod nim będzie inny model, a programista uwierzy nazwie, nie konfiguracji. <code>model-2</code> nic nie mówi o kontrakcie, więc nikt nie wie, czy wolno go użyć do nowej funkcji. Prefiks <code>helpdesk-</code> wyznacza właściciela, gdy z proxy korzysta kilka systemów. Wybór aliasu to decyzja biznesowa, więc zapada w backendzie, w jednym miejscu:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/llm/ModelSelector.kt">
+  object LlmAliases {
+      const val DEFAULT = "helpdesk-default"
+      const val FAST = "helpdesk-fast"
+      const val LOCAL = "helpdesk-local"
+      // helpdesk-default-backup celowo nieobecny: przełączaniem zajmuje się proxy
+  }
+
+  enum class LlmTask { CHAT, TRIAGE, SUMMARY }
+
+  @Component
+  class ModelSelector(private val tenantSettings: TenantSettingsApi) {
+      fun aliasFor(tenantId: UUID, task: LlmTask): String {
+          val s = tenantSettings.get(tenantId)
+          if (!s.aiEnabled) throw AiDisabledForTenantException(tenantId)
+          if (!s.externalLlmAllowed) return LlmAliases.LOCAL     // zgoda ma pierwszeństwo przed jakością
+          return when (task) {
+              LlmTask.CHAT -> LlmAliases.DEFAULT
+              LlmTask.TRIAGE, LlmTask.SUMMARY -> LlmAliases.FAST
+          }
+      }
+  }
+</script>
+<div class="box warn"><span class="label">Pułapka: fallback wyprowadza dane</span><p>Fallback „gdy <code>helpdesk-local</code> nie odpowiada, użyj <code>helpdesk-default</code>” przy awarii serwera lokalnego wyśle dane Globexu do zewnętrznego dostawcy. Alias lokalny nie może mieć fallbacku na zewnętrzny model. Dla obrony w głąb ścieżka Globexu może dostać klucz z dostępem wyłącznie do <code>helpdesk-local</code>.</p></div>
+
+<h2>Klucze: trzy poziomy</h2>
+<table>
+  <tr><th>Poziom</th><th>Do czego</th><th>Gdzie</th></tr>
+  <tr><td>Klucze dostawców</td><td>Wywołania Anthropic, Azure OpenAI na koszt firmy</td><td>Wyłącznie w sekretach proxy; na Azure najlepiej managed identity zamiast klucza</td></tr>
+  <tr><td><dfn data-t="master-key">Master key</dfn></td><td>Administracja: klucze, zespoły, budżety, panel</td><td>Sejf sekretów; 2–3 administratorów i automatyzacja</td></tr>
+  <tr><td><dfn data-t="virtual-key">Klucze wirtualne</dfn></td><td>Wywołania modeli przez aplikacje, z listą aliasów, budżetem i limitami</td><td>Sekrety aplikacji (<code>LLM_API_KEY_*</code>)</td></tr>
+</table>
+<p>Master key działa też jako klucz do modeli, bez limitów, więc nigdy nie trafia do aplikacji. Wyciek klucza wirtualnego kosztuje najwyżej jego budżet i jest odwoływalny jednym wywołaniem; wyciek master key pozwala wydawać sobie nowe klucze.</p>
+<p>Zasada: <strong>jeden klucz na funkcję AI i środowisko</strong>.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="klucze wirtualne HelpDesk">
+  key_alias               models                               max_budget / 30d
+  ─────────────────────── ──────────────────────────────────── ────────────────
+  helpdesk-chat-prod      helpdesk-default, helpdesk-local     2000 USD
+  helpdesk-triage-prod    helpdesk-fast, helpdesk-local         150 USD
+  helpdesk-evals-ci       wszystkie aliasy, także backup        300 USD
+  helpdesk-chat-staging   helpdesk-default, helpdesk-local      100 USD
+  helpdesk-dev-<login>    helpdesk-fast, helpdesk-local          20 USD
+</script>
+<p>Raport kosztów od razu pokazuje koszt każdej funkcji, pętla w triage nie zje budżetu czatu, staging nie konkuruje o limity z produkcją, a klucz wyciekły z laptopa kosztuje najwyżej 20 USD.</p>
+
+<h2>Klucze wirtualne: generowanie, zespoły, limity</h2>
+<p>Klucze wirtualne wymagają bazy. Tworzy je <code>/key/generate</code> wywołany z master key:</p>
+<script type="text/x-code" data-lang="bash" data-title="nowy klucz dla triage">
+  curl -sS -X POST "$LITELLM_URL/key/generate" \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+    -d '{
+          "key_alias": "helpdesk-triage-prod",
+          "team_id": "'"$HELPDESK_TEAM_ID"'",
+          "models": ["helpdesk-fast", "helpdesk-local"],
+          "max_budget": 150,
+          "soft_budget": 120,
+          "budget_duration": "30d",
+          "rpm_limit": 300,
+          "tpm_limit": 400000,
+          "metadata": { "owner": "helpdesk", "env": "prod", "feature": "triage" }
+        }'
+  # odpowiedź: { "key": "sk-…", … } – klucz widać TYLKO raz, od razu do sejfu sekretów
+</script>
+<table>
+  <tr><th>Pole</th><th>Znaczenie</th></tr>
+  <tr><td><code>models</code></td><td>Dozwolone aliasy. Pusta lista zwykle oznacza dostęp do wszystkich, więc zawsze ją podawaj.</td></tr>
+  <tr><td><code>max_budget</code> / <code>soft_budget</code></td><td>Twardy limit w USD (blokuje) i próg ostrzegawczy (wywołuje alert).</td></tr>
+  <tr><td><code>budget_duration</code></td><td>Okres resetu budżetu (<code>1d</code>, <code>30d</code>); bez niego budżet jest jednorazowy.</td></tr>
+  <tr><td><code>rpm_limit</code>, <code>tpm_limit</code></td><td>Żądania i tokeny na minutę dla klucza, łącznie dla wszystkich aliasów.</td></tr>
+  <tr><td><code>duration</code></td><td>Czas życia, np. <code>90d</code>; dla kluczy tymczasowych (testy obciążeniowe, partnerzy).</td></tr>
+</table>
+<h3>Dlaczego limit TPM jest ważniejszy niż RPM</h3>
+<p>Najgorszy przypadek dla czatu: pętla agenta wysyła żądania z kontekstem 8000 <dfn data-t="token">tokenów</dfn> wejściowych po ilustracyjnej cenie 3 USD za milion (sprawdź aktualny cennik).</p>
+<ul>
+  <li>Tylko <code>rpm_limit: 600</code>: 600 × 8000 = 4,8 mln tokenów na minutę, ok. 14,40 USD na minutę, ok. 860 USD na godzinę.</li>
+  <li>Z <code>tpm_limit: 400000</code>: maksymalnie ok. 1,20 USD na minutę, ok. 72 USD na godzinę. Alert zdąży zadziałać, a budżet zatrzyma resztę.</li>
+</ul>
+<p>Limit dobierasz z realnego ruchu. Triage: 3000 zgłoszeń dziennie, w szczycie ok. 15% ruchu w godzinę, czyli ok. 8 zgłoszeń na minutę po ok. 1600 tokenów, razem ok. 13 tys. tokenów na minutę. Limit 400 tys. to ponad 30-krotny zapas. Koszt miesięczny przy ilustracyjnych 0,40 USD (wejście) i 1,60 USD (wyjście) za milion: 3000 × 30 × (1500 × 0,40 + 100 × 1,60) / 1 000 000 ≈ 68 USD, więc budżet 150 USD z progiem 120 USD jest rozsądny.</p>
+<h3>Zespoły</h3>
+<p>Zespół (team) grupuje klucze pod wspólnym limitem. Chroni przed sytuacją „każdy klucz w limicie, a razem za dużo”:</p>
+<script type="text/x-code" data-lang="bash" data-title="zespół HelpDesk">
+  curl -sS -X POST "$LITELLM_URL/team/new" \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+    -d '{ "team_alias": "helpdesk",
+          "models": ["helpdesk-default", "helpdesk-fast", "helpdesk-default-backup", "helpdesk-local"],
+          "max_budget": 3000, "budget_duration": "30d" }'
+  # odpowiedź zawiera team_id – podajesz go w /key/generate
+</script>
+<p>Klucz w zespole nie dostanie modelu spoza listy zespołu ani nie wyda więcej niż zespół.</p>
+
+<h2>Rotacja, odwoływanie i przechowywanie sekretów</h2>
+<p>Repozytorium zawiera <code>config.yaml</code> z odwołaniami <code>os.environ/…</code>, a wartości dostarcza platforma:</p>
+<ul>
+  <li><strong>Azure Key Vault</strong> (zarządzany sejf sekretów). Azure Container Apps pobiera z niego sekret przez managed identity i podaje kontenerowi jako zmienną środowiskową.</li>
+  <li><strong>Kubernetes Secret</strong> synchronizowany z Key Vault (External Secrets Operator lub Secrets Store CSI Driver). Secret w K8s jest tylko zakodowany base64, więc nie trzymaj go jako pliku YAML w Gicie.</li>
+  <li><strong>Lokalnie</strong>: <code>.env</code> w <code>.gitignore</code> i klucz deweloperski z budżetem 20 USD. Do tego skanowanie sekretów w CI (np. gitleaks).</li>
+</ul>
+<h3>Rotacja bez przestoju</h3>
+<p>Rotacja to okresowa wymiana klucza, ograniczająca skutki niewykrytego wycieku. W wersji open source: (1) wygeneruj nowy klucz z tymi samymi parametrami (alias z sufiksem, np. <code>-2026-11</code>); (2) zapisz go jako nową wersję sekretu w Key Vault; (3) zrestartuj aplikację w trybie rolling (stopniowa wymiana instancji); (4) sprawdź w logach kosztów, że stary klucz od doby nie ma ruchu; (5) usuń stary. Regeneracja z okresem przejściowym i automatyczna rotacja są oznaczone jako Enterprise.</p>
+<script type="text/x-code" data-lang="bash" data-title="incydent: wyciekł klucz wirtualny">
+  # 1. Natychmiast zablokuj (odwracalne, historia kosztów zostaje)
+  curl -sS -X POST "$LITELLM_URL/key/block" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H "Content-Type: application/json" -d '{"key": "sk-Xq3…"}'
+  # 2. Ile wydano
+  curl -sS "$LITELLM_URL/key/info?key=sk-Xq3…" -H "Authorization: Bearer $LITELLM_MASTER_KEY"
+  # 3. Po wydaniu aplikacji nowego klucza: usuń na stałe
+  curl -sS -X POST "$LITELLM_URL/key/delete" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H "Content-Type: application/json" -d '{"keys": ["sk-Xq3…"]}'
+</script>
+<p>Blokada działa w sekundy bez deployu, ale wyłącza funkcję AI, która używa klucza. Zatrzymanie strat jest ważniejsze niż dostępność jednej funkcji, dlatego najpierw blokujesz. Przy wycieku <em>klucza dostawcy</em> Azure OpenAI ma dwa klucze (KEY1 i KEY2), żeby przełączyć się na drugi przed unieważnieniem pierwszego; przy managed identity problem nie istnieje.</p>
+
+<h2>Śledzenie kosztów: user, tagi, metadane</h2>
+<p>Klucz per funkcja daje koszt per funkcja. Do pytania „ile kosztuje AI dla Acme?” potrzebujesz danych z samego żądania:</p>
+<table>
+  <tr><th>Mechanizm</th><th>Jak przekazać</th><th>W HelpDesk</th></tr>
+  <tr><td><code>user</code></td><td>Standardowe pole żądania OpenAI</td><td>ID tenanta: koszt i budżet per klient (w LiteLLM „end user”/„customer”)</td></tr>
+  <tr><td>Tagi</td><td>Nagłówek <code>x-litellm-tags: a,b</code> lub pole <code>tags</code> (tablica)</td><td><code>feature:triage</code>, <code>env:prod</code>, <code>prompt:triage-v7</code></td></tr>
+  <tr><td>Metadane logu</td><td>Nagłówek <code>x-litellm-spend-logs-metadata</code> z JSON</td><td>ID zgłoszenia, ID trace'a</td></tr>
+</table>
+<div class="box warn"><span class="label">Tylko identyfikatory</span><p>Logi kosztów leżą w bazie proxy, a pole <code>user</code> może trafić do dostawcy. Wysyłasz wyłącznie identyfikatory techniczne, nigdy imię, e-mail ani treść zgłoszenia, bo to <dfn data-t="pii">dane osobowe</dfn>. Nawet UUID użytkownika jest w rozumieniu RODO pseudonimem, dlatego jako <code>user</code> wysyłamy ID tenanta.</p></div>
+<p><code>OpenAiChatOptions</code> w Spring AI 1.x ma metody <code>user(String)</code> i <code>httpHeaders(Map&lt;String, String&gt;)</code>; nowsze wersje dodają <code>extraBody(Map)</code> na dowolne pola treści. Sprawdź je w wersji z Twojego BOM.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/llm/LlmOptionsFactory.kt">
+  data class LlmCallContext(val tenantId: UUID, val feature: String, val ticketId: UUID? = null, val promptVersion: String)
+
+  @Component
+  class LlmOptionsFactory(
+      private val selector: ModelSelector,
+      private val objectMapper: ObjectMapper,
+      @Value("\${helpdesk.env}") private val env: String,          // dev | staging | prod
+  ) {
+      fun options(ctx: LlmCallContext, task: LlmTask): OpenAiChatOptions {
+          val spendMetadata = buildMap {
+              put("tenant_id", ctx.tenantId.toString())
+              ctx.ticketId?.let { put("ticket_id", it.toString()) }
+              Span.current().spanContext.traceId
+                  .takeIf { it != TraceId.getInvalid() }?.let { put("trace_id", it) }  // lekcja 1.4
+          }
+          return OpenAiChatOptions.builder()
+              .model(selector.aliasFor(ctx.tenantId, task))
+              .user(ctx.tenantId.toString())
+              .httpHeaders(mapOf(
+                  "x-litellm-tags" to "feature:${ctx.feature},env:$env,prompt:${ctx.promptVersion}",
+                  "x-litellm-spend-logs-metadata" to objectMapper.writeValueAsString(spendMetadata),
+              ))
+              .build()
+      }
+  }
+
+  // użycie: triageClient.prompt().user(ticket.description).options(factory.options(ctx, LlmTask.TRIAGE)).call()
+</script>
+<p>Treść zgłoszenia idzie do modelu, ale nie do metadanych kosztów. Nagłówki są tu jednoznaczniejsze niż pole <code>metadata</code> w treści żądania, które w API OpenAI ma własne znaczenie, a jego interpretacja przez LiteLLM zmieniała się między wersjami.</p>
+<table>
+  <tr><th>Endpoint</th><th>Co zwraca</th></tr>
+  <tr><td><code>GET /key/info?key=…</code></td><td>Parametry klucza i koszt w bieżącym okresie (<code>info.spend</code>)</td></tr>
+  <tr><td><code>GET /team/info?team_id=…</code></td><td>Koszt i budżet zespołu</td></tr>
+  <tr><td><code>GET /customer/info</code></td><td>Koszt per wartość <code>user</code>, u nas per tenant (nazwę parametru sprawdź w swojej wersji)</td></tr>
+  <tr><td><code>GET /spend/logs?start_date=…&amp;end_date=…</code></td><td>Logi kosztów z okresu; z <code>request_id</code> jedno żądanie</td></tr>
+  <tr><td><code>GET /spend/logs/v2</code></td><td>Stronicowanie i filtry (<code>api_key</code>, <code>user_id</code>, <code>team_id</code>, <code>model</code>); zalecany do eksportu</td></tr>
+</table>
+<p>Log kosztów rośnie o wiersz na wywołanie: 50 tys. wywołań dziennie to 1,5 mln wierszy miesięcznie. Zaplanuj retencję albo eksport do hurtowni. Treść promptów nie jest domyślnie zapisywana w logach kosztów i tak ma zostać.</p>
+
+<h2>Budżety i alerty</h2>
+<p>Proxy sprawdza przed wywołaniem wszystkie poziomy budżetu naraz: zespół <code>helpdesk</code> (3000 USD), klucz funkcji (np. triage 150 USD) i klienta. Budżet per tenant przekłada się wprost na model biznesowy: plan STANDARD dostaje np. 30 USD AI miesięcznie, PREMIUM 200 USD. Tworzysz go przez <code>/budget/new</code> (definicja) i <code>/customer/new</code> (przypisanie do wartości <code>user</code>). Budżety klientów są globalne dla proxy, a nie per klucz, co pasuje, bo tenant jest jeden niezależnie od funkcji.</p>
+<h3>Co widzi aplikacja po przekroczeniu</h3>
+<p>Przekroczony budżet to błąd z typem informującym o budżecie (zwykle status 400), przekroczone RPM/TPM klucza to 429. Użytkownik nie może zobaczyć „błędu serwera”:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/llm/LlmErrorMapper.kt">
+  sealed class LlmFailure(msg: String) : RuntimeException(msg) {
+      class BudgetExceeded(msg: String) : LlmFailure(msg)
+      class Unavailable(msg: String) : LlmFailure(msg)
+  }
+
+  // Kształt błędu sprawdź na swojej wersji LiteLLM i utrwal w teście kontraktowym.
+  fun Exception.toLlmFailure(): LlmFailure {
+      val text = message.orEmpty().lowercase()
+      return if ("budget" in text && "exceed" in text) LlmFailure.BudgetExceeded(text)
+             else LlmFailure.Unavailable(text)
+  }
+
+  // w ApiExceptionHandler (lekcja 1.1)
+  @ExceptionHandler(LlmFailure::class)
+  fun aiUnavailable(e: LlmFailure) =
+      ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+          "Asystent jest chwilowo niedostępny. Zgłoszenie możesz obsłużyć ręcznie.").apply {
+          type = URI.create("https://helpdesk.example/problems/ai-unavailable")
+      }
+</script>
+<p>Dla triage przekroczenie budżetu oznacza ręczną kolejkę, a nie zgubione zgłoszenie (lekcja 1.5).</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – alerty">
+  general_settings:
+    alerting: ["ms_teams"]          # albo "slack", "webhook"; URL w MS_TEAMS_WEBHOOK_URL
+    alerting_threshold: 300         # sekundy, po których żądanie uznać za „wiszące”
+    alert_types: [budget_alerts, llm_exceptions, llm_too_slow, outage_alerts, daily_reports]
+</script>
+<p>Alerty proxy nie zastąpią alertów aplikacji: proxy wie, ile wydano, ale nie wie, że koszt na zgłoszenie wzrósł trzykrotnie po zmianie promptu (lekcje 2.6 i 5.7). Minimum na start: <code>soft_budget</code> na 80% każdego klucza, alert przy dziennym koszcie powyżej dwukrotności średniej z 7 dni i limit wydatków u samego dostawcy jako ostatnia linia obrony.</p>
+
+<h2>Spring AI na proxy: konfiguracja i test</h2>
+<p>Przy kluczach per funkcja potrzebujesz kilku klientów. Czat korzysta z autokonfiguracji, triage z osobnego <code>OpenAiApi</code> (niskopoziomowego klienta HTTP Spring AI) z własnym kluczem:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  spring:
+    ai:
+      openai:
+        base-url: ${LLM_BASE_URL:http://localhost:4000}   # proxy, bez /v1
+        api-key: ${LLM_API_KEY_CHAT}                      # klucz domyślnego klienta = czat
+        chat:
+          options:
+            model: helpdesk-default
+            temperature: 0.2
+            max-tokens: 800
+  helpdesk:
+    env: ${HELPDESK_ENV:dev}
+    llm:
+      triage-api-key: ${LLM_API_KEY_TRIAGE}
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/llm/LlmClientsConfig.kt">
+  @Configuration
+  class LlmClientsConfig {
+      @Bean
+      fun chatClient(builder: ChatClient.Builder): ChatClient = builder.build()
+
+      @Bean
+      fun triageClient(
+          @Value("\${spring.ai.openai.base-url}") baseUrl: String,
+          @Value("\${helpdesk.llm.triage-api-key}") apiKey: String,
+      ): ChatClient {
+          val api = OpenAiApi.builder().baseUrl(baseUrl).apiKey(apiKey).build()
+          val model = OpenAiChatModel.builder()
+              .openAiApi(api)
+              .defaultOptions(OpenAiChatOptions.builder().model(LlmAliases.FAST).temperature(0.0).maxTokens(200).build())
+              .build()
+          return ChatClient.create(model)
+      }
+  }
+</script>
+<p>Ręcznie zbudowany <code>OpenAiChatModel</code> nie dostaje wszystkiego z autokonfiguracji (np. rejestru obserwacji z lekcji 1.4), więc przekaż to jawnie. Nazwy builderów zmieniały się w wersjach 1.x, sprawdź dokumentację wersji z BOM.</p>
+<script type="text/x-code" data-lang="bash" data-title="test połączenia z linii poleceń">
+  curl -sS http://localhost:4000/health/readiness | jq          # proxy i baza, bez klucza
+  curl -sS http://localhost:4000/v1/models -H "Authorization: Bearer $LLM_API_KEY_TRIAGE" | jq -r '.data[].id'
+  # oczekiwane: helpdesk-fast, helpdesk-local – i nic więcej
+
+  curl -sS -D - http://localhost:4000/v1/chat/completions \
+    -H "Authorization: Bearer $LLM_API_KEY_TRIAGE" -H "Content-Type: application/json" \
+    -d '{"model": "helpdesk-fast", "max_tokens": 5,
+         "messages": [{"role": "user", "content": "Odpowiedz jednym słowem: OK"}]}'
+</script>
+<p>W nagłówkach odpowiedzi: <code>x-litellm-model-group</code> (alias, o który prosiłeś), <code>x-litellm-model-id</code> (<code>model_info.id</code> wdrożenia, które odpowiedziało), <code>x-litellm-response-cost</code> (koszt w USD) i <code>x-litellm-call-id</code> (do odszukania w logach). Pole <code>model</code> w treści to nazwa modelu od dostawcy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="LlmProxySmokeIT.kt">
+  @Tag("smoke")      // po wdrożeniu na staging, nie przy każdym buildzie: kosztuje tokeny
+  @SpringBootTest
+  class LlmProxySmokeIT(
+      @Autowired private val triageClient: ChatClient,
+      @Value("\${spring.ai.openai.base-url}") baseUrl: String,
+      @Value("\${helpdesk.llm.triage-api-key}") triageKey: String,
+  ) {
+      private val http = RestClient.builder().baseUrl(baseUrl)
+          .defaultHeader("Authorization", "Bearer $triageKey").build()
+
+      data class ModelList(val data: List<ModelEntry>)
+      data class ModelEntry(val id: String)
+
+      @Test
+      fun `klucz triage widzi dokladnie swoje aliasy`() {
+          val ids = http.get().uri("/v1/models").retrieve().body<ModelList>()!!.data.map { it.id }
+          assertThat(ids).containsExactlyInAnyOrder(LlmAliases.FAST, LlmAliases.LOCAL)
+      }
+
+      @Test
+      fun `alias fast odpowiada i zwraca faktyczny model`() {
+          val r = triageClient.prompt().user("Odpowiedz jednym słowem: OK").call().chatResponse()!!
+          assertThat(r.result.output.text).isNotBlank()
+          assertThat(r.metadata.model).isNotBlank()
+      }
+  }
+</script>
+<p>Pierwszy test pilnuje bezpieczeństwa: nikt „na chwilę” nie rozszerzy klucza triage o drogi alias czatu.</p>
+<div class="box warn"><span class="label">Readiness aplikacji a proxy</span><p>Nie dodawaj sprawdzania proxy do grupy <code>readiness</code> Actuatora. Gdy proxy padnie, Kubernetes uzna wszystkie instancje backendu za niegotowe i odetnie cały HelpDesk, a nie tylko funkcje AI. Wskaźnik proxy umieść w osobnej grupie, służącej do monitoringu.</p></div>
+
+<h2>Wdrożenie proxy: lokalnie i produkcyjnie</h2>
+<p>Lokalnie rozszerzamy Compose z lekcji 1.1 o przypiętą wersję, Redisa i health check:</p>
+<script type="text/x-code" data-lang="yaml" data-title="docker-compose.yml (fragment)">
+  services:
+    litellm:
+      image: ghcr.io/berriai/litellm:main-v1.xx.x-stable   # konkretne wydanie, nigdy :latest
+      command: ["--config", "/app/config.yaml", "--port", "4000"]
+      volumes: ["./litellm.yaml:/app/config.yaml:ro"]
+      env_file: .env
+      environment:
+        DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
+        REDIS_HOST: redis
+        REDIS_PORT: "6379"
+      depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_started } }
+      ports: ["4000:4000"]
+      healthcheck:
+        test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+        interval: 10s
+    redis:
+      image: redis:7-alpine
+</script>
+<table>
+  <tr><th>Endpoint</th><th>Co sprawdza</th><th>Użycie</th></tr>
+  <tr><td><code>/health/liveliness</code></td><td>Czy proces działa; bez zależności i bez klucza</td><td>Liveness probe</td></tr>
+  <tr><td><code>/health/readiness</code></td><td>Gotowość instancji, w tym baza (503, gdy niedostępna); bez klucza</td><td>Readiness probe</td></tr>
+  <tr><td><code>/health</code></td><td>Stan każdego wdrożenia modelu; bez trybu w tle wysyła prawdziwe zapytania; wymaga klucza</td><td>Monitoring, nigdy probe</td></tr>
+</table>
+<p>Liveness probe (sonda „czy żyjesz”) decyduje o restarcie kontenera, readiness probe (sonda „czy jesteś gotów”) o kierowaniu do niego ruchu. Probe na <code>/health</code> co 10 s z 3 replik to ponad 100 tys. płatnych zapytań miesięcznie na każdy model, a awaria jednego dostawcy restartowałaby całe proxy.</p>
+<h3>Azure Container Apps</h3>
+<p>Azure Container Apps (zarządzana platforma kontenerów bez utrzymywania klastra) to najprostsza opcja w Azure. CI buduje własny obraz z przypiętej wersji LiteLLM i <code>config.yaml</code>, więc tag obrazu jest wersją konfiguracji, a rollback to powrót do poprzedniej rewizji.</p>
+<script type="text/x-code" data-lang="bash" data-title="Dockerfile i wdrożenie (szkic)">
+  # proxy/Dockerfile
+  #   FROM ghcr.io/berriai/litellm:main-v1.xx.x-stable
+  #   COPY litellm.yaml /app/config.yaml
+  #   CMD ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]
+
+  KV=https://kv-helpdesk-prod.vault.azure.net/secrets
+  az containerapp create --name litellm --resource-group rg-helpdesk-prod \
+    --environment cae-helpdesk-prod --image acrhelpdesk.azurecr.io/litellm-proxy:2026.11.12-a1b2c3d \
+    --ingress internal --target-port 4000 --min-replicas 2 --max-replicas 6 \
+    --user-assigned "$PROXY_IDENTITY_ID" \
+    --secrets "master-key=keyvaultref:$KV/litellm-master-key,identityref:$PROXY_IDENTITY_ID" \
+              "db-url=keyvaultref:$KV/litellm-database-url,identityref:$PROXY_IDENTITY_ID" \
+    --env-vars LITELLM_MASTER_KEY=secretref:master-key DATABASE_URL=secretref:db-url \
+               LITELLM_MODE=PRODUCTION LITELLM_LOG=ERROR AZURE_CLIENT_ID="$PROXY_IDENTITY_CLIENT_ID"
+  # analogicznie LITELLM_SALT_KEY i klucz Anthropic; probes i strefy w Bicep/Terraform
+</script>
+<p><code>--ingress internal</code> oznacza dostęp tylko z sieci środowiska. <code>AZURE_CLIENT_ID</code> wskazuje tożsamość typu user-assigned, której ma użyć <code>DefaultAzureCredential</code>. Zasoby zmierz pod obciążeniem: dokumentacja LiteLLM zaleca nawet 1 vCPU i 4 GiB na worker.</p>
+<h3>Kubernetes</h3>
+<script type="text/x-code" data-lang="yaml" data-title="k8s/litellm.yaml (fragment)">
+  spec:
+    replicas: 3
+    template:
+      metadata:
+        annotations: { checksum/config: "<sha256 litellm.yaml>" }   # zmiana konfiguracji → rolling restart
+      spec:
+        topologySpreadConstraints:                                  # repliki w różnych strefach
+          - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway,
+              labelSelector: { matchLabels: { app: litellm } } }
+        containers:
+          - name: litellm
+            image: ghcr.io/berriai/litellm:main-v1.xx.x-stable
+            args: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]
+            envFrom: [{ secretRef: { name: litellm-secrets } }]     # synchronizowany z Key Vault
+            livenessProbe:  { httpGet: { path: /health/liveliness, port: 4000 }, periodSeconds: 15 }
+            readinessProbe: { httpGet: { path: /health/readiness, port: 4000 }, periodSeconds: 10 }
+  ---
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata: { name: litellm }
+  spec: { minAvailable: 2, selector: { matchLabels: { app: litellm } } }
+</script>
+<p>LiteLLM nie przeładowuje pliku sam, więc suma kontrolna ConfigMapy w adnotacji wymusza restart podów po zmianie. PodDisruptionBudget (reguła K8s ograniczająca planowe wyłączenia) nie pozwoli aktualizacji węzłów zabić więcej niż jednej repliki. Dokumentacja zaleca 1 worker na pod i skalowanie liczbą podów; projekt udostępnia też chart Helm.</p>
+
+<h2>GitOps i proxy jako krytyczna zależność</h2>
+<p><dfn data-t="gitops">GitOps</dfn> to podejście, w którym stan infrastruktury opisuje repozytorium, a każda zmiana przechodzi przez pull request i automatyczne wdrożenie. Zmiana modelu pod aliasem jest wtedy commitem z autorem i recenzją, a rollback to <code>git revert</code>. Pipeline dla zmiany w <code>litellm.yaml</code>:</p>
+<ol>
+  <li>Walidacja reguł: każdy wpis ma <code>model_info.id</code>, żadnych kluczy wpisanych wprost, <code>helpdesk-local</code> bez fallbacku na zewnętrzny alias.</li>
+  <li>Start proxy w kontenerze w CI i <code>/health/readiness</code>.</li>
+  <li>Evale dla aliasów, których dotyczy zmiana.</li>
+  <li>Staging ze smoke testem, potem produkcja po zatwierdzeniu.</li>
+</ol>
+<h3>Pojedynczy punkt awarii</h3>
+<p>Proxy przyjmuje cały ruch AI, więc jest <dfn data-t="spof">pojedynczym punktem awarii (SPOF)</dfn>: gdy nie działa, nie działa żadna funkcja AI w firmie. Samo proxy jest bezstanowe (stan jest w Postgresie i Redisie), więc zabezpiecza się je jak każdą krytyczną usługę HTTP:</p>
+<table>
+  <tr><th>Ryzyko</th><th>Zabezpieczenie</th></tr>
+  <tr><td>Awaria instancji lub strefy</td><td>2–3 repliki w różnych strefach, PodDisruptionBudget, autoskalowanie po CPU</td></tr>
+  <tr><td>Awaria Postgresa</td><td>Baza w trybie HA. Opcja <code>allow_requests_on_db_unavailable</code> obsłuży żądania bez bazy, ale osłabia kontrolę kluczy i budżetów, więc dokumentacja zaleca ją tylko dla proxy niedostępnego z internetu.</td></tr>
+  <tr><td>Wadliwa wersja LiteLLM lub konfiguracja</td><td>Przypięty obraz, lista zmian, staging, rolling update i rollback w minutę. Wydania są bardzo częste: nie aktualizuj automatycznie.</td></tr>
+  <tr><td>Proxy mimo to niedostępne</td><td>W aplikacji krótki timeout, <dfn data-t="circuit-breaker">circuit breaker</dfn> i degradacja: UI bez asystenta, triage do ręcznej kolejki (lekcja 1.5)</td></tr>
+  <tr><td>Przejęcie proxy</td><td>Proxy zna wszystkie klucze dostawców: tylko wewnętrzny ingress, <code>/ui</code> niedostępne z zewnątrz, obraz przypięty po digeście, minimalne uprawnienia tożsamości</td></tr>
+</table>
+<p>„Awaryjna” ścieżka z aplikacji prosto do dostawcy zwykle szkodzi: wymaga klucza dostawcy w aplikacji, omija budżety i jest nieprzetestowana, bo uruchamia się raz w roku. Lepiej zainwestować w dostępność proxy i łagodną degradację.</p>
+
+<h2>Wymiana modelu pod aliasem</h2>
+<p>Alias pozwala zmienić model jedną linijką, bez deployu aplikacji. To największa zaleta proxy i jego największe ryzyko: zmiana jest tak łatwa, że łatwo zrobić ją bez sprawdzenia skutków.</p>
+<div class="box bug"><span class="label">Błąd produkcyjny #2: cicha zmiana kategoryzacji triage</span>
+<p><strong>Co się stało.</strong> Dostawca wypuścił nowszy, tańszy model. Administrator zmienił <code>litellm_params.model</code> w aliasie <code>helpdesk-fast</code> w piątek po południu. Smoke testy przeszły: proxy odpowiadało poprawnym JSON-em zgodnym ze schematem.</p>
+<p><strong>Skutek.</strong> Nowy model inaczej rozumiał granicę między <code>BILLING</code> i <code>ACCOUNT</code>: pytania o faktury na konto firmowe trafiały do <code>ACCOUNT</code>. Ok. 18% zgłoszeń rozliczeniowych lądowało w złej kolejce z SLA liczonym w zespole, który ich nie obsługiwał. Nikt nie dostał błędu. Po tygodniu kierowniczka działu rozliczeń zauważyła, że w jej kolejce jest podejrzanie cicho.</p>
+<p><strong>Dlaczego nikt nie zauważył.</strong> Aplikacja logowała tylko alias, więc w danych nie było granicy „przed i po”. Evali triage nie uruchamiano, bo zmiana „nie dotyczyła kodu”.</p>
+<p><strong>Obrona.</strong> Zmiana aliasu to zmiana produkcyjna: pull request, evale przed scaleniem, zapis faktycznego modelu przy każdej decyzji, wdrożenie stopniowe lub shadow, monitoring rozkładu kategorii.</p></div>
+<h3>Procedura bezpiecznej zmiany</h3>
+<ol>
+  <li><strong>Kandydat pod osobnym aliasem</strong> <code>helpdesk-fast-candidate</code>, dostępny tylko dla klucza evali.</li>
+  <li><strong><dfn data-t="eval">Evale</dfn></strong> (lekcja 2.8, bramka CI w 3.7) na obecnym aliasie i kandydacie. Porównaj macierz pomyłek per kategoria, nie tylko średnią: średnia może stać w miejscu, gdy jedna kategoria się zawala. Do tego koszt i czas.</li>
+  <li><strong>Zapis faktycznego modelu</strong> i wersji promptu przy każdej decyzji w <code>ticket_events</code>.</li>
+  <li><strong><dfn data-t="canary">Canary</dfn></strong>: kandydat w puli <code>helpdesk-fast</code> z wagą 5%, porównanie rozkładu kategorii i ręcznych poprawek per model.</li>
+  <li><strong>Przełączenie</strong> na 100% po kilku dniach bez różnic, usunięcie starego wdrożenia w kolejnym commicie, wpis w changelogu z wynikami evali.</li>
+</ol>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – canary w puli">
+  model_list:
+    - model_name: helpdesk-fast
+      litellm_params: { model: azure/gpt-41-mini-eu, api_base: os.environ/AZURE_OPENAI_ENDPOINT_SWC,
+                        api_version: "2024-10-21", weight: 95 }
+      model_info: { id: fast-azure-swc-v1, base_model: azure/gpt-4.1-mini }
+    - model_name: helpdesk-fast                       # kandydat (nazwa wdrożenia przykładowa)
+      litellm_params: { model: azure/fast-candidate-eu, api_base: os.environ/AZURE_OPENAI_ENDPOINT_SWC,
+                        api_version: "2024-10-21", weight: 5 }
+      model_info: { id: fast-azure-swc-v2-candidate }
+</script>
+<p>Canary w puli celowo i na krótko łamie zasadę zamiennych wdrożeń, więc wymaga zaliczonych evali i zapisu faktycznego modelu. Losowe 5% żądań nie trzyma rozmowy na jednym modelu: dla triage to akceptowalne, dla czatu lepszy jest canary per tenant sterowany z aplikacji. Pełne wdrożenia stopniowe, <dfn data-t="shadow-mode">shadow mode</dfn> i rollback omawia lekcja 5.4.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="triage/TriageRecorder.kt (fragment)">
+  events.record(
+      ticketId = ticket.id, tenantId = ticket.tenantId,
+      actorType = ActorType.ASSISTANT, type = "TRIAGE_CATEGORIZED",
+      payload = mapOf(
+          "category" to decision.category,
+          "alias" to LlmAliases.FAST,
+          "model" to response.metadata.model,          // faktyczny model od dostawcy
+          "promptVersion" to ctx.promptVersion,
+      ),
+  )
+</script>
+<script type="text/x-code" data-lang="sql" data-title="rozkład kategorii per model – 14 dni">
+  SELECT payload->>'model'    AS model,
+         payload->>'category' AS kategoria,
+         count(*)             AS liczba,
+         round(100.0 * count(*) / sum(count(*)) OVER (PARTITION BY payload->>'model'), 1) AS procent
+  FROM ticket_events
+  WHERE type = 'TRIAGE_CATEGORIZED' AND actor_type = 'ASSISTANT'
+    AND created_at >= now() - interval '14 days'
+  GROUP BY 1, 2
+  ORDER BY 1, 4 DESC;
+</script>
+<p>Z tym zapytaniem różnica w udziale <code>BILLING</code> byłaby widoczna pierwszego dnia. Dwa wdrożenia tego samego modelu (np. dwa regiony) rozróżnisz dopiero po nagłówku <code>x-litellm-model-id</code>, którego <code>ChatResponse</code> nie wystawia; potrzebny jest wtedy interceptor klienta HTTP albo callback po stronie proxy (lekcja 1.4).</p>
+<div class="box tip"><span class="label">Reguła</span><p>Pull request zmieniający model pod istniejącym aliasem musi zawierać wyniki evali. Zmiana regionu lub klucza tego samego modelu wymaga tylko smoke testu.</p></div>
+
+<h2>Alternatywy i kiedy proxy to przesada</h2>
+<p>Zasady z tej lekcji przenoszą się na każdy gateway. Porównanie w skrócie (rynek zmienia się szybko, sprawdź aktualny stan):</p>
+<table>
+  <tr><th>Rozwiązanie</th><th>Mocne strony</th><th>Słabsze strony</th></tr>
+  <tr><td>LiteLLM (self-hosted)</td><td>Bardzo wielu dostawców, klucze wirtualne z budżetami w USD, pełna kontrola, ten sam stack lokalnie</td><td>Usługa do utrzymania (Postgres, Redis, aktualizacje); część funkcji płatna</td></tr>
+  <tr><td>Azure API Management (AI gateway)</td><td>Usługa zarządzana: polityki limitów tokenów, metryki zużycia, pule backendów z circuit breakerem, Entra ID</td><td>Najlepiej z modelami w Azure; polityki w XML; brak wygodnych budżetów w USD per klucz</td></tr>
+  <tr><td>Portkey</td><td>Routing, fallback, guardrails, panel obserwowalności</td><td>Pełnia funkcji w SaaS, czyli dane przez zewnętrzną firmę</td></tr>
+  <tr><td>Kong AI Gateway</td><td>Wtyczki AI do Konga; sens, gdy firma już go używa</td><td>Zaawansowane funkcje komercyjne; słabsze raporty kosztów LLM</td></tr>
+  <tr><td>Gatewaye chmurowe i agregatory (Bedrock, Vertex AI, Cloudflare AI Gateway, OpenRouter)</td><td>Wiele modeli za jednym API i jedną fakturą, zero utrzymania</td><td>Uzależnienie od chmury lub pośrednika, ograniczony wybór, dane u pośrednika</td></tr>
+</table>
+<p>Na Azure realny wybór to zwykle LiteLLM albo APIM. APIM wygrywa, gdy wszystkie modele są w Azure, a firma już utrzymuje APIM. LiteLLM wygrywa, gdy potrzebujesz modeli spoza Azure (Anthropic, lokalne), budżetów per funkcja i tenant oraz tego samego proxy na laptopie. Da się je łączyć: APIM jako brama sieciowa, LiteLLM jako warstwa modeli.</p>
+<p><strong>Proxy to przesada</strong> przy prototypie, który może zniknąć za miesiąc, albo przy jednej aplikacji z jednym dostawcą, małym ruchem i bez rozliczeń per klient, np. wszystko w Azure OpenAI z managed identity i kosztami w Azure Cost Management. Zachowaj wtedy nazwę modelu w konfiguracji i zapis faktycznego modelu przy decyzjach, a przejście na proxy będzie zmianą <code>base-url</code> i klucza. W HelpDesk proxy jest uzasadnione od początku: trzech dostawców, wymóg Globexu i budżety per funkcja i tenant.</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Uruchom proxy z konfiguracją z lekcji (dostawców zamień na dostępne, <code>helpdesk-local</code> skieruj na Ollamę). Utwórz zespół <code>helpdesk</code> i klucze <code>helpdesk-chat-dev</code> oraz <code>helpdesk-triage-dev</code>. Sprawdź, że klucz triage widzi tylko swoje aliasy i dostaje błąd dla <code>helpdesk-default</code>.</li>
+  <li>Utwórz klucz z <code>max_budget: 0.001</code>, wywołuj go do blokady, zapisz dokładny kształt błędu i napisz na jego podstawie test kontraktowy dla mapowania błędów.</li>
+  <li>Dodaj <code>LlmOptionsFactory</code>, wykonaj wywołania dla Acme i Globexu i sprawdź w <code>/spend/logs</code>, czy zapisały się tagi <code>feature:*</code> i <code>user</code>. Policz koszt per tenant.</li>
+  <li>Dodaj do puli <code>helpdesk-fast</code> drugie wdrożenie z wagą 20 i stałym <code>model_info.id</code>. Po 50 wywołaniach sprawdź rozkład w nagłówku <code>x-litellm-model-id</code>.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Jakiego klucza używa backend HelpDesk do wywołań modelu przez proxy?</p>
+  <button>Klucza API dostawcy, bo proxy tylko przekazuje żądanie dalej</button>
+  <button>Master key LiteLLM, bo ma dostęp do wszystkich aliasów</button>
+  <button>Klucza wirtualnego dla danej funkcji i środowiska, z listą aliasów, budżetem i limitami</button>
+  <p class="explain">Aplikacja dostaje najwęższy możliwy klucz. Jego wyciek kosztuje najwyżej jego budżet i jest odwoływalny jednym <code>/key/block</code>. Master key nie ma limitów i pozwala tworzyć klucze, a klucze dostawców są wyłącznie w sekretach proxy.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Do puli <code>helpdesk-fast</code> (ten sam model w dwóch regionach) ktoś chce dodać inny model, „bo ma wolne limity”. Co jest głównym problemem?</p>
+  <button>Pula powinna zawierać zamienne wdrożenia; inny model będzie klasyfikował część zgłoszeń inaczej, a logi aliasu tego nie pokażą</button>
+  <button>LiteLLM nie pozwala na różne modele pod jednym <code>model_name</code></button>
+  <button><code>simple-shuffle</code> nie działa z więcej niż dwoma wdrożeniami</button>
+  <p class="explain">Konfiguracja technicznie zadziała i właśnie dlatego jest groźna. Inny model powinien mieć własny alias, przejść evale i być przełączany jawnie: fallbackiem albo kontrolowanym canary.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Który endpoint ustawisz jako readiness probe dla LiteLLM?</p>
+  <button><code>/health</code>, bo sprawdza, czy modele odpowiadają</button>
+  <button><code>/health/readiness</code>, bo sprawdza gotowość instancji i bazy bez wywoływania modeli</button>
+  <button><code>/v1/models</code>, bo zwraca listę aliasów</button>
+  <p class="explain"><code>/health</code> wymaga klucza i bez trybu w tle wywołuje każdy model: kosztuje i uzależnia dostępność proxy od każdego dostawcy. <code>/health/liveliness</code> służy do liveness, <code>/health/readiness</code> do readiness.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Co powinno trafić do pola <code>user</code> i metadanych żądania z HelpDesk?</p>
+  <button>E-mail użytkownika, żeby łatwo znaleźć go w raporcie kosztów</button>
+  <button>Treść zgłoszenia, żeby analizować koszt drogich pytań</button>
+  <button>Identyfikatory techniczne: ID tenanta, funkcja, ID zgłoszenia, wersja promptu</button>
+  <p class="explain">Logi kosztów leżą w bazie proxy, a <code>user</code> może trafić do dostawcy. Dane osobowe i treści zgłoszeń nie mają tam czego szukać, a identyfikatory wystarczą, żeby połączyć koszt z tenantem, funkcją i trace'em.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Po zmianie modelu pod <code>helpdesk-fast</code> trafność triage w evalu spadła z 94% do 93,5%. Co jeszcze sprawdzasz?</p>
+  <button>Nic, 0,5 punktu procentowego to szum</button>
+  <button>Wyniki per kategoria, koszt i czas, a po wdrożeniu rozkład kategorii per faktyczny model</button>
+  <button>Tylko to, czy nowy model zwraca poprawny JSON</button>
+  <p class="explain">Średnia może się prawie nie zmienić, gdy jedna kategoria się zawala, jak w błędzie produkcyjnym #2. Poprawny format nie oznacza poprawnej klasyfikacji, dlatego porównujesz kategorie i monitorujesz decyzje z zapisanym modelem.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

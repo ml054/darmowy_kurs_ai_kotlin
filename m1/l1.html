@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.1 System HelpDesk – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="1.1">
+<main>
+<p class="meta">Lekcja 1.1 · ok. 60 min</p>
+<h1>System HelpDesk: architektura, API, uprawnienia</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Poznać system, do którego przez cały kurs dodajemy AI: domenę, moduły, API i dane.</li>
+  <li>Zrozumieć, które elementy istniejącej architektury staną się granicami bezpieczeństwa dla asystenta.</li>
+  <li>Zbudować izolację klientów w trzech warstwach: zapytanie, serwis i baza (Row Level Security).</li>
+  <li>Przygotować dane testowe i test integracyjny, który od pierwszego dnia pilnuje izolacji.</li>
+  <li>Uruchomić lokalne środowisko z proxy LLM i narzędziami obserwowalności.</li>
+</ul></div>
+
+<div class="box"><span class="label">Jak czytać kurs</span><p>Pojęcia z <dfn data-t="eval">podkreśleniem kropkowanym</dfn> możesz dotknąć, żeby zobaczyć krótką definicję. Pełne wyjaśnienia są w słowniczku (przycisk <strong>Aa</strong> u góry). Każde pojęcie ma też swoją lekcję, do której prowadzi słowniczek, więc tu wystarczy intuicja.</p></div>
+
+<h2>Co zmienia się w systemie, gdy dodajesz AI</h2>
+<p>Większość projektów AI w firmach nie zaczyna się od zera. Jest działająca aplikacja z bazą, uprawnieniami, SLA i użytkownikami, a zadanie brzmi: „dodaj asystenta”. Pierwsza pokusa to potraktowanie AI jak kolejnego endpointu. To błąd, bo LLM wprowadza do systemu cechy, których klasyczny kod nie ma:</p>
+<table>
+  <tr><th>Cecha</th><th>Klasyczny endpoint</th><th>Funkcja z LLM</th></tr>
+  <tr><td>Determinizm</td><td>Te same dane wejściowe dają ten sam wynik</td><td>Wynik może się różnić przy każdym wywołaniu</td></tr>
+  <tr><td>Czas odpowiedzi</td><td>Milisekundy</td><td>Sekundy, czasem dziesiątki sekund</td></tr>
+  <tr><td>Koszt żądania</td><td>Praktycznie zerowy</td><td>Płacisz za każdy <dfn data-t="token">token</dfn> (fragment tekstu), koszt rośnie z długością rozmowy</td></tr>
+  <tr><td>Wejście</td><td>Walidowane DTO</td><td>Swobodny tekst, który może zawierać ukryte polecenia dla modelu (<dfn data-t="prompt-injection">prompt injection</dfn>)</td></tr>
+  <tr><td>Kto decyduje, co wywołać</td><td>Programista, w kodzie</td><td>Model sam wybiera, które funkcje systemu wywołać (<dfn data-t="tool-calling">tool calling</dfn>)</td></tr>
+  <tr><td>Zależność zewnętrzna</td><td>Własna baza</td><td>Zewnętrzny dostawca z limitami, awariami i zmianami modeli</td></tr>
+  <tr><td>Testowanie</td><td>Asercje na wynik</td><td>Statystyczna ocena jakości na zestawie przykładów (<dfn data-t="eval">evale</dfn>)</td></tr>
+</table>
+<p>Każdy wiersz tej tabeli będzie miał w kursie osobną lekcję. Ta lekcja przygotowuje fundament: system, w którym uprawnienia i izolacja klientów są egzekwowane tak, że asystent nie jest w stanie ich obejść, nawet jeśli model „zechce”.</p>
+<div class="box tip"><span class="label">Zasada kursu</span><p>LLM jest kolejnym <em>klientem</em> Twojego API, a nie nowym źródłem prawdy. Wszystko, co model robi, przechodzi przez te same serwisy, walidacje i uprawnienia co akcje człowieka. Model może się pomylić, dać się zmanipulować albo wymyślić dane. Backend nie może.</p></div>
+
+<h2>Domena HelpDesk</h2>
+<p>HelpDesk to system zgłoszeń serwisowych dla wielu firm-klientów (<dfn data-t="tenant">tenantów</dfn>). Firma usługowa ma zespół agentów, którzy obsługują zgłoszenia od klientów. Każdy klient widzi wyłącznie swoje zgłoszenia, a agent widzi zgłoszenia tenantów, do których jest przypisany.</p>
+<h3>Role</h3>
+<table>
+  <tr><th>Rola</th><th>Kto to</th><th>Co może</th></tr>
+  <tr><td><code>CUSTOMER</code></td><td>Pracownik firmy-klienta</td><td>Tworzy zgłoszenia, widzi i komentuje zgłoszenia swojej firmy (tylko komentarze publiczne), zamyka własne zgłoszenia po rozwiązaniu.</td></tr>
+  <tr><td><code>AGENT</code></td><td>Pracownik działu wsparcia</td><td>Obsługuje zgłoszenia przypisanych tenantów: zmienia status i priorytet, przypisuje, pisze komentarze publiczne i notatki wewnętrzne.</td></tr>
+  <tr><td><code>ADMIN</code></td><td>Administrator firmy usługowej</td><td>Wszystko powyżej we wszystkich tenantach plus konfiguracja SLA i ustawień tenantów.</td></tr>
+</table>
+<h3>Encje</h3>
+<ul>
+  <li><strong>Tenant</strong>: firma-klient. Ma ustawienia, m.in. czy funkcje AI są włączone i czy dane mogą być przetwarzane przez zewnętrznego dostawcę LLM.</li>
+  <li><strong>Ticket</strong>: zgłoszenie, ze statusem, priorytetem, osobą przypisaną i terminem <dfn data-t="sla">SLA</dfn> (uzgodniony czas reakcji i rozwiązania).</li>
+  <li><strong>Comment</strong>: komentarz do zgłoszenia, <em>publiczny</em> (widzi klient) albo <em>wewnętrzny</em> (tylko agenci).</li>
+  <li><strong>SlaPolicy</strong>: czasy reakcji i rozwiązania zależne od priorytetu i planu tenanta.</li>
+  <li><strong>TicketEvent</strong>: historia zmian zgłoszenia (kto, co, kiedy). Później dołączą tu akcje asystenta.</li>
+</ul>
+<div class="box warn"><span class="label">Zapamiętaj: komentarze wewnętrzne</span><p>Notatki wewnętrzne to drugi, mniej oczywisty kanał wycieku. Agent pisze w nich na przykład „klient jest trudny, nie dawać rabatu”. Jeśli asystent dla klienta streści zgłoszenie razem z notatkami, wyciek dzieje się bez żadnego „hakowania”. Widoczność komentarzy musi być filtrowana tak samo twardo jak tenant.</p></div>
+
+<h2>Architektura</h2>
+<script type="text/x-code" data-lang="plaintext" data-title="architektura">
+  ┌──────────────┐   HTTPS/JWT   ┌────────────────────────────────────────────┐
+  │ React + TS   │ ────────────► │ Spring Boot (Kotlin) – modularny monolit   │
+  │ (SPA)        │ ◄──── SSE ─── │                                            │
+  └──────────────┘               │  identity │ ticket │ comment │ sla │ tenant │
+                                 │                 ▲                          │
+                                 │                 │ tylko publiczne API      │
+                                 │            assistant (AI)                  │
+                                 └───────┬───────────────┬──────────────┬─────┘
+                                         │ JDBC          │ HTTP         │ OTLP
+                                   ┌─────▼─────┐   ┌─────▼─────┐   ┌────▼──────────┐
+                                   │ Postgres  │   │ LiteLLM   │   │ OTel Collector│
+                                   │ + pgvector│   │ (proxy)   │   │ → Tempo/      │
+                                   │ + RLS     │   └─────┬─────┘   │   Langfuse    │
+                                   └───────────┘         │         └───────────────┘
+                                                 Anthropic / OpenAI / Ollama
+</script>
+<p>Kluczowe decyzje:</p>
+<ul>
+  <li><strong>Modularny monolit</strong> zamiast mikroserwisów. Asystent jest osobnym modułem, który korzysta z publicznych interfejsów modułów domenowych. Nie ma dostępu do ich repozytoriów ani encji JPA.</li>
+  <li><strong>Postgres z <dfn data-t="pgvector">pgvector</dfn></strong>: ta sama baza obsłuży wyszukiwanie po znaczeniu tekstu (wektorowe) w module 4, bez osobnej bazy wektorowej.</li>
+  <li><strong><dfn data-t="proxy">Proxy LLM</dfn></strong> między aplikacją a dostawcami modeli: jedno miejsce na klucze, limity, koszty i przełączanie modeli (lekcja 1.3).</li>
+  <li><strong>OpenTelemetry</strong> od pierwszego dnia: każde żądanie zostawia <dfn data-t="trace">trace</dfn>, czyli zapis wszystkich operacji z czasami (lekcja 1.4).</li>
+</ul>
+
+<h3>Struktura pakietów i pilnowanie granic</h3>
+<script type="text/x-code" data-lang="plaintext" data-title="src/main/kotlin/pl/example/helpdesk">
+  helpdesk/
+  ├── HelpdeskApplication.kt
+  ├── identity/            CurrentUser, Role, konfiguracja security
+  ├── tenant/              TenantSettings, TenantSettingsApi
+  ├── ticket/
+  │   ├── TicketApi.kt     ← publiczny interfejs modułu (fasada)
+  │   ├── TicketViews.kt   ← publiczne DTO (widoki)
+  │   └── internal/        encje, repozytoria, implementacja – niewidoczne na zewnątrz
+  ├── comment/
+  │   ├── CommentApi.kt
+  │   └── internal/
+  ├── sla/
+  │   ├── SlaApi.kt
+  │   └── internal/
+  └── assistant/           moduł AI – zależy tylko od *Api i widoków
+</script>
+<p>Granice łatwo złamać jednym importem, więc pilnuje ich test. Spring Modulith traktuje pakiety pierwszego poziomu jako moduły, a podpakiety (np. <code>internal</code>) jako niedostępne dla innych modułów:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ModulithArchitectureTest.kt">
+  // testImplementation("org.springframework.modulith:spring-modulith-starter-test")
+  class ModulithArchitectureTest {
+      @Test
+      fun `moduly nie siegaja do wnetrza innych modulow`() {
+          ApplicationModules.of(HelpdeskApplication::class.java).verify()
+      }
+  }
+</script>
+<p>Jeśli ktoś w module <code>assistant</code> wstrzyknie <code>TicketRepository</code> „bo tak szybciej”, test się wywali. To ważne, bo repozytorium nie zna uprawnień, a fasada zna.</p>
+<p>Gdy nie chcesz Spring Modulith, ten sam efekt da ArchUnit:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantBoundaryTest.kt">
+  @AnalyzeClasses(packages = ["pl.example.helpdesk"])
+  class AssistantBoundaryTest {
+      @ArchTest @JvmField
+      val assistantUsesOnlyPublicApis: ArchRule = noClasses()
+          .that().resideInAPackage("..assistant..")
+          .should().dependOnClassesThat().resideInAPackage("..internal..")
+          .because("asystent musi przechodzić przez fasady sprawdzające uprawnienia")
+  }
+</script>
+
+<h2>Model danych</h2>
+<h3>Migracje (Flyway)</h3>
+<script type="text/x-code" data-lang="sql" data-title="V1__init.sql">
+  CREATE TABLE tenants (
+      id                     uuid PRIMARY KEY,
+      name                   text NOT NULL,
+      plan                   text NOT NULL DEFAULT 'STANDARD',
+      ai_enabled             boolean NOT NULL DEFAULT false,
+      external_llm_allowed   boolean NOT NULL DEFAULT false,  -- zgoda na wysyłkę danych do dostawcy
+      created_at             timestamptz NOT NULL DEFAULT now()
+  );
+
+  CREATE TABLE tickets (
+      id             uuid PRIMARY KEY,
+      tenant_id      uuid NOT NULL REFERENCES tenants(id),
+      title          text NOT NULL,
+      description    text NOT NULL,
+      status         text NOT NULL,
+      priority       text NOT NULL,
+      category       text,
+      assignee_id    uuid,
+      reporter_id    uuid NOT NULL,
+      created_at     timestamptz NOT NULL,
+      first_response_at timestamptz,
+      resolved_at    timestamptz,
+      sla_due_at     timestamptz NOT NULL,
+      sla_paused_at  timestamptz,                 -- pauza w WAITING_FOR_CUSTOMER
+      sla_paused_total_seconds bigint NOT NULL DEFAULT 0,
+      version        bigint NOT NULL DEFAULT 0
+  );
+  CREATE INDEX ix_tickets_tenant_status ON tickets (tenant_id, status);
+  CREATE INDEX ix_tickets_assignee ON tickets (assignee_id) WHERE status NOT IN ('RESOLVED','CLOSED');
+
+  CREATE TABLE comments (
+      id          uuid PRIMARY KEY,
+      ticket_id   uuid NOT NULL REFERENCES tickets(id),
+      tenant_id   uuid NOT NULL,                  -- zdenormalizowane: potrzebne do RLS i filtrów
+      author_id   uuid NOT NULL,
+      visibility  text NOT NULL CHECK (visibility IN ('PUBLIC','INTERNAL')),
+      body        text NOT NULL,
+      created_at  timestamptz NOT NULL
+  );
+  CREATE INDEX ix_comments_ticket ON comments (ticket_id, created_at);
+
+  CREATE TABLE ticket_events (
+      id          bigserial PRIMARY KEY,
+      ticket_id   uuid NOT NULL,
+      tenant_id   uuid NOT NULL,
+      actor_id    uuid NOT NULL,
+      actor_type  text NOT NULL,                  -- USER | ASSISTANT | SYSTEM
+      type        text NOT NULL,                  -- STATUS_CHANGED, ASSIGNED, ...
+      payload     jsonb NOT NULL,
+      created_at  timestamptz NOT NULL DEFAULT now()
+  );
+</script>
+<p>Trzy szczegóły, które zaprocentują później:</p>
+<ul>
+  <li><code>tenant_id</code> jest też w <code>comments</code> i <code>ticket_events</code>. Każda tabela z danymi klienta ma własną kolumnę tenanta, żeby filtr i RLS nie wymagały joinów.</li>
+  <li><code>actor_type</code> w historii: od modułu 3 akcje asystenta będą odróżnialne od akcji ludzi.</li>
+  <li><code>version</code> do <dfn data-t="optimistic-locking">optimistic locking</dfn>: gdy asystent i człowiek zmienią zgłoszenie równocześnie, jedna zmiana dostanie konflikt zamiast nadpisać drugą.</li>
+</ul>
+
+<h3>Encje</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/internal/Ticket.kt">
+  @Entity
+  @Table(name = "tickets")
+  class Ticket(
+      @Id val id: UUID = UUID.randomUUID(),
+      @Column(nullable = false, updatable = false) val tenantId: UUID,
+      @Column(nullable = false) var title: String,
+      @Column(nullable = false) var description: String,
+      @Enumerated(EnumType.STRING) var status: TicketStatus = TicketStatus.NEW,
+      @Enumerated(EnumType.STRING) var priority: Priority = Priority.NORMAL,
+      var category: String? = null,
+      var assigneeId: UUID? = null,
+      @Column(updatable = false) val reporterId: UUID,
+      @Column(updatable = false) val createdAt: Instant = Instant.now(),
+      var firstResponseAt: Instant? = null,
+      var resolvedAt: Instant? = null,
+      var slaDueAt: Instant,
+      var slaPausedAt: Instant? = null,
+      var slaPausedTotalSeconds: Long = 0,
+      @Version var version: Long = 0,
+  ) {
+      fun changeStatus(target: TicketStatus, now: Instant) {
+          TicketStateMachine.requireAllowed(status, target)
+          if (target == TicketStatus.WAITING_FOR_CUSTOMER) slaPausedAt = now
+          if (status == TicketStatus.WAITING_FOR_CUSTOMER && slaPausedAt != null) {
+              slaPausedTotalSeconds += Duration.between(slaPausedAt, now).seconds
+              slaPausedAt = null
+          }
+          if (target == TicketStatus.RESOLVED) resolvedAt = now
+          status = target
+      }
+  }
+</script>
+<p>Logika zmiany statusu jest w encji, a nie w kontrolerze. Dzięki temu nie ma znaczenia, czy status zmienia człowiek przez UI, czy asystent przez narzędzie: obowiązują te same reguły.</p>
+
+<h3>Maszyna stanów</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/TicketStateMachine.kt">
+  enum class TicketStatus { NEW, IN_PROGRESS, WAITING_FOR_CUSTOMER, RESOLVED, CLOSED }
+
+  object TicketStateMachine {
+      private val allowed: Map<TicketStatus, Set<TicketStatus>> = mapOf(
+          TicketStatus.NEW to setOf(TicketStatus.IN_PROGRESS, TicketStatus.CLOSED),
+          TicketStatus.IN_PROGRESS to setOf(TicketStatus.WAITING_FOR_CUSTOMER, TicketStatus.RESOLVED),
+          TicketStatus.WAITING_FOR_CUSTOMER to setOf(TicketStatus.IN_PROGRESS, TicketStatus.RESOLVED),
+          TicketStatus.RESOLVED to setOf(TicketStatus.CLOSED, TicketStatus.IN_PROGRESS), // reopen
+          TicketStatus.CLOSED to emptySet(),
+      )
+
+      fun allowedFrom(from: TicketStatus): Set<TicketStatus> = allowed.getValue(from)
+
+      fun requireAllowed(from: TicketStatus, to: TicketStatus) {
+          if (to !in allowedFrom(from)) throw InvalidTransitionException(from, to, allowedFrom(from))
+      }
+  }
+
+  class InvalidTransitionException(
+      val from: TicketStatus, val to: TicketStatus, val allowed: Set<TicketStatus>,
+  ) : RuntimeException("Nie można zmienić statusu z $from na $to. Dozwolone: $allowed")
+</script>
+<div class="box tip"><span class="label">Pod kątem AI</span><p>Komunikat wyjątku zawiera listę dozwolonych przejść. Gdy model spróbuje niedozwolonej zmiany, dostanie zrozumiałą informację zwrotną i może się poprawić. Komunikaty błędów pisane „dla człowieka” są też najlepsze dla modelu.</p></div>
+
+<h2>SLA i „czas oczekiwania”</h2>
+<p>Pytania typu „jak długo czekam?” i „czy przekroczono SLA?” będą najczęstsze w module 2. Asystent nie może ich liczyć sam z dat w tekście, bo <dfn data-t="llm">LLM-y</dfn> (modele językowe) słabo radzą sobie z arytmetyką dat i nie znają reguł pauzowania. Liczy backend, a model tylko przekazuje wynik.</p>
+<table>
+  <tr><th>Priorytet</th><th>Pierwsza reakcja</th><th>Rozwiązanie</th></tr>
+  <tr><td>CRITICAL</td><td>30 min</td><td>4 h</td></tr>
+  <tr><td>HIGH</td><td>2 h</td><td>1 dzień</td></tr>
+  <tr><td>NORMAL</td><td>8 h</td><td>3 dni</td></tr>
+  <tr><td>LOW</td><td>1 dzień</td><td>10 dni</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="sla/SlaApi.kt">
+  enum class SlaState { ON_TRACK, AT_RISK, BREACHED, PAUSED, MET }
+
+  data class SlaView(
+      val state: SlaState,
+      val dueAt: Instant,
+      val remaining: Duration?,      // null gdy BREACHED/MET
+      val overdueBy: Duration?,
+      val waitingTime: Duration,     // od utworzenia, bez czasu pauzy
+  )
+
+  @Service
+  class SlaApi(private val clock: Clock) {
+      fun evaluate(t: TicketView): SlaView {
+          val now = clock.instant()
+          val paused = t.slaPausedAt?.let { Duration.between(it, now) } ?: Duration.ZERO
+          val effectiveDue = t.slaDueAt.plusSeconds(t.slaPausedTotalSeconds).plus(paused)
+          val waiting = Duration.between(t.createdAt, t.resolvedAt ?: now)
+              .minusSeconds(t.slaPausedTotalSeconds).minus(paused)
+
+          val state = when {
+              t.resolvedAt != null -> if (t.resolvedAt <= effectiveDue) SlaState.MET else SlaState.BREACHED
+              t.slaPausedAt != null -> SlaState.PAUSED
+              now > effectiveDue -> SlaState.BREACHED
+              Duration.between(now, effectiveDue) < Duration.ofHours(1) -> SlaState.AT_RISK
+              else -> SlaState.ON_TRACK
+          }
+          return SlaView(
+              state = state,
+              dueAt = effectiveDue,
+              remaining = if (now < effectiveDue && t.resolvedAt == null) Duration.between(now, effectiveDue) else null,
+              overdueBy = if (now > effectiveDue && t.resolvedAt == null) Duration.between(effectiveDue, now) else null,
+              waitingTime = waiting,
+          )
+      }
+  }
+</script>
+<p>Zwróć uwagę na wstrzykiwany <code>Clock</code>. W testach (i w evalach asystenta) ustawisz stały czas, dzięki czemu odpowiedź na pytanie „ile zostało do SLA?” będzie powtarzalna.</p>
+<div class="box warn"><span class="label">Uproszczenie</span><p>Prawdziwe SLA zwykle liczy się w godzinach pracy (np. pn–pt 8–16, bez świąt). Logika robi się wtedy złożona, co jest dodatkowym argumentem, żeby nigdy nie oddawać jej modelowi.</p></div>
+
+<h2>Uwierzytelnienie i kontekst użytkownika</h2>
+<p>Aplikacja jest resource serverem OAuth2: frontend dostaje JWT od dostawcy tożsamości (Keycloak, Entra ID), a backend go weryfikuje. Przykładowy token:</p>
+<script type="text/x-code" data-lang="json" data-title="JWT payload">
+  {
+    "sub": "6a1f2c0e-1d1b-4f3a-9a77-1c3f0b2a9e10",
+    "name": "Anna Kowalska",
+    "roles": ["CUSTOMER"],
+    "tenants": ["0b8f6c55-0f0c-4c1e-8a7e-3f1f5d1a2b3c"],
+    "exp": 1795000000
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="identity/SecurityConfig.kt">
+  @Configuration
+  @EnableMethodSecurity
+  class SecurityConfig {
+
+      @Bean
+      fun filterChain(http: HttpSecurity): SecurityFilterChain = http
+          .authorizeHttpRequests {
+              it.requestMatchers("/actuator/health/**").permitAll()
+                .anyRequest().authenticated()
+          }
+          .oauth2ResourceServer { rs -> rs.jwt { it.jwtAuthenticationConverter(rolesConverter()) } }
+          .csrf { it.disable() }  // API bezstanowe z Bearer token
+          .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
+          .build()
+
+      private fun rolesConverter() = JwtAuthenticationConverter().apply {
+          setJwtGrantedAuthoritiesConverter { jwt ->
+              jwt.getClaimAsStringList("roles").orEmpty().map { SimpleGrantedAuthority("ROLE_$it") }
+          }
+      }
+  }
+</script>
+
+<h3>CurrentUser jako jawny parametr</h3>
+<p>Zamiast czytać <code>SecurityContextHolder</code> głęboko w serwisach, budujemy obiekt <code>CurrentUser</code> w kontrolerze i przekazujemy go dalej jawnie. Ma to duże znaczenie dla AI: narzędzia asystenta wykonują się czasem w innym wątku (streaming, async), gdzie <code>SecurityContextHolder</code> jest pusty albo, co gorsza, zawiera innego użytkownika.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="identity/CurrentUser.kt">
+  enum class Role { CUSTOMER, AGENT, ADMIN }
+
+  data class CurrentUser(
+      val userId: UUID,
+      val tenantIds: Set<UUID>,
+      val roles: Set<Role>,
+  ) {
+      val isStaff get() = Role.AGENT in roles || Role.ADMIN in roles
+      fun canSeeTenant(tenantId: UUID) = Role.ADMIN in roles || tenantId in tenantIds
+      fun canSeeInternalComments() = isStaff
+  }
+
+  @Component
+  class CurrentUserArgumentResolver : HandlerMethodArgumentResolver {
+      override fun supportsParameter(p: MethodParameter) = p.parameterType == CurrentUser::class.java
+
+      override fun resolveArgument(
+          p: MethodParameter, mav: ModelAndViewContainer?, req: NativeWebRequest, binder: WebDataBinderFactory?,
+      ): CurrentUser {
+          val auth = SecurityContextHolder.getContext().authentication as? JwtAuthenticationToken
+              ?: throw AccessDeniedException("Brak uwierzytelnienia")
+          val jwt = auth.token
+          return CurrentUser(
+              userId = UUID.fromString(jwt.subject),
+              tenantIds = jwt.getClaimAsStringList("tenants").orEmpty().map(UUID::fromString).toSet(),
+              roles = jwt.getClaimAsStringList("roles").orEmpty().mapNotNull { runCatching { Role.valueOf(it) }.getOrNull() }.toSet(),
+          )
+      }
+  }
+
+  @Configuration
+  class WebConfig(private val resolver: CurrentUserArgumentResolver) : WebMvcConfigurer {
+      override fun addArgumentResolvers(resolvers: MutableList<HandlerMethodArgumentResolver>) {
+          resolvers += resolver
+      }
+  }
+</script>
+<p>Teraz kontroler po prostu deklaruje parametr <code>user: CurrentUser</code>.</p>
+<div class="box warn"><span class="label">Pułapka: tenant z żądania</span><p>Nigdy nie bierz <code>tenantId</code> z parametru URL, body ani z treści wygenerowanej przez model, jeśli nie sprawdzisz go względem <code>CurrentUser</code>. Asystent będzie generował argumenty narzędzi, a w nich może pojawić się dowolne ID, łącznie z ID innego klienta wstrzykniętym przez atakującego.</p></div>
+
+<h2>Izolacja klientów w trzech warstwach</h2>
+<p>Wyciek danych między klientami to w systemie multi-tenant najpoważniejszy błąd. Z asystentem AI ryzyko rośnie, bo pojawia się nowa droga dostępu do danych, której nikt nie testował tak dokładnie jak UI. Dlatego obrona jest warstwowa:</p>
+<ol>
+  <li><strong>Zapytanie</strong>: każda metoda repozytorium filtruje po tenantach.</li>
+  <li><strong>Fasada modułu</strong>: sprawdza uprawnienia i zwraca widok dopasowany do roli.</li>
+  <li><strong>Baza</strong>: <dfn data-t="rls">Row Level Security</dfn> w Postgresie odrzuca wiersze innych tenantów, nawet gdy ktoś napisze zapytanie bez filtra.</li>
+</ol>
+
+<h3>Warstwa 1: repozytorium</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/internal/TicketRepository.kt">
+  interface TicketRepository : JpaRepository<Ticket, UUID> {
+
+      fun findByIdAndTenantIdIn(id: UUID, tenantIds: Collection<UUID>): Ticket?
+
+      @Query("""
+          select t from Ticket t
+          where t.tenantId in :tenantIds
+            and t.status in :statuses
+            and (:assigneeId is null or t.assigneeId = :assigneeId)
+          order by t.slaDueAt asc
+      """)
+      fun search(
+          tenantIds: Collection<UUID>,
+          statuses: Collection<TicketStatus>,   // pusty filtr = wszystkie statusy (uzupełnia fasada)
+          assigneeId: UUID?,
+          page: Pageable,
+      ): Slice<Ticket>
+  }
+</script>
+<p>Metody bez parametru tenantów (np. odziedziczone <code>findById</code>) nadal istnieją. Dlatego repozytorium jest w <code>internal</code>, a z zewnątrz dostępna jest tylko fasada.</p>
+
+<h3>Warstwa 2: fasada i widoki zależne od roli</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/TicketViews.kt">
+  /** Widok dla klienta: bez danych wewnętrznych. */
+  data class TicketView(
+      val id: UUID,
+      val tenantId: UUID,
+      val title: String,
+      val description: String,
+      val status: TicketStatus,
+      val priority: Priority,
+      val assigneeName: String?,
+      val createdAt: Instant,
+      val resolvedAt: Instant?,
+      val slaDueAt: Instant,
+      val slaPausedAt: Instant?,
+      val slaPausedTotalSeconds: Long,
+  )
+
+  /** Rozszerzony widok dla personelu. */
+  data class StaffTicketView(
+      val base: TicketView,
+      val category: String?,
+      val assigneeId: UUID?,
+      val reporterId: UUID,
+      val version: Long,
+  )
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/TicketApi.kt">
+  @Service
+  @Transactional(readOnly = true)
+  class TicketApi(
+      private val repo: TicketRepository,
+      private val users: UserDirectory,
+      private val tenantSession: TenantSession,
+      private val events: TicketEventRecorder,
+      private val clock: Clock,
+  ) {
+      fun get(user: CurrentUser, id: UUID): TicketView {
+          tenantSession.bind(user)
+          val t = repo.findByIdAndTenantIdIn(id, user.tenantIds)
+              ?: throw TicketNotFoundException(id)   // 404 także dla cudzego zgłoszenia
+          return t.toView(users)
+      }
+
+      fun search(user: CurrentUser, filter: TicketFilter, page: Pageable): Slice<TicketView> {
+          tenantSession.bind(user)
+          val assignee = if (filter.onlyMine && user.isStaff) user.userId else null
+          val statuses = filter.statuses?.takeIf { it.isNotEmpty() } ?: TicketStatus.entries.toSet()
+          return repo.search(user.tenantIds, statuses, assignee, page).map { it.toView(users) }
+      }
+
+      @Transactional
+      fun changeStatus(user: CurrentUser, id: UUID, target: TicketStatus, expectedVersion: Long?): TicketView {
+          tenantSession.bind(user)
+          val t = repo.findByIdAndTenantIdIn(id, user.tenantIds) ?: throw TicketNotFoundException(id)
+          TicketPermissions.requireCanChangeStatus(user, t, target)
+          if (expectedVersion != null && expectedVersion != t.version) throw StaleTicketException(id)
+          val from = t.status
+          t.changeStatus(target, clock.instant())
+          events.statusChanged(t, user, from, target)
+          return t.toView(users)
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/TicketPermissions.kt">
+  object TicketPermissions {
+      fun requireCanChangeStatus(user: CurrentUser, t: Ticket, target: TicketStatus) {
+          val ok = when {
+              user.isStaff -> true
+              // klient może tylko zamknąć rozwiązane zgłoszenie albo je ponownie otworzyć
+              t.reporterId == user.userId && t.status == TicketStatus.RESOLVED ->
+                  target in setOf(TicketStatus.CLOSED, TicketStatus.IN_PROGRESS)
+              else -> false
+          }
+          if (!ok) throw ForbiddenActionException("Brak uprawnień do zmiany statusu na $target")
+      }
+  }
+</script>
+<p>Dlaczego 404, a nie 403, dla cudzego zgłoszenia? Odpowiedź 403 potwierdza, że zasób istnieje. Asystent zapytany „jaki jest status zgłoszenia 8f2c…?” mógłby wtedy odpowiedzieć „nie mam dostępu do tego zgłoszenia”, co już jest wyciekiem informacji. Przy 404 odpowiedź brzmi „nie znalazłem takiego zgłoszenia”.</p>
+
+<h3>Warstwa 3: Row Level Security</h3>
+<p>RLS to siatka bezpieczeństwa: nawet jeśli w przyszłości ktoś doda zapytanie bez filtra (np. natywny SQL w raporcie albo w narzędziu asystenta), baza zwróci tylko wiersze dozwolonych tenantów.</p>
+<script type="text/x-code" data-lang="sql" data-title="V2__rls.sql">
+  -- aplikacja łączy się użytkownikiem, który NIE jest właścicielem tabel
+  -- (właściciel omija RLS, chyba że użyjesz FORCE ROW LEVEL SECURITY)
+  ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE tickets FORCE ROW LEVEL SECURITY;
+
+  CREATE POLICY tenant_isolation ON tickets
+      USING (
+          current_setting('app.bypass_rls', true) = 'on'
+          OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[])
+      );
+
+  ALTER TABLE comments ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE comments FORCE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON comments
+      USING (
+          current_setting('app.bypass_rls', true) = 'on'
+          OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[])
+      );
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="identity/TenantSession.kt">
+  @Component
+  class TenantSession(private val jdbc: JdbcTemplate) {
+      /**
+       * Ustawia listę tenantów dla bieżącej transakcji.
+       * is_local = true: wartość znika po commit/rollback, więc nie „przecieka”
+       * do kolejnego żądania korzystającego z tego samego połączenia z puli.
+       */
+      fun bind(user: CurrentUser) {
+          check(TransactionSynchronizationManager.isActualTransactionActive()) {
+              "TenantSession.bind wymaga aktywnej transakcji"
+          }
+          val ids = if (Role.ADMIN in user.roles) "" else user.tenantIds.joinToString(",")
+          jdbc.queryForObject("select set_config('app.tenant_ids', ?, true)", String::class.java, ids)
+          if (Role.ADMIN in user.roles) {
+              jdbc.queryForObject("select set_config('app.bypass_rls', 'on', true)", String::class.java)
+          }
+      }
+  }
+</script>
+<div class="box warn"><span class="label">Pułapki RLS</span><ul>
+  <li>Bez <code>is_local = true</code> ustawienie zostaje na połączeniu w puli i trafia do następnego użytkownika. To dokładnie ten błąd, przed którym RLS miało chronić.</li>
+  <li>Zadania w tle (np. przeliczanie SLA, w module 5 agent triage) też muszą ustawić kontekst albo jawnie użyć trybu systemowego. Brak kontekstu da puste wyniki, co jest bezpieczne, ale bywa mylące przy debugowaniu.</li>
+  <li>RLS nie zastępuje filtrów w zapytaniach: bez nich planer zapytań nie użyje indeksów na <code>tenant_id</code> tak dobrze, a błędy będą widoczne dopiero jako „puste wyniki”.</li>
+</ul></div>
+
+<h2>Komentarze i widoczność</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="comment/CommentApi.kt">
+  enum class Visibility { PUBLIC, INTERNAL }
+  data class CommentView(val id: UUID, val authorName: String, val visibility: Visibility, val body: String, val createdAt: Instant)
+
+  @Service
+  @Transactional(readOnly = true)
+  class CommentApi(
+      private val repo: CommentRepository,
+      private val tickets: TicketApi,
+      private val users: UserDirectory,
+  ) {
+      fun list(user: CurrentUser, ticketId: UUID): List<CommentView> {
+          tickets.get(user, ticketId)            // sprawdza dostęp do zgłoszenia (404 dla cudzego)
+          val visible = if (user.canSeeInternalComments()) Visibility.entries.toSet() else setOf(Visibility.PUBLIC)
+          return repo.findByTicketIdAndVisibilityInOrderByCreatedAt(ticketId, visible).map { it.toView(users) }
+      }
+  }
+</script>
+<p>Zwróć uwagę, że <code>list</code> najpierw woła <code>tickets.get</code>. Uprawnienie do komentarzy wynika z uprawnienia do zgłoszenia. Bez tego wystarczy znać ID zgłoszenia, żeby czytać komentarze.</p>
+
+<h2>Błędy w formacie ProblemDetail</h2>
+<p>Spring Boot obsługuje standard <dfn data-t="problem-detail">RFC 9457 (Problem Details)</dfn>. Jednolity format błędów przyda się dwa razy: frontend wie, co pokazać, a w module 2 narzędzia asystenta zamienią te same błędy na komunikat zrozumiały dla modelu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ApiExceptionHandler.kt">
+  @RestControllerAdvice
+  class ApiExceptionHandler {
+
+      @ExceptionHandler(TicketNotFoundException::class)
+      fun notFound(e: TicketNotFoundException) =
+          ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, "Nie znaleziono zgłoszenia").apply {
+              type = URI.create("https://helpdesk.example/problems/ticket-not-found")
+          }
+
+      @ExceptionHandler(InvalidTransitionException::class)
+      fun invalidTransition(e: InvalidTransitionException) =
+          ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.message!!).apply {
+              type = URI.create("https://helpdesk.example/problems/invalid-transition")
+              setProperty("allowed", e.allowed)
+          }
+
+      @ExceptionHandler(StaleTicketException::class)
+      fun stale(e: StaleTicketException) =
+          ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, "Zgłoszenie zostało zmienione w międzyczasie. Odśwież dane.")
+
+      @ExceptionHandler(ForbiddenActionException::class)
+      fun forbidden(e: ForbiddenActionException) =
+          ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, e.message!!)
+  }
+</script>
+<script type="text/x-code" data-lang="json" data-title="przykładowa odpowiedź 409">
+  {
+    "type": "https://helpdesk.example/problems/invalid-transition",
+    "title": "Conflict",
+    "status": 409,
+    "detail": "Nie można zmienić statusu z CLOSED na IN_PROGRESS. Dozwolone: []",
+    "allowed": []
+  }
+</script>
+
+<h2>REST API</h2>
+<table>
+  <tr><th>Metoda i ścieżka</th><th>Opis</th><th>Kto</th></tr>
+  <tr><td><code>GET /api/tickets</code></td><td>Lista z filtrami <code>status</code>, <code>mine</code>, stronicowanie</td><td>wszyscy</td></tr>
+  <tr><td><code>GET /api/tickets/{id}</code></td><td>Szczegóły i stan SLA</td><td>wszyscy</td></tr>
+  <tr><td><code>POST /api/tickets</code></td><td>Nowe zgłoszenie</td><td>wszyscy</td></tr>
+  <tr><td><code>PATCH /api/tickets/{id}/status</code></td><td>Zmiana statusu (nagłówek <code>If-Match</code> z wersją)</td><td>personel, klient w ograniczonym zakresie</td></tr>
+  <tr><td><code>PATCH /api/tickets/{id}/assignee</code></td><td>Przypisanie</td><td>personel</td></tr>
+  <tr><td><code>GET /api/tickets/{id}/comments</code></td><td>Komentarze widoczne dla roli</td><td>wszyscy</td></tr>
+  <tr><td><code>POST /api/tickets/{id}/comments</code></td><td>Nowy komentarz</td><td>wszyscy (INTERNAL tylko personel)</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/web/TicketController.kt">
+  @RestController
+  @RequestMapping("/api/tickets")
+  class TicketController(private val tickets: TicketApi, private val sla: SlaApi) {
+
+      @GetMapping
+      fun list(
+          user: CurrentUser,
+          @RequestParam(required = false) status: Set<TicketStatus>?,
+          @RequestParam(defaultValue = "false") mine: Boolean,
+          @PageableDefault(size = 20) page: Pageable,
+      ) = tickets.search(user, TicketFilter(status, mine), page)
+          .map { TicketDto.from(it, sla.evaluate(it)) }
+
+      @GetMapping("/{id}")
+      fun get(user: CurrentUser, @PathVariable id: UUID): TicketDto {
+          val t = tickets.get(user, id)
+          return TicketDto.from(t, sla.evaluate(t))
+      }
+
+      @PatchMapping("/{id}/status")
+      fun changeStatus(
+          user: CurrentUser,
+          @PathVariable id: UUID,
+          @RequestHeader("If-Match", required = false) ifMatch: Long?,
+          @Valid @RequestBody body: StatusChangeRequest,
+      ): TicketDto {
+          val t = tickets.changeStatus(user, id, body.status, ifMatch)
+          return TicketDto.from(t, sla.evaluate(t))
+      }
+  }
+
+  data class StatusChangeRequest(@field:NotNull val status: TicketStatus)
+</script>
+<p>Kontroler jest cienki: zamienia HTTP na wywołanie fasady. Gdy w module 2 dojdą narzędzia AI, będą robić dokładnie to samo, tylko zamiast HTTP będzie wywołanie z modelu.</p>
+
+<h2>Frontend: typy i klient API</h2>
+<p>Frontend to React z TypeScript. Typy DTO najlepiej generować z OpenAPI (np. <code>springdoc-openapi</code> po stronie backendu i <code>openapi-typescript</code> po stronie frontu), żeby nie rozjechały się z backendem. Poniżej wersja pisana ręcznie dla czytelności.</p>
+<script type="text/x-code" data-lang="typescript" data-title="api/types.ts">
+  export type TicketStatus = "NEW" | "IN_PROGRESS" | "WAITING_FOR_CUSTOMER" | "RESOLVED" | "CLOSED";
+  export type Priority = "LOW" | "NORMAL" | "HIGH" | "CRITICAL";
+  export type SlaState = "ON_TRACK" | "AT_RISK" | "BREACHED" | "PAUSED" | "MET";
+
+  export interface TicketDto {
+    id: string;
+    title: string;
+    description: string;
+    status: TicketStatus;
+    priority: Priority;
+    assigneeName: string | null;
+    createdAt: string;        // ISO-8601
+    version: number;
+    sla: { state: SlaState; dueAt: string; remainingMinutes: number | null; overdueMinutes: number | null };
+  }
+
+  export interface Problem { type?: string; title: string; status: number; detail?: string; [k: string]: unknown }
+</script>
+<script type="text/x-code" data-lang="typescript" data-title="api/http.ts">
+  export class ApiError extends Error {
+    constructor(public readonly problem: Problem) { super(problem.detail ?? problem.title); }
+    get status() { return this.problem.status; }
+  }
+
+  export async function api<T>(path: string, init: RequestInit & { token: string }): Promise<T> {
+    const { token, headers, ...rest } = init;
+    const res = await fetch(path, {
+      ...rest,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...headers },
+    });
+    if (!res.ok) {
+      const problem: Problem = res.headers.get("content-type")?.includes("problem+json")
+        ? await res.json()
+        : { title: res.statusText, status: res.status };
+      throw new ApiError(problem);
+    }
+    return res.status === 204 ? (undefined as T) : res.json();
+  }
+
+  export const ticketsApi = {
+    get: (id: string, token: string) => api<TicketDto>(`/api/tickets/${id}`, { token }),
+    changeStatus: (t: TicketDto, status: TicketStatus, token: string) =>
+      api<TicketDto>(`/api/tickets/${t.id}/status`, {
+        token, method: "PATCH", headers: { "If-Match": String(t.version) }, body: JSON.stringify({ status }),
+      }),
+  };
+</script>
+<script type="text/x-code" data-lang="typescript" data-title="hooks/useTicket.ts">
+  // TanStack Query: cache, odświeżanie i stany ładowania
+  export function useTicket(id: string) {
+    const { token } = useAuth();
+    return useQuery({
+      queryKey: ["ticket", id],
+      queryFn: () => ticketsApi.get(id, token),
+      retry: (count, err) => !(err instanceof ApiError && err.status === 404) && count < 2,
+    });
+  }
+</script>
+<p>Gdy asystent zmieni zgłoszenie (moduł 3), UI musi się odświeżyć. Wystarczy wtedy <code>queryClient.invalidateQueries({ queryKey: ["ticket", id] })</code> po zdarzeniu z czatu. Warto o tym pamiętać, projektując klucze cache.</p>
+
+<h2>Środowisko lokalne</h2>
+<script type="text/x-code" data-lang="yaml" data-title="docker-compose.yml">
+  services:
+    postgres:
+      image: pgvector/pgvector:pg16          # pgvector przyda się w module 4
+      environment:
+        POSTGRES_DB: helpdesk
+        POSTGRES_USER: helpdesk_owner        # właściciel schematu (migracje)
+        POSTGRES_PASSWORD: owner
+      volumes:
+        - ./db/init:/docker-entrypoint-initdb.d   # tworzy użytkownika aplikacji i bazę dla LiteLLM
+      ports: ["5432:5432"]
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U helpdesk_owner"]
+        interval: 5s
+
+    litellm:
+      image: ghcr.io/berriai/litellm:main-stable
+      command: ["--config", "/app/config.yaml", "--port", "4000"]
+      volumes: ["./litellm.yaml:/app/config.yaml:ro"]
+      env_file: .env
+      environment:
+        DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm   # klucze wirtualne i koszty
+      depends_on:
+        postgres: { condition: service_healthy }
+      ports: ["4000:4000"]
+
+    otel-collector:
+      image: otel/opentelemetry-collector-contrib:latest
+      volumes: ["./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro"]
+      ports: ["4317:4317", "4318:4318"]
+
+    jaeger:                                  # prosty podgląd trace'ów lokalnie
+      image: jaegertracing/all-in-one:latest
+      ports: ["16686:16686"]
+</script>
+<script type="text/x-code" data-lang="sql" data-title="db/init/01-users.sql">
+  CREATE USER helpdesk_app WITH PASSWORD 'app';   -- NIE jest właścicielem tabel → RLS działa
+  GRANT CONNECT ON DATABASE helpdesk TO helpdesk_app;
+  -- uprawnienia do tabel nadaje migracja Flyway po ich utworzeniu:
+  -- GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO helpdesk_app;
+
+  CREATE USER litellm WITH PASSWORD 'litellm';
+  CREATE DATABASE litellm OWNER litellm;
+</script>
+<script type="text/x-code" data-lang="bash" data-title=".env.example (kopiujesz do .env, .env jest w .gitignore)">
+  ANTHROPIC_API_KEY=
+  OPENAI_API_KEY=
+  LITELLM_MASTER_KEY=sk-local-master-change-me
+  LLM_API_KEY=            # klucz wirtualny dla backendu – wygenerujesz w lekcji 1.3
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  spring:
+    datasource:
+      url: jdbc:postgresql://localhost:5432/helpdesk
+      username: helpdesk_app
+      password: app
+    flyway:
+      user: helpdesk_owner        # migracje jako właściciel, aplikacja jako helpdesk_app
+      password: owner
+    jpa:
+      open-in-view: false         # brak leniwego ładowania w kontrolerach i w narzędziach AI
+</script>
+<script type="text/x-code" data-lang="bash" data-title="uruchomienie">
+  cp .env.example .env              # uzupełnij klucze
+  docker compose up -d
+  ./gradlew bootRun                 # backend :8080
+  cd web && npm i && npm run dev    # frontend :5173
+  open http://localhost:16686       # Jaeger
+</script>
+
+<h2>Dane testowe: dwóch klientów od pierwszego dnia</h2>
+<p>Większość błędów izolacji wychodzi dopiero wtedy, gdy w bazie jest więcej niż jeden tenant. Dane startowe powinny od razu zawierać co najmniej dwóch klientów z podobnymi zgłoszeniami. Wtedy wyciek widać od razu, a nie dopiero u klienta.</p>
+<script type="text/x-code" data-lang="sql" data-title="R__seed_dev.sql (tylko profil dev)">
+  INSERT INTO tenants (id, name, ai_enabled, external_llm_allowed) VALUES
+    ('0b8f6c55-0f0c-4c1e-8a7e-3f1f5d1a2b3c', 'Acme Sp. z o.o.',  true, true),
+    ('7d2e4a10-5b6c-4d7e-8f90-a1b2c3d4e5f6', 'Globex S.A.',      true, false);  -- nie zgadza się na zewnętrzne LLM
+
+  INSERT INTO tickets (id, tenant_id, title, description, status, priority, reporter_id, created_at, sla_due_at) VALUES
+    ('8f2c0000-0000-4000-8000-000000000001', '0b8f6c55-0f0c-4c1e-8a7e-3f1f5d1a2b3c',
+     'Nie działa logowanie do panelu', 'Od rana błąd 500 przy logowaniu.', 'IN_PROGRESS', 'HIGH',
+     '6a1f2c0e-1d1b-4f3a-9a77-1c3f0b2a9e10', now() - interval '3 hours', now() + interval '21 hours'),
+    ('8f2c0000-0000-4000-8000-000000000002', '7d2e4a10-5b6c-4d7e-8f90-a1b2c3d4e5f6',
+     'Nie działa logowanie', 'Klient Globex: problem z SSO.', 'NEW', 'CRITICAL',
+     '11111111-2222-4333-8444-555555555555', now() - interval '20 minutes', now() + interval '10 minutes');
+</script>
+
+<h2>Test integracyjny izolacji</h2>
+<p>Ten test będzie rósł przez cały kurs. W module 2 dopiszesz do niego przypadek „zapytaj asystenta o cudze zgłoszenie”.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TenantIsolationIT.kt">
+  @SpringBootTest
+  @Testcontainers
+  class TenantIsolationIT(@Autowired private val tickets: TicketApi) {
+
+      companion object {
+          @Container @ServiceConnection @JvmStatic
+          val postgres = PostgreSQLContainer(
+              DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres")
+          )
+      }
+
+      private val acmeUser = CurrentUser(
+          userId = UUID.fromString("6a1f2c0e-1d1b-4f3a-9a77-1c3f0b2a9e10"),
+          tenantIds = setOf(ACME), roles = setOf(Role.CUSTOMER),
+      )
+
+      @Test
+      fun `klient nie widzi zgloszenia innego tenanta`() {
+          assertThrows<TicketNotFoundException> { tickets.get(acmeUser, GLOBEX_TICKET) }
+      }
+
+      @Test
+      fun `lista zawiera tylko zgloszenia wlasnego tenanta`() {
+          val result = tickets.search(acmeUser, TicketFilter(null, false), PageRequest.of(0, 100))
+          assertThat(result.content).isNotEmpty.allMatch { it.tenantId == ACME }
+      }
+
+      @Test
+      fun `RLS blokuje zapytanie bez filtra`(@Autowired jdbc: JdbcTemplate, @Autowired tx: TransactionTemplate,
+                                            @Autowired session: TenantSession) {
+          val count = tx.execute {
+              session.bind(acmeUser)
+              jdbc.queryForObject("select count(*) from tickets", Long::class.java) // celowo bez WHERE
+          }
+          val acmeCount = tx.execute {
+              session.bind(acmeUser)
+              jdbc.queryForObject("select count(*) from tickets where tenant_id = ?", Long::class.java, ACME)
+          }
+          assertThat(count).isEqualTo(acmeCount)
+      }
+  }
+</script>
+
+<h2>Mapa ryzyk: co AI może zepsuć w tym systemie</h2>
+<p>Zanim dodamy pierwszą linijkę AI, warto spisać, co może pójść źle. Ta tabela to zarazem mapa kursu:</p>
+<table>
+  <tr><th>Ryzyko</th><th>Przykład w HelpDesk</th><th>Gdzie w kursie</th></tr>
+  <tr><td>Wyciek między klientami</td><td>Czat pokazuje status zgłoszenia innej firmy</td><td>2.2, 4.4</td></tr>
+  <tr><td>Wyciek danych wewnętrznych</td><td>Streszczenie zawiera notatkę wewnętrzną agenta</td><td>2.1, 2.2</td></tr>
+  <tr><td>Dane osobowe u dostawcy LLM</td><td>Globex nie zgadza się na wysyłkę danych do zewnętrznego LLM</td><td>1.6, 2.7</td></tr>
+  <tr><td>Wymyślone fakty</td><td>Asystent podaje nieistniejący termin SLA</td><td>2.1, 2.8, 4.5</td></tr>
+  <tr><td>Niechciane akcje</td><td>Treść zgłoszenia każe agentowi zamknąć wszystkie zgłoszenia klienta</td><td>3.3, 3.4</td></tr>
+  <tr><td>Koszty poza kontrolą</td><td>Pętla agenta, drogi model do prostych zadań</td><td>1.5, 2.6, 3.2, 4.6</td></tr>
+  <tr><td>Ciche pogorszenie jakości</td><td>Zmiana modelu pod aliasem zmienia triage</td><td>1.3, 3.7, 5.4</td></tr>
+  <tr><td>Przeciążenie ludzi</td><td>Kolejka eskalacji rośnie szybciej, niż zespół ją obsługuje</td><td>5.3</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Uruchom środowisko i zaloguj się jako użytkownik Acme. Spróbuj otworzyć zgłoszenie Globex przez URL. Powinieneś dostać 404.</li>
+  <li>Dodaj do repozytorium „szybką” metodę <code>findAllByStatus</code> bez filtra tenanta i wywołaj ją w teście. Sprawdź, że RLS i tak zwraca tylko dane Acme.</li>
+  <li>W swoim firmowym systemie wypisz wszystkie miejsca, w których sprawdzane są uprawnienia do danych (zapytanie, serwis, kontroler, frontend). Zaznacz te, które asystent AI mógłby ominąć, gdyby korzystał bezpośrednio z repozytoriów.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="1">
+  <p class="q">Gdzie najlepiej filtrować dane po tenancie?</p>
+  <button>W prompcie do modelu („pokazuj tylko dane klienta X”)</button>
+  <button>W zapytaniu do bazy na podstawie uwierzytelnionego użytkownika, z RLS jako dodatkową siatką</button>
+  <button>We frontendzie, ukrywając cudze zgłoszenia</button>
+  <p class="explain">Prompt można obejść, a frontend jest pod kontrolą użytkownika. Filtr w zapytaniu sprawia, że cudze dane w ogóle nie opuszczają bazy, a RLS łapie przypadki, w których ktoś o filtrze zapomniał.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego <code>get()</code> zwraca 404, a nie 403, dla zgłoszenia innego klienta?</p>
+  <button>Żeby nie ujawniać, że zgłoszenie o takim ID istnieje</button>
+  <button>Bo 403 jest zarezerwowane dla administratorów</button>
+  <button>To bez znaczenia, kwestia stylu</button>
+  <p class="explain">Odpowiedź 403 potwierdza istnienie zasobu. Asystent mógłby tę informację nieświadomie przekazać dalej.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="2">
+  <p class="q">Co się stanie, jeśli <code>set_config('app.tenant_ids', …)</code> wywołasz z <code>is_local = false</code>?</p>
+  <button>Nic, to tylko kwestia wydajności</button>
+  <button>Postgres odrzuci zapytanie</button>
+  <button>Ustawienie zostanie na połączeniu w puli i może trafić do żądania innego użytkownika</button>
+  <p class="explain">Pula połączeń używa tych samych sesji Postgresa wielokrotnie. Ustawienie na poziomie sesji przeżywa transakcję i „przecieka” do następnego żądania.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Dlaczego <code>CurrentUser</code> jest przekazywany jawnie zamiast czytany z <code>SecurityContextHolder</code> w serwisie?</p>
+  <button>Bo SecurityContextHolder jest przestarzały</button>
+  <button>Bo narzędzia asystenta mogą działać w innym wątku, gdzie kontekst bezpieczeństwa jest pusty albo nieaktualny</button>
+  <button>Bo JWT nie zawiera danych o tenantach</button>
+  <p class="explain"><code>SecurityContextHolder</code> domyślnie opiera się na <code>ThreadLocal</code>. Streaming i wywołania asynchroniczne zmieniają wątek, więc jawny parametr jest bezpieczniejszy i łatwiejszy do testowania.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="0">
+  <p class="q">Dlaczego asystent nie powinien sam liczyć, ile czasu zostało do przekroczenia SLA?</p>
+  <button>Bo modele słabo liczą daty i nie znają reguł pauzowania SLA; wynik powinien policzyć backend</button>
+  <button>Bo to zbyt drogie w tokenach</button>
+  <button>Bo dane SLA są poufne</button>
+  <p class="explain">Logika biznesowa, a szczególnie obliczenia, zostaje w kodzie. Model dostaje gotowy wynik i ubiera go w zdanie.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

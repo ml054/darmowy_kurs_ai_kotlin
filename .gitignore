@@ -1,0 +1,8 @@
+node_modules/
+
+# Pliki robocze (nie są częścią strony)
+CLAUDE.md
+.claude/
+_*
+package.json
+package-lock.json

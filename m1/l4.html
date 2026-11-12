@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.4 Tracing i obserwowalność – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="1.4">
+<main>
+<p class="meta">Lekcja 1.4 · ok. 70 min</p>
+<h1>Tracing i obserwowalność</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć, co trzeba umieć odtworzyć, gdy „asystent odpowiedział bzdurę”, i dlaczego same logi do tego nie wystarczą.</li>
+  <li>Poznać trace'y, spany, propagację kontekstu i sampling na tyle, żeby świadomie konfigurować narzędzia.</li>
+  <li>Włączyć OpenTelemetry w Spring Boot 3 przez Micrometer i odczytać, co Spring AI instrumentuje sam.</li>
+  <li>Dodać własne atrybuty domenowe bez wysadzenia bazy metryk i bez wycieku danych osobowych.</li>
+  <li>Utrzymać ciągłość trace'a w kodzie asynchronicznym i przy streamingu.</li>
+  <li>Zbudować dashboard, alerty i ścieżkę „podaj ten kod wsparciu” od UI do trace'a.</li>
+</ul></div>
+
+<h2>Problem: „asystent odpowiedział bzdurę”</h2>
+<p>Klient Acme pisze: „Wasz asystent twierdzi, że moje zgłoszenie jest zamknięte, a ono nadal wisi”. W klasycznym systemie znalazłbyś żądanie w logach i sprawdził, co zwróciła baza. Przy asystencie opartym na <dfn data-t="llm">LLM</dfn> odpowiedź powstała w kilku krokach, z których każdy mógł zawieść:</p>
+<ol>
+  <li>Model dostał <dfn data-t="prompt">prompt</dfn> w jakiejś wersji, z historią rozmowy.</li>
+  <li>Zdecydował się wywołać narzędzie <code>getTicket</code> (<dfn data-t="tool-calling">tool calling</dfn>) i wymyślił mu argumenty.</li>
+  <li>Narzędzie zwróciło wynik albo błąd.</li>
+  <li>Model dostał ten wynik w drugim wywołaniu i napisał odpowiedź.</li>
+</ol>
+<p>W tej historii trace pokazuje, że model przepisał ID z literówką, narzędzie zwróciło 404, a model w drugiej iteracji zamiast przyznać się do błędu „uzupełnił” odpowiedź. Bez zapisu kroków kończy się na „nie da się odtworzyć”. Potrzebujesz:</p>
+<table>
+  <tr><th>Co odtworzyć</th><th>Po co</th><th>Skąd (w tej lekcji)</th></tr>
+  <tr><td>Wersja promptu systemowego</td><td>Zmiana promptu zmienia zachowanie jak deploy</td><td><code>helpdesk.prompt.version</code></td></tr>
+  <tr><td>Kontekst: historia, wyniki narzędzi, dokumenty</td><td>Model odpowiada tylko na tym, co dostał</td><td>Treść (opcjonalnie), ID rozmowy</td></tr>
+  <tr><td>Narzędzia, argumenty, wyniki, błędy</td><td>Najczęstsze źródło „bzdur”</td><td>Spany narzędzi Spring AI</td></tr>
+  <tr><td>Model żądany i faktyczny</td><td>Za <dfn data-t="alias">aliasem</dfn> lub po <dfn data-t="fallback">fallbacku</dfn> mógł odpowiedzieć inny model</td><td><code>gen_ai.request.model</code>, <code>gen_ai.response.model</code></td></tr>
+  <tr><td>Parametry, powód zakończenia</td><td><code>length</code> = odpowiedź ucięta limitem tokenów</td><td><code>gen_ai.response.finish_reasons</code></td></tr>
+  <tr><td>Tokeny, czas, koszt</td><td>Długi kontekst: wolniej, drożej, często gorzej</td><td><code>gen_ai.usage.*</code>, metryki</td></tr>
+  <tr><td>Użytkownik, tenant, funkcja</td><td>Jeden klient czy wszyscy?</td><td>ID (nie nazwy!)</td></tr>
+</table>
+<p>Klasycznemu endpointowi z deterministycznym wynikiem zwykle wystarcza log „wejście → wyjście”. Funkcja z LLM ma niedeterministyczny środek, kroki wybierane w trakcie działania i zależność, która sama zmienia model pod aliasem. Dlatego <dfn data-t="observability">obserwowalność</dfn> (zdolność odpowiadania na nowe pytania o działanie systemu z danych, które już zbiera) musi tu być lepsza niż w CRUD-zie.</p>
+
+<h2>Trzy filary: logi, metryki, trace'y</h2>
+<p>Jeśli do tej pory używałeś głównie logów, oto szybkie uporządkowanie. Każdy filar odpowiada na inne pytanie i ma inny koszt:</p>
+<table>
+  <tr><th></th><th>Logi</th><th>Metryki</th><th>Trace'y</th></tr>
+  <tr><td>Czym są</td><td>Pojedyncze zdarzenia tekstowe lub JSON</td><td>Liczby agregowane w czasie: liczniki, histogramy</td><td>Drzewo operacji jednego żądania z czasami i atrybutami</td></tr>
+  <tr><td>Pytanie</td><td>„Co dokładnie się stało w tym miejscu?”</td><td>„Ile, jak szybko, jak często? Czy jest gorzej niż wczoraj?”</td><td>„Gdzie w tym żądaniu poszedł czas i co je złożyło?”</td></tr>
+  <tr><td>Koszt i retencja</td><td>Rośnie z ruchem, dni–tygodnie</td><td>Stały (zależy od liczby serii), miesiące</td><td>Duży, zwykle próbkowany, dni</td></tr>
+  <tr><td>Kompletność</td><td>Zwykle wszystkie</td><td>Zawsze 100% zdarzeń</td><td>Często tylko część żądań</td></tr>
+</table>
+<p><strong>Metryka</strong> to nazwana liczba z etykietami (np. <code>gen_ai_client_token_usage_total{gen_ai_token_type="input"}</code>), którą system monitoringu, np. <strong>Prometheus</strong> (baza szeregów czasowych pobierająca metryki z aplikacji co kilkanaście sekund), zapisuje w czasie. <strong>Histogram</strong> to metryka, która zlicza wartości w przedziałach (kubełkach), dzięki czemu można policzyć <dfn data-t="percentile">percentyl</dfn>, np. p95: czas, poniżej którego mieści się 95% żądań. Średnia ukrywa wolne żądania, a p95 je pokazuje.</p>
+<p>Siła tych trzech filarów jest w połączeniu: alert z metryki („p95 czatu powyżej 20 s”) prowadzi do przykładowych trace'ów z tego okresu, a trace prowadzi do logów z tym samym identyfikatorem.</p>
+
+<h2>Trace, span, atrybuty i propagacja kontekstu</h2>
+<p><dfn data-t="trace">Trace</dfn> to zapis jednego żądania przez cały system. Składa się ze <strong>spanów</strong>: span to jedna operacja z czasem rozpoczęcia, czasem trwania, statusem (OK/ERROR) i <strong>atrybutami</strong>, czyli parami klucz-wartość (np. <code>gen_ai.request.model = helpdesk-default</code>). Każdy span ma identyfikator i wskazuje rodzica, więc spany tworzą drzewo. Cały trace ma jeden <code>traceId</code>.</p>
+<p>Tak wygląda trace żądania czatu, w którym model najpierw prosi o narzędzie, a potem odpowiada:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="trace: POST /api/assistant/chat (traceId 4bf92f35…)">
+  http post /api/assistant/chat                       3.42 s
+  └─ assistant info-chat   feature=info-chat, prompt.version=info-chat/v7
+     └─ spring_ai chat_client                         3.38 s
+        ├─ advisor (np. pamięć rozmowy)               3.37 s
+        │  ├─ chat helpdesk-default   (iteracja 1)   1.21 s  in 1840 / out 42 tok, finish=TOOL_CALLS
+        │  │  └─ http post → LiteLLM                  1.20 s
+        │  │     └─ litellm: anthropic/claude-…       1.18 s  (spany proxy, jeśli włączysz)
+        │  ├─ tool_call getTicket                     0.04 s  args {"id":"8f2c…01"}
+        │  │  └─ SELECT tickets …                     0.01 s
+        │  └─ chat helpdesk-default   (iteracja 2)   2.10 s  in 2110 / out 186 tok, finish=STOP
+        │     └─ http post → LiteLLM                  2.09 s
+  └─ INSERT ticket_events …                           0.01 s
+</script>
+<p>Widać dwie iteracje modelu, czyli dwa obroty <dfn data-t="agent-loop">pętli agenta</dfn> (każda płatna, druga z dłuższym kontekstem, bo zawiera wynik narzędzia), szybkie narzędzie i to, że czas zjadły wywołania modelu. Nazwy spanów zależą od wersji bibliotek.</p>
+
+<h3>Propagacja kontekstu i nagłówek traceparent</h3>
+<p>Żeby spany z różnych procesów (backend, <dfn data-t="proxy">proxy LLM</dfn>, inne usługi) trafiły do jednego trace'a, każde wywołanie HTTP przenosi identyfikatory w nagłówku <dfn data-t="traceparent">traceparent</dfn> ze standardu W3C Trace Context:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="nagłówek W3C Trace Context">
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+               │  │                                │                └ flagi: 01 = próbkowany (sampled)
+               │  │                                └ ID spanu rodzica (8 bajtów, 16 znaków hex)
+               │  └ traceId (16 bajtów, 32 znaki hex)
+               └ wersja formatu
+</script>
+<p>Odbiorca tworzy swoje spany jako dzieci wskazanego spanu. Wewnątrz procesu bieżący span siedzi w <code>ThreadLocal</code> (zmiennej przypisanej do wątku), co działa, dopóki praca nie przeskoczy na inny wątek.</p>
+<p><dfn data-t="sampling">Sampling</dfn> to decyzja, które trace'y zachować, bo zapis wszystkich przy dużym ruchu kosztuje. Flaga <code>01</code> przekazuje decyzję dalej, żeby każda usługa zachowała ten sam trace w całości.</p>
+
+<h2>OpenTelemetry i Micrometer w Spring Boot 3</h2>
+<p><dfn data-t="opentelemetry">OpenTelemetry</dfn> (OTel) to otwarty standard i biblioteki do zbierania trace'ów, metryk i logów oraz protokół wysyłki <strong>OTLP</strong> (gRPC na porcie 4317, HTTP na 4318). Spring Boot nie używa API OTel bezpośrednio, tylko <dfn data-t="observation-api">Micrometer Observation API</dfn>: kod otwiera i zamyka <em>obserwację</em>, a podłączone handlery zamieniają ją na metrykę, span albo wpis w logu.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="jak to jest poskładane">
+  Spring MVC, Spring AI, RestClient, Twój kod
+          │  Observation start / stop (+ atrybuty)
+          ▼
+  ObservationRegistry
+     ├─ MeterObservationHandler   → Timer, Counter → /actuator/prometheus
+     ├─ TracingObservationHandler → Micrometer Tracing → bridge → OTel SDK → eksporter OTLP
+     └─ własne handlery (np. licznik kosztu, dalej w lekcji)
+                                                          │ OTLP
+                                                          ▼
+                                                   OTel Collector → Jaeger / Tempo / Langfuse / Azure Monitor
+</script>
+<p>Jedna instrumentacja daje więc metryki i trace'y z tymi samymi nazwami atrybutów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="build.gradle.kts">
+  dependencies {
+      implementation("org.springframework.boot:spring-boot-starter-actuator")      // wymagany przez obserwacje Spring AI
+      implementation("io.micrometer:micrometer-tracing-bridge-otel")              // Micrometer Tracing → OTel SDK
+      implementation("io.opentelemetry:opentelemetry-exporter-otlp")              // wysyłka spanów przez OTLP
+      runtimeOnly("io.micrometer:micrometer-registry-prometheus")                  // /actuator/prometheus
+      // spany zapytań SQL (JDBC); wersję dobierz do Spring Boot – sprawdź w README projektu
+      implementation("net.ttddyy.observation:datasource-micrometer-spring-boot:${property("datasourceMicrometerVersion")}")
+      testImplementation("io.opentelemetry:opentelemetry-sdk-testing")             // InMemorySpanExporter do testów
+  }
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  spring:
+    application:
+      name: helpdesk                      # trafia do atrybutu service.name
+    reactor:
+      context-propagation: auto           # kontekst trace'a w Flux/Mono (sekcja o asynchroniczności)
+
+  management:
+    tracing:
+      sampling:
+        probability: 1.0                  # domyślnie 0.1! Decyzję podejmie Collector (tail sampling)
+    otlp:
+      tracing:
+        endpoint: http://localhost:4318/v1/traces
+    opentelemetry:
+      resource-attributes:
+        deployment.environment: ${APP_ENV:local}
+    observations:
+      enable:
+        spring.security: false            # setki spanów filtrów Spring Security to szum
+    metrics:
+      distribution:
+        percentiles-histogram:
+          http.server.requests: true      # kubełki histogramu → p95 w PromQL
+          gen_ai.client.operation: true
+    endpoints:
+      web:
+        exposure:
+          include: health, prometheus     # w produkcji /actuator/prometheus za siecią wewnętrzną
+</script>
+<div class="box warn"><span class="label">Pułapka: „nie widzę trace'ów”</span><p>Domyślne <code>probability</code> to 0.1, więc lokalnie widzisz co dziesiąte żądanie. W testach <code>@SpringBootTest</code> tracing jest wyłączony, dopóki nie dodasz <code>@AutoConfigureObservability</code>. Ręcznie tworzony <code>RestClient.create()</code> zamiast wstrzykniętego <code>RestClient.Builder</code> nie ma obserwacji i nie wysyła <code>traceparent</code>. Spring AI korzysta z buildera z kontekstu, więc wywołania do LiteLLM są propagowane automatycznie.</p></div>
+<div class="box"><span class="label">Spring Boot 4</span><p>Boot 4 ma <code>spring-boot-starter-opentelemetry</code> i nowe nazwy właściwości (np. <code>management.opentelemetry.tracing.export.otlp.endpoint</code>). Przy migracji sprawdź release notes.</p></div>
+
+<h2>OTel Collector i lokalny Jaeger</h2>
+<p>Między aplikacją a backendem stoi zwykle <dfn data-t="otel-collector">OpenTelemetry Collector</dfn>: osobny proces, który przyjmuje telemetrię, przetwarza ją i rozsyła dalej. To jedno miejsce na sampling, maskowanie, zmianę backendu (Jaeger dziś, Azure Monitor jutro) i wysyłkę w kilka miejsc, bez zmian w aplikacji. Konfiguracja to <strong>pipeline'y</strong> z trzech rodzajów komponentów: <strong>receivers</strong> (skąd dane przychodzą), <strong>processors</strong> (co robimy po drodze: limit pamięci, paczkowanie, sampling, usuwanie atrybutów) i <strong>exporters</strong> (dokąd wysyłamy).</p>
+<script type="text/x-code" data-lang="yaml" data-title="otel-collector.yaml (wersja startowa)">
+  receivers:
+    otlp:
+      protocols:
+        grpc: { endpoint: 0.0.0.0:4317 }
+        http: { endpoint: 0.0.0.0:4318 }
+
+  processors:
+    memory_limiter:                 # zawsze pierwszy: chroni Collector przed OOM
+      check_interval: 1s
+      limit_percentage: 80
+      spike_limit_percentage: 20
+    batch: {}                       # wysyłka paczkami zamiast pojedynczych spanów
+
+  exporters:
+    otlp/jaeger:                    # Jaeger przyjmuje OTLP natywnie
+      endpoint: jaeger:4317
+      tls: { insecure: true }
+    debug:
+      verbosity: basic              # podgląd w logach Collectora przy uruchamianiu
+
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp/jaeger, debug]
+</script>
+<p><strong>Jaeger</strong> to otwarte narzędzie do przeglądania trace'ów. Wersja all-in-one z lekcji 1.1 trzyma dane w pamięci, co lokalnie wystarcza (w produkcji typowo Grafana Tempo albo usługa chmurowa). Do <code>docker-compose.yml</code> dokładamy jeszcze Prometheus (scrape <code>host.docker.internal:8080/actuator/prometheus</code>, bo backend działa na hoście) i <strong>Grafanę</strong> (narzędzie do dashboardów) na porcie 3001, bo 3000 zostawiamy dla lokalnego Langfuse. Po <code>docker compose up -d</code> i jednym pytaniu do asystenta otwórz Jaegera (<code>localhost:16686</code>), wybierz usługę <code>helpdesk</code> i znajdź trace z dwiema iteracjami modelu.</p>
+
+<h2>Co Spring AI instrumentuje sam</h2>
+<p>Spring AI tworzy obserwacje dla swoich komponentów. Według dokumentacji Spring AI 1.x (nazwy sprawdź w rozdziale „Observability” dla swojej wersji):</p>
+<table>
+  <tr><th>Obserwacja</th><th>Komponent</th><th>Najważniejsze atrybuty</th></tr>
+  <tr><td><code>spring.ai.chat.client</code></td><td>Wywołanie <code>ChatClient</code> (<code>call()</code>/<code>stream()</code>)</td><td>tryb stream, nazwy narzędzi i advisorów, ID rozmowy</td></tr>
+  <tr><td><code>spring.ai.advisor</code></td><td>Advisor, czyli interceptor wokół <code>ChatClient</code> (np. pamięć rozmowy, lekcja 2.5)</td><td><code>spring.ai.advisor.name</code></td></tr>
+  <tr><td><code>gen_ai.client.operation</code></td><td>Pojedyncze wywołanie <code>ChatModel</code> (też embeddingów)</td><td><code>gen_ai.request.model</code>, <code>gen_ai.response.model</code>, <code>gen_ai.usage.*</code>, <code>finish_reasons</code>, <code>temperature</code>, <code>max_tokens</code></td></tr>
+  <tr><td><code>spring.ai.tool</code></td><td>Wykonanie narzędzia</td><td><code>spring.ai.tool.definition.name</code>, opcjonalnie argumenty i wynik</td></tr>
+  <tr><td><code>db.vector.client.operation</code></td><td>Baza wektorowa (moduł 4)</td><td><code>db.vector.query.top_k</code></td></tr>
+</table>
+<p>Atrybuty <code>gen_ai.*</code> pochodzą z <dfn data-t="semconv">semantic conventions</dfn> OpenTelemetry, czyli uzgodnionych nazw, dzięki którym Jaeger, Langfuse czy Azure Monitor rozumieją dane bez konfiguracji. <code>gen_ai.operation.name</code> to rodzaj operacji (<code>chat</code>, <code>embeddings</code>; dla spanów frameworka <code>framework</code>). <code>gen_ai.request.model</code> to alias, o który prosiliśmy, a <code>gen_ai.response.model</code> to pole <code>model</code> z odpowiedzi LiteLLM, czyli kto faktycznie odpowiedział. <code>gen_ai.usage.input_tokens</code> i <code>output_tokens</code> to zużycie <dfn data-t="token">tokenów</dfn> w wywołaniu, a <code>finish_reasons</code> przyjmuje m.in. <code>STOP</code>, <code>LENGTH</code> (ucięte) i <code>TOOL_CALLS</code> (model prosi o narzędzie).</p>
+<p>Z tych samych obserwacji powstają metryki, np.:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="/actuator/prometheus (fragment)">
+  gen_ai_client_token_usage_total{gen_ai_request_model="helpdesk-default",gen_ai_response_model="claude-…",
+      gen_ai_system="openai",gen_ai_token_type="input",…} 184213
+  gen_ai_client_operation_seconds_count{gen_ai_request_model="helpdesk-default",error="none",…} 97
+</script>
+<div class="box warn"><span class="label">Spring AI a aktualna konwencja OTel</span><ul>
+  <li>Konwencje GenAI mają w OTel status „Development” i nazwy wciąż się zmieniają. Nowsze wersje zastępują <code>gen_ai.system</code> atrybutem <code>gen_ai.provider.name</code> i opisują czas histogramem <code>gen_ai.client.operation.duration</code>. Spring AI 1.x eksportuje timer <code>gen_ai.client.operation</code> i licznik <code>gen_ai.client.token.usage</code> (typy <code>input</code>, <code>output</code>, <code>total</code>). Dashboardy wersjonuj razem z zależnościami.</li>
+  <li>Przez LiteLLM używamy modułu OpenAI, więc <code>gen_ai.system = openai</code> także wtedy, gdy odpowiedział model Anthropic. O faktycznym modelu mówi <code>gen_ai.response.model</code> albo spany proxy.</li>
+  <li>Przy <dfn data-t="streaming">streamingu</dfn> API zgodne z OpenAI podaje zużycie tokenów tylko na życzenie: <code>spring.ai.openai.chat.options.stream-usage: true</code>. Bez tego metryki tokenów czatu strumieniowego są puste.</li>
+</ul></div>
+
+<h2>Treść promptów i odpowiedzi: właściwości i RODO</h2>
+<p>Domyślnie Spring AI <strong>nie</strong> zapisuje treści promptów, odpowiedzi ani argumentów narzędzi, bo są duże i mogą zawierać dane wrażliwe. Właściwości włączające (Spring AI 1.x):</p>
+<table>
+  <tr><th>Właściwość</th><th>Co robi</th></tr>
+  <tr><td><code>spring.ai.chat.client.observations.log-prompt</code></td><td>Treść promptu na poziomie <code>ChatClient</code></td></tr>
+  <tr><td><code>spring.ai.chat.client.observations.log-completion</code></td><td>Treść odpowiedzi na poziomie <code>ChatClient</code></td></tr>
+  <tr><td><code>spring.ai.chat.observations.log-prompt</code> / <code>log-completion</code></td><td>Treść na poziomie <code>ChatModel</code></td></tr>
+  <tr><td><code>spring.ai.tools.observations.include-content</code></td><td>Argumenty i wynik narzędzia jako atrybuty spanu (<code>spring.ai.tool.call.arguments</code>, <code>…result</code>)</td></tr>
+</table>
+<p>Nazwy zmieniały się (przed 1.0: <code>include-prompt</code>, <code>include-completion</code>). Ważniejsze: w 1.x <code>log-prompt</code> i <code>log-completion</code> zapisują treść do <strong>logów aplikacji</strong> (z <code>traceId</code>), a nie do atrybutów spanu. Langfuse potrzebuje treści w spanie, więc jego dokumentacja dla Spring AI dodaje filtr obserwacji dopisujący <code>gen_ai.prompt</code> i <code>gen_ai.completion</code>. Wersja w Kotlinie, z warunkiem zgody tenanta:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/observability/ChatContentObservationFilter.kt">
+  /** Przodek w drzewie obserwacji spełniający warunek (np. nasza obserwacja czatu). */
+  fun Observation.ContextView.ancestor(match: (Observation.ContextView) -> Boolean): Observation.ContextView? {
+      var current = parentObservation?.contextView
+      while (current != null) {
+          if (match(current)) return current
+          current = current.parentObservation?.contextView
+      }
+      return null
+  }
+
+  @Component
+  @ConditionalOnProperty("helpdesk.observability.capture-content", havingValue = "true")
+  class ChatContentObservationFilter(
+      private val policy: ContentCapturePolicy,   // własny komponent: zgoda tenanta + cache
+  ) : ObservationFilter {
+
+      override fun map(context: Observation.Context): Observation.Context {
+          if (context !is ChatModelObservationContext) return context
+          val tenantId = context.ancestor { it.name == AssistantObservations.CHAT }
+              ?.getHighCardinalityKeyValue(AssistantObservations.TENANT)?.value
+              ?: return context                     // brak kontekstu = brak treści (bezpieczny domyślny)
+          if (!policy.allowsContentCapture(UUID.fromString(tenantId))) return context
+
+          val prompt = context.request.instructions
+              .joinToString("\n---\n") { "${it.messageType}: ${it.text}" }
+          val completion = context.response?.results
+              ?.joinToString("\n") { it.output.text.orEmpty() }.orEmpty()
+
+          context.addHighCardinalityKeyValue(KeyValue.of("gen_ai.prompt", prompt.take(MAX_CHARS)))
+          context.addHighCardinalityKeyValue(KeyValue.of("gen_ai.completion", completion.take(MAX_CHARS)))
+          return context
+      }
+
+      private companion object { const val MAX_CHARS = 32_000 }
+  }
+</script>
+<div class="box warn"><span class="label">RODO: treść to dane osobowe</span><p>Pytania i zgłoszenia zawierają imiona, e-maile, telefony, czasem dane zdrowotne („pracownik na L4”). Treść w trace'ach to kopia tych danych w kolejnym systemie, często z szerszym dostępem i dłuższą retencją niż baza, a w APM zwykle bez możliwości usunięcia na żądanie. Zasady: treść tylko do narzędzia z kontrolą dostępu i krótką retencją, po maskowaniu <dfn data-t="pii">danych osobowych</dfn>, nigdy bez zgody tenanta (Globex ma <code>external_llm_allowed = false</code>, więc jego treści nie trafiają do żadnej usługi zewnętrznej, także do chmurowego Langfuse). Maskowanie <dfn data-t="presidio">Presidio</dfn> to lekcja 2.7.</p></div>
+
+<h2>Własne obserwacje i atrybuty domenowe</h2>
+<p>Automatyczna instrumentacja nie odróżni czatu informacyjnego od triage ani wersji promptu, a bez tego nie odpowiesz na pytania „która funkcja tyle kosztuje?” i „czy nowa wersja promptu jest wolniejsza?”. Dodajemy własną obserwację obejmującą całe użycie asystenta:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantService.kt">
+  object AssistantObservations {
+      const val CHAT = "helpdesk.assistant.chat"
+      const val FEATURE = "helpdesk.feature"               // low: info-chat, triage, kb-answer
+      const val PROMPT_VERSION = "helpdesk.prompt.version" // low: info-chat/v7
+      const val OUTCOME = "helpdesk.outcome"               // low: answered, truncated, error
+      const val TENANT = "helpdesk.tenant.id"              // high
+      const val CONVERSATION = "helpdesk.conversation.id"  // high
+  }
+
+  @Service
+  class AssistantService(
+      private val chat: ChatClient,
+      private val ticketTools: TicketTools,                // narzędzia z lekcji 2.1
+      private val registry: ObservationRegistry,
+  ) {
+      // tenantId sprawdzony wcześniej przez user.canSeeTenant(tenantId)
+      fun answer(user: CurrentUser, tenantId: UUID, conversationId: UUID, question: String): AssistantAnswer {
+          val obs = Observation.createNotStarted(AssistantObservations.CHAT, registry)
+              .contextualName("assistant info-chat")
+              .lowCardinalityKeyValue(AssistantObservations.FEATURE, "info-chat")
+              .lowCardinalityKeyValue(AssistantObservations.PROMPT_VERSION, Prompts.INFO_CHAT.version)
+              .lowCardinalityKeyValue(AssistantObservations.OUTCOME, "error")   // nadpiszemy przy sukcesie
+              .highCardinalityKeyValue(AssistantObservations.TENANT, tenantId.toString())
+              .highCardinalityKeyValue(AssistantObservations.CONVERSATION, conversationId.toString())
+
+          return obs.observe(Supplier {
+              val response = chat.prompt()
+                  .system(Prompts.INFO_CHAT.text)
+                  .user(question)
+                  .tools(ticketTools)
+                  .call()
+                  .chatResponse() ?: error("Pusta odpowiedź modelu")
+
+              val finish = response.result?.metadata?.finishReason.orEmpty()
+              obs.lowCardinalityKeyValue(
+                  AssistantObservations.OUTCOME,
+                  if (finish.equals("LENGTH", ignoreCase = true)) "truncated" else "answered",
+              )
+              AssistantAnswer(text = response.result?.output?.text.orEmpty(), model = response.metadata.model)
+          })!!
+      }
+  }
+</script>
+<p>Obserwacja daje span (rodzic spanów Spring AI z tego wywołania) i timer <code>helpdesk_assistant_chat_seconds</code> z etykietami funkcji, wersji promptu i wyniku. <code>OUTCOME</code> ustawiamy od razu na <code>error</code>, bo klucz etykiety musi być obecny <strong>zawsze</strong>: ta sama metryka raz z etykietą, a raz bez niej to w Prometheusie błąd albo po cichu odrzucony miernik.</p>
+
+<h3>Funkcja i wersja promptu na metrykach Spring AI</h3>
+<p>Metryka <code>gen_ai_client_token_usage_total</code> nie wie, z której funkcji pochodzi wywołanie. <code>ObservationFilter</code> (wywoływany przy zamknięciu obserwacji, przed handlerami metryk) może skopiować nasze etykiety od przodka do obserwacji modelu i narzędzi:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/observability/FeatureKeysPropagationFilter.kt">
+  @Component
+  class FeatureKeysPropagationFilter : ObservationFilter {
+      private val keys = listOf(AssistantObservations.FEATURE, AssistantObservations.PROMPT_VERSION)
+
+      override fun map(context: Observation.Context): Observation.Context {
+          if (context !is ChatModelObservationContext && context !is ToolCallingObservationContext) return context
+          val parent = context.ancestor { it.name == AssistantObservations.CHAT }
+          keys.forEach { key ->
+              val value = parent?.getLowCardinalityKeyValue(key)?.value ?: "unknown"   // zawsze ten sam zestaw kluczy
+              context.addLowCardinalityKeyValue(KeyValue.of(key, value))
+          }
+          return context
+      }
+  }
+</script>
+<p>Wartość <code>unknown</code> wskazuje miejsca, które wołają model z pominięciem <code>AssistantService</code>. Działanie filtra na metrykach potwierdź testem w swojej wersji Micrometera i Spring AI.</p>
+
+<h3>Licznik kosztu</h3>
+<p>Szczegółowy pomiar kosztu to lekcja 2.6. Tu wystarczy handler, który przelicza tokeny na pieniądze według tabeli cen z konfiguracji:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/observability/LlmCostObservationHandler.kt">
+  @Component
+  class LlmCostObservationHandler(
+      private val meters: MeterRegistry,
+      private val prices: LlmPriceTable,     // ceny za 1M tokenów per model, z application.yml
+  ) : ObservationHandler<ChatModelObservationContext> {
+
+      override fun supportsContext(context: Observation.Context) = context is ChatModelObservationContext
+
+      override fun onStop(context: ChatModelObservationContext) {
+          val metadata = context.response?.metadata ?: return
+          val usage = metadata.usage
+          val model = metadata.model ?: "unknown"
+          val usd = prices.costUsd(model, usage.promptTokens ?: 0, usage.completionTokens ?: 0)
+          meters.counter(
+              "helpdesk.llm.cost.usd",
+              "helpdesk.feature", context.getLowCardinalityKeyValue(AssistantObservations.FEATURE)?.value ?: "unknown",
+              "gen_ai.response.model", model,
+          ).increment(usd)
+      }
+  }
+</script>
+<p>To szacunek; dokładne rozliczenie per klucz wirtualny ma LiteLLM (lekcja 1.3). Rozjazd obu liczb oznacza nieaktualną tabelę cen albo wywołania omijające instrumentację.</p>
+
+<h2>Low vs high cardinality: jak nie wysadzić bazy metryk</h2>
+<p><dfn data-t="cardinality">Kardynalność</dfn> to liczba różnych wartości, jakie może przyjąć atrybut. Każda unikalna kombinacja etykiet metryki to osobny <strong>szereg czasowy</strong>, który baza metryk trzyma w pamięci i na dysku. Micrometer rozróżnia dwa rodzaje atrybutów:</p>
+<ul>
+  <li><strong>low cardinality</strong>: mało, z góry ograniczona liczba wartości (funkcja, wersja promptu, alias modelu, nazwa narzędzia, wynik). Trafiają do metryk <em>i</em> trace'ów.</li>
+  <li><strong>high cardinality</strong>: wartości nieograniczone (ID użytkownika, zgłoszenia, rozmowy, treść). Trafiają <em>tylko</em> do trace'ów, gdzie są atrybutami pojedynczego spanu i nic nie kosztują w metrykach.</li>
+</ul>
+<p>Policzmy, co się stanie, jeśli ktoś „dla wygody” doda <code>user.id</code> jako low cardinality do obserwacji modelu z włączonym histogramem:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="rachunek serii">
+  gen_ai_client_operation_seconds_bucket
+    kubełki histogramu                 ~70
+  × aliasy (request model)               4
+  × modele w odpowiedzi                  ~2 na alias (główny + fallback)
+  × instancje aplikacji                  4
+  = ok. 2 240 serii                      → bez problemu
+
+  … + user.id (40 000 aktywnych użytkowników)
+  = ok. 90 000 000 serii                 → przy kilku KB RAM na serię: setki GB
+</script>
+<p>Prometheus ginie z braku pamięci, a w usługach chmurowych rośnie rachunek za liczbę serii. Pomyłka wchodzi jedną linijką w code review, a skutki widać po kilku dniach.</p>
+<table>
+  <tr><th>Atrybut</th><th>Rodzaj</th><th>Uwagi</th></tr>
+  <tr><td><code>helpdesk.feature</code>, <code>prompt.version</code>, alias, nazwa narzędzia</td><td>low</td><td>Kilka–kilkadziesiąt wartości kontrolowanych w kodzie</td></tr>
+  <tr><td><code>gen_ai.response.model</code></td><td>low</td><td>Ograniczona lista, ale rośnie z każdą wersją modelu</td></tr>
+  <tr><td>ID tenanta</td><td>zależy</td><td>Przy 20 stałych klientach można rozważyć low. Przy setkach: high, a koszt per tenant z LiteLLM lub Langfuse</td></tr>
+  <tr><td>ID użytkownika, zgłoszenia, rozmowy</td><td>high</td><td>Zawsze tylko w trace'ach</td></tr>
+  <tr><td>Komunikat wyjątku, treść, URL z parametrami</td><td>nigdy w metrykach</td><td>Jako etykieta tylko klasa wyjątku, jak <code>error</code> w Micrometerze</td></tr>
+</table>
+<div class="box tip"><span class="label">Szybka kontrola</span><p>W Prometheusie zapytanie <code>topk(10, count by (__name__)({__name__=~".+"}))</code> pokazuje metryki z największą liczbą serii. Uruchamiaj je po każdym wdrożeniu nowych atrybutów.</p></div>
+<div class="box warn"><span class="label">Baggage to nie miejsce na dane</span><p>OTel ma też <strong>baggage</strong>, czyli pary klucz-wartość przenoszone w nagłówkach do kolejnych usług. Kusi, żeby wrzucić tam e-mail użytkownika. Nie rób tego: baggage idzie w nagłówkach HTTP do każdej usługi w łańcuchu, również do proxy LLM.</p></div>
+
+<h2>Korelacja logów z trace'ami</h2>
+<p>Gdy Micrometer Tracing jest na classpath, Spring Boot (od 3.2) wstawia <code>traceId</code> i <code>spanId</code> do <dfn data-t="mdc">MDC</dfn> (Mapped Diagnostic Context: mapa wartości przypisana do wątku, którą logger dołącza do każdego wpisu) i do domyślnego wzorca logów:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="log tekstowy">
+  2026-11-12T10:15:02.418+01:00  WARN 4242 --- [helpdesk] [nio-8080-exec-3] [4bf92f3577b34da6a3ce929d0e0e4736-a3ce929d0e0e4736] p.e.h.assistant.TicketTools : getTicket: ticket 8f2c…0l not found
+</script>
+<p>Fragment w nawiasie kwadratowym kontroluje <code>logging.pattern.correlation</code>. W produkcji lepiej logować w JSON, bo system logów (Loki, Elastic, Azure Log Analytics) indeksuje wtedy pola zamiast parsować tekst. Od Spring Boot 3.4 wystarczy właściwość:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application-prod.yml">
+  logging:
+    structured:
+      format:
+        console: logstash          # albo ecs / gelf; wartości z MDC trafiają do JSON jako pola
+</script>
+<script type="text/x-code" data-lang="json" data-title="log JSON (kształt zależy od wybranego formatu)">
+  {
+    "@timestamp": "2026-11-12T09:15:02.418Z",
+    "level": "WARN",
+    "logger_name": "pl.example.helpdesk.assistant.TicketTools",
+    "message": "getTicket: ticket not found",
+    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "spanId": "a3ce929d0e0e4736",
+    "tool": "getTicket"
+  }
+</script>
+<p>Dobre praktyki dla modułu <code>assistant</code>:</p>
+<ul>
+  <li>Loguj zdarzenia (brak zgłoszenia, odrzucony argument, przekroczony limit), a nie treść rozmowy, która ma osobną ścieżkę z kontrolą dostępu.</li>
+  <li>W logach używaj ID: <code>"ticket {} not found", id</code> jest w porządku, a <code>"user {} asked {}", email, question</code> to wyciek.</li>
+  <li>Pola strukturalne (<code>tool</code>, <code>feature</code>) dodawaj przez <code>MDC.putCloseable</code>, nie sklejając stringów.</li>
+  <li>Logi nie są próbkowane. Gdy trace'a nie zachowano, logi z <code>traceId</code> nadal odtworzą przebieg.</li>
+</ul>
+
+<h2>Propagacja kontekstu w kodzie asynchronicznym i streamingu</h2>
+<p>Kontekst trace'a żyje w <code>ThreadLocal</code>, więc nowy wątek go nie zna. Span narzędzia albo zapytania SQL zaczyna wtedy <em>nowy</em> trace, a logi nie mają <code>traceId</code>: w Jaegerze widzisz kilka krótkich trace'ów zamiast jednego drzewa. Przy LLM to częste, bo streaming, równoległe narzędzia i zadania w tle są normą.</p>
+<table>
+  <tr><th>Sytuacja</th><th>Objaw</th><th>Naprawa</th></tr>
+  <tr><td><code>@Async</code>, <code>ThreadPoolTaskExecutor</code></td><td>Metoda asynchroniczna w osobnym trace</td><td>Bean <code>ContextPropagatingTaskDecorator</code> (Boot podpina go do automatycznie konfigurowanego executora)</td></tr>
+  <tr><td>Własny <code>ExecutorService</code> (też <code>newVirtualThreadPerTaskExecutor()</code>), <code>CompletableFuture.supplyAsync</code> bez executora</td><td>j.w.</td><td><code>ContextExecutorService.wrap(…)</code> z biblioteki context-propagation; zawsze podawaj opakowany executor</td></tr>
+  <tr><td>Reactor <code>Flux</code>/<code>Mono</code> (streaming Spring AI)</td><td>Spany SQL i logi w narzędziach bez rodzica</td><td><code>spring.reactor.context-propagation=auto</code>; dla własnych Fluxów <code>contextCapture()</code></td></tr>
+  <tr><td>Korutyny Kotlin (<code>withContext(Dispatchers.IO)</code>)</td><td>j.w.</td><td>Element kontekstu z obserwacją, np. <code>observationRegistry.asContextElement()</code> z Micrometera (sprawdź w swojej wersji)</td></tr>
+  <tr><td>Kolejka zadań w tle (np. Azure Service Bus)</td><td>Zadanie triage bez związku z żądaniem, które je zleciło</td><td>Przenoś <code>traceparent</code> we właściwościach wiadomości. Długie zadania łącz linkiem do spanu, nie jako dziecko</td></tr>
+</table>
+<p><strong>Wątki wirtualne</strong> (Java 21, <code>spring.threads.virtual.enabled: true</code>) same nie psują propagacji: żądanie obsługuje jeden wątek wirtualny z działającym <code>ThreadLocal</code>. Problem pojawia się, gdy sam przekazujesz pracę do innego wątku.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ContextPropagationConfig.kt">
+  @Configuration
+  class ContextPropagationConfig {
+
+      /** Boot 3.2+ podpina TaskDecorator do applicationTaskExecutor → @Async zachowuje trace i MDC. */
+      @Bean
+      fun contextPropagatingTaskDecorator(): TaskDecorator = ContextPropagatingTaskDecorator()
+
+      /** Executor do równoległego wykonywania narzędzi, np. kilku getTicket naraz. */
+      @Bean(destroyMethod = "close")
+      fun toolExecutor(): ExecutorService =
+          ContextExecutorService.wrap(Executors.newVirtualThreadPerTaskExecutor()) {
+              ContextSnapshotFactory.builder().build().captureAll()
+          }
+  }
+</script>
+<h3>Streaming czatu</h3>
+<p><code>chat.prompt().stream()</code> zwraca <code>Flux</code> (strumień Reactora), a Spring AI trzyma obserwację w kontekście Reactora. Tryb <code>auto</code> przywraca w operatorach i w kodzie narzędzi wartości <code>ThreadLocal</code> (trace, MDC). Obserwację na cały strumień dodasz operatorem z <code>reactor-core-micrometer</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantStreamController.kt (fragment)">
+  @PostMapping("/api/assistant/chat/stream", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+  fun stream(user: CurrentUser, @RequestBody req: ChatRequest): Flux<ServerSentEvent<String>> {
+      val traceId = tracer.currentSpan()?.context()?.traceId()      // odczyt w wątku żądania
+      return chat.prompt().user(req.question).tools(ticketTools).stream().content()
+          .map { ServerSentEvent.builder(it).build() }
+          .name(AssistantObservations.CHAT)
+          .tag(AssistantObservations.FEATURE, "info-chat")
+          .tap(Micrometer.observation(registry))                    // span i timer na cały strumień
+          .onErrorResume { e ->
+              log.warn("Błąd strumienia czatu", e)
+              Flux.just(ServerSentEvent.builder("""{"traceId":"$traceId"}""").event("error").build())
+          }
+  }
+</script>
+<p>Pułapki streamingu: czas spanu HTTP to czas całego strumienia, więc jego p95 nic nie mówi o odczuciu użytkownika (mierz <dfn data-t="ttft">TTFT</dfn>, lekcje 2.3 i 2.6); zamknięcie karty anuluje strumień, więc sprawdź, czy span kończy się wtedy poprawnie i czy anulowanie da się odróżnić od błędu; błąd po pierwszych zdarzeniach nie zmieni już statusu HTTP, dlatego wysyłamy zdarzenie <code>error</code> z <code>traceId</code>.</p>
+<h3>Test, który łapie zerwany trace</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantTracingIT.kt">
+  @SpringBootTest
+  @AutoConfigureObservability                       // bez tego tracing w testach jest wyłączony
+  @Import(AssistantTracingIT.Spans::class)
+  class AssistantTracingIT(@Autowired val assistant: AssistantService, @Autowired val spans: InMemorySpanExporter) {
+
+      @TestConfiguration
+      class Spans { @Bean fun inMemorySpanExporter(): InMemorySpanExporter = InMemorySpanExporter.create() }
+
+      @Test
+      fun `wywolania modelu i narzedzi sa w jednym trace`() {
+          // atrapa LiteLLM (np. WireMock) w 1. odpowiedzi prosi o getTicket
+          assistant.answer(acmeUser, ACME, UUID.randomUUID(), "Jaki jest status zgłoszenia 8f2c…01?")
+          await().atMost(Duration.ofSeconds(10)).untilAsserted {   // eksport spanów jest paczkowany
+              assertThat(spans.finishedSpanItems.map { it.name }).anyMatch { it.startsWith("tool_call") }
+          }
+          assertThat(spans.finishedSpanItems.map { it.traceId }.distinct()).hasSize(1)
+      }
+  }
+</script>
+
+<h2>Narzędzia LLM-owe: Langfuse, callbacki LiteLLM</h2>
+<p>W Jaegerze i Tempo słabo czyta się rozmowy: treść to atrybut na dziesiątki tysięcy znaków, nie ma kosztów ani ocen. <dfn data-t="langfuse">Langfuse</dfn> to otwarte narzędzie (self-hosted albo w chmurze) dla aplikacji z LLM. Daje:</p>
+<ul>
+  <li><strong>Rozmowy</strong>: trace'y w sesjach, z czytelnym wejściem i wyjściem każdego wywołania modelu.</li>
+  <li><strong>Koszty i tokeny</strong> per model, użytkownik, sesja, liczone z tabeli cen (możesz dopisać własne modele).</li>
+  <li><strong>Wersje promptów</strong>: zarządzanie promptami powiązane z generacjami. Przy promptach w repozytorium (lekcja 2.4) filtrujesz po <code>helpdesk.prompt.version</code>.</li>
+  <li><strong>Oceny (scores)</strong>: kciuk użytkownika, ręczne adnotacje, <dfn data-t="llm-judge">LLM-as-a-judge</dfn>.</li>
+  <li><strong>Zbiory danych</strong>: przypadki z produkcji przenosisz do zestawu do <dfn data-t="eval">evali</dfn> (lekcja 2.8).</li>
+</ul>
+<p>Langfuse przyjmuje OTLP. Ma zobaczyć treść, a Jaeger nie, więc robimy dwa pipeline'y za wspólnym samplingiem, połączone connectorem <code>forward</code> (komponentem będącym eksporterem jednego pipeline'u i receiverem kolejnych):</p>
+<script type="text/x-code" data-lang="yaml" data-title="otel-collector.yaml (wersja z Langfuse)">
+  processors:                            # + memory_limiter, batch, transform, tail_sampling
+    attributes/strip-content:            # Jaeger/Tempo: szerszy dostęp, więc bez treści
+      actions:
+        - { key: gen_ai.prompt, action: delete }
+        - { key: gen_ai.completion, action: delete }
+        - { key: spring.ai.tool.call.arguments, action: delete }
+        - { key: spring.ai.tool.call.result, action: delete }
+    redaction/pii:                       # Langfuse: maskowanie oczywistych wzorców (nie zastępuje Presidio)
+      allow_all_keys: true
+      blocked_values:
+        - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"   # e-mail
+        - "\\b\\d{11}\\b"                                     # PESEL (uproszczenie)
+      summary: info
+
+  connectors:
+    forward/sampled: {}
+
+  exporters:
+    otlp/jaeger:
+      endpoint: jaeger:4317
+      tls: { insecure: true }
+    otlphttp/langfuse:
+      endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}   # np. https://langfuse.firma.local/api/public/otel
+      headers:
+        Authorization: "Basic ${env:LANGFUSE_AUTH}"   # base64(public_key:secret_key)
+        x-langfuse-ingestion-version: "4"             # wymagany w nowszych wersjach – sprawdź dokumentację
+
+  service:
+    pipelines:
+      traces/in:
+        receivers: [otlp]
+        processors: [memory_limiter, transform/genai-types, tail_sampling]
+        exporters: [forward/sampled]
+      traces/apm:
+        receivers: [forward/sampled]
+        processors: [attributes/strip-content, batch]
+        exporters: [otlp/jaeger]
+      traces/llm:
+        receivers: [forward/sampled]
+        processors: [redaction/pii, batch]
+        exporters: [otlphttp/langfuse]
+</script>
+<p>Langfuse rozpoznaje <code>gen_ai.*</code> oraz własne atrybuty, np. <code>langfuse.user.id</code> i <code>langfuse.session.id</code>, najlepiej ustawione na spanie głównym. W kontrolerze bieżąca obserwacja to żądanie HTTP, czyli korzeń trace'a:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantController.kt (fragment)">
+  registry.currentObservation?.apply {
+      highCardinalityKeyValue("langfuse.session.id", req.conversationId.toString())
+      highCardinalityKeyValue("langfuse.user.id", user.userId.toString())   // ID, nie e-mail
+  }
+</script>
+<p>Ocenę użytkownika z UI backend wysyła do Langfuse jako score (publiczne API, endpoint <code>/api/public/scores</code>, schemat sprawdź w API reference) z tym samym <code>traceId</code>, który zwracamy frontendowi. Przy self-hostingu pamiętaj, że aktualny Langfuse to kilka komponentów (Postgres, ClickHouse, Redis, magazyn obiektów S3 lub Azure Blob) do utrzymania jak każda usługa z danymi osobowymi.</p>
+
+<h3>Callbacki LiteLLM jako druga droga</h3>
+<p>LiteLLM może sam raportować każde wywołanie modelu. Możliwości są dwie:</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml (fragment)">
+  litellm_settings:
+    callbacks: ["otel"]                 # spany proxy do Collectora (env OTEL_EXPORTER, OTEL_ENDPOINT)
+    # success_callback: ["langfuse"]    # alternatywa: prosto do Langfuse (env LANGFUSE_*)
+    turn_off_message_logging: true      # treść idzie ścieżką aplikacji, nie dublujemy jej
+    redact_user_api_key_info: true
+</script>
+<table>
+  <tr><th>Podejście</th><th>Co widać</th><th>Czego nie widać</th></tr>
+  <tr><td>Aplikacja → OTLP → Collector → Langfuse</td><td>Pełne drzewo: HTTP, advisory, iteracje modelu, narzędzia, SQL, atrybuty domenowe</td><td>Wnętrza proxy: retry, fallback, faktyczny dostawca, dokładny koszt</td></tr>
+  <tr><td>LiteLLM <code>success_callback: ["langfuse"]</code></td><td>Każde wywołanie modelu (także z innych aplikacji), faktyczny model, koszt z proxy</td><td>Kontekst aplikacji (narzędzia, baza, funkcja), chyba że przekażesz <code>metadata</code>. Osobny trace, o ile nie podasz <code>metadata.trace_id</code> równego naszemu <code>traceId</code></td></tr>
+  <tr><td>LiteLLM <code>callbacks: ["otel"]</code> → ten sam Collector</td><td>Spany proxy jako dzieci spanu aplikacji (dzięki <code>traceparent</code>): retry, fallback, czas u dostawcy</td><td>Nic ponad proxy. Uzupełnia ścieżkę aplikacyjną, nie zastępuje jej</td></tr>
+</table>
+<p>W HelpDesk źródłem prawdy jest ścieżka aplikacyjna, LiteLLM dokłada spany przez <code>otel</code> i liczy koszty per klucz. Callback Langfuse w LiteLLM ma sens, gdy z proxy korzysta wiele aplikacji bez własnej instrumentacji.</p>
+
+<h2>Azure: Application Insights i Azure Monitor przez OpenTelemetry</h2>
+<p>Jeśli firma ma Azure Monitor (Application Insights to jego część dla aplikacji), Jaeger nie jest potrzebny. Dwie drogi:</p>
+<ul>
+  <li><strong>Collector z eksporterem <code>azuremonitor</code></strong> (dystrybucja contrib): aplikacja bez zmian, sampling i maskowanie jak wyżej.</li>
+  <li><strong>Agent Java Application Insights</strong> (<code>-javaagent:applicationinsights-agent-3.x.jar</code>), oparty na OTel: sam instrumentuje aplikację i zbiera metryki Micrometera. Nie łącz go z własnym eksportem OTLP z aplikacji, bo łatwo o zdublowane albo rozjechane trace'y.</li>
+</ul>
+<script type="text/x-code" data-lang="yaml" data-title="otel-collector.yaml (eksporter Azure)">
+  exporters:
+    azuremonitor:
+      connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}   # z Key Vault, nie z repo
+  service:
+    pipelines:
+      traces/apm:
+        receivers: [forward/sampled]
+        processors: [attributes/strip-content, batch]
+        exporters: [azuremonitor]
+</script>
+<p>Spany serwera trafiają do tabeli <code>requests</code>, wewnętrzne i klienckie (w tym wywołania modelu) do <code>dependencies</code>, a atrybuty do <code>customDimensions</code>. Zapytanie w KQL (języku zapytań Azure Monitor):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="KQL: wywołania modelu w ostatniej dobie">
+  dependencies
+  | where timestamp > ago(24h)
+  | where tostring(customDimensions["gen_ai.operation.name"]) == "chat"
+  | extend model = tostring(customDimensions["gen_ai.response.model"]),
+           inTok = toint(customDimensions["gen_ai.usage.input_tokens"]),
+           outTok = toint(customDimensions["gen_ai.usage.output_tokens"])
+  | summarize calls = count(), p95_ms = percentile(duration, 95),
+              input = sum(inTok), output = sum(outTok) by model, bin(timestamp, 1h)
+</script>
+<p>Pamiętaj, że te sumy pochodzą z trace'ów, czyli z próbki. Do kosztów używaj metryk (sekcja o samplingu).</p>
+
+<h2>Co logować, a czego nie</h2>
+<table>
+  <tr><th>Dane</th><th>Decyzja</th><th>Gdzie i jak długo</th></tr>
+  <tr><td>Model żądany i faktyczny, tokeny, czas, <code>finish_reason</code>, błędy, funkcja, wersja promptu, narzędzia</td><td>Zawsze</td><td>Metryki (np. 13 mies.) i trace'y (7–14 dni)</td></tr>
+  <tr><td>ID użytkownika, tenanta, rozmowy, zgłoszenia</td><td>Tak, jako high cardinality</td><td>Tylko trace'y i logi</td></tr>
+  <tr><td>Argumenty narzędzi</td><td>Zwykle tak (to głównie ID), ale np. <code>searchTickets(query)</code> zawiera tekst użytkownika</td><td>Traktuj jak treść, jeśli zawierają tekst swobodny</td></tr>
+  <tr><td>Treść pytań, odpowiedzi, wyniki narzędzi</td><td>Opcjonalnie, po zgodzie tenanta, z maskowaniem</td><td>Tylko narzędzie z kontrolą dostępu (Langfuse), np. 30 dni</td></tr>
+  <tr><td>Pełny tekst promptu systemowego</td><td>Nie trzeba</td><td>Wystarczy wersja, prompt jest w repozytorium</td></tr>
+  <tr><td>Imię, e-mail, telefon jako atrybut; JWT, <code>Authorization</code>, klucze API</td><td>Nigdy</td><td>Zastąp ID; sprawdź, czy instrumentacja HTTP nie zapisuje nagłówków</td></tr>
+</table>
+<ul>
+  <li><strong>Maskowanie</strong> blisko źródła: najpierw nie zapisujesz w aplikacji tego, czego nie potrzebujesz, potem Collector (<code>redaction</code>, usuwanie atrybutów). Regex złapie e-mail, ale nie imię i nazwisko. To zadanie dla Presidio (lekcja 2.7).</li>
+  <li><strong>Retencja</strong>: im bogatsze dane, tym krótsza. Usunięcie danych na żądanie łatwiej obsłużyć w Langfuse (API do usuwania trace'ów) niż w magazynie trace'ów APM.</li>
+  <li><strong>Kontrola dostępu</strong>: treść rozmów widzi wąska grupa (zespół AI, wsparcie L3) przez SSO, z logowaniem dostępu. Dashboardy metryk mogą być szeroko dostępne.</li>
+</ul>
+<div class="box tip"><span class="label">Trace to nie audyt</span><p>Trace jest próbkowany, krótko przechowywany i służy do diagnostyki. Odpowiedź na pytanie „co asystent zmienił w zgłoszeniu i na czyje polecenie?” musi być pełna i trwała, dlatego trafia do <code>ticket_events</code> z <code>actor_type = ASSISTANT</code> (lekcja 3.6). Do wpisu audytu warto dołączyć <code>traceId</code>, żeby móc przejść do szczegółów, dopóki trace istnieje.</p></div>
+
+<h2>Sampling: head czy tail</h2>
+<p><strong>Head sampling</strong> decyduje na początku żądania, np. losowo 10% (<code>probability: 0.1</code>). Jest tani, ale ślepy: nie wie jeszcze, czy żądanie skończy się błędem, potrwa 40 s albo zużyje 50 tys. tokenów. Tracisz 90% trace'ów z błędami, a właśnie ich szukasz przy zgłoszeniu klienta.</p>
+<p><strong>Tail sampling</strong> decyduje po zakończeniu trace'a: aplikacja wysyła wszystko, a processor <code>tail_sampling</code> w Collectorze wybiera po zamknięciu trace'a. Zasada dla LLM: <strong>zawsze zachowuj błędy, wolne i drogie żądania</strong>, a ze zwykłych tylko próbkę.</p>
+<script type="text/x-code" data-lang="yaml" data-title="otel-collector.yaml (sampling)">
+  processors:
+    # Micrometer zapisuje wartości atrybutów jako tekst → zamieniamy tokeny na liczbę
+    transform/genai-types:
+      error_mode: ignore
+      trace_statements:
+        - context: span
+          statements:
+            - set(attributes["gen_ai.usage.total_tokens"], Int(attributes["gen_ai.usage.total_tokens"])) where attributes["gen_ai.usage.total_tokens"] != nil
+
+    tail_sampling:
+      decision_wait: 90s                 # pętla agenta + streaming trwają długo; domyślne 30 s to za mało
+      num_traces: 50000                  # ile trace'ów trzymać w pamięci w oczekiwaniu na decyzję
+      expected_new_traces_per_sec: 50
+      policies:                          # trace jest zachowany, jeśli pasuje do KTÓREJKOLWIEK polityki
+        - name: errors
+          type: status_code
+          status_code: { status_codes: [ERROR] }
+        - name: slow
+          type: latency
+          latency: { threshold_ms: 15000 }
+        - name: expensive-call
+          type: numeric_attribute
+          numeric_attribute: { key: gen_ai.usage.total_tokens, min_value: 20000, max_value: 100000000 }
+        - name: baseline
+          type: probabilistic
+          probabilistic: { sampling_percentage: 10 }
+</script>
+<p>Rachunek pamięci: 20 żądań/s × 90 s to ok. 1 800 trace'ów w buforze. Przy 30 spanach na trace i treści rzędu 30 KB na wywołanie modelu to kilkaset MB: akceptowalne, ale widać, że treść zwielokrotnia zapotrzebowanie Collectora na pamięć.</p>
+<div class="box warn"><span class="label">Pułapki tail samplingu</span><ul>
+  <li>Spany jednego trace'a muszą trafić do <em>tej samej</em> instancji Collectora. Przy kilku replikach potrzebna jest warstwa z eksporterem <code>loadbalancing</code> kierującym ruch po <code>traceID</code>.</li>
+  <li>Aplikacja musi wysyłać 100% (<code>probability: 1.0</code>). Przy 0.1 polityka „zawsze błędy” obejmuje tylko 10% błędów.</li>
+  <li>Ocena użytkownika przychodzi po decyzji samplingu. Źle ocenione przypadki, które mają trafić do evali, zapisuj osobno w chwili oceny (za zgodą).</li>
+</ul></div>
+<p>Najważniejsze: <strong>metryki nie są próbkowane</strong>. Micrometer liczy 100% wywołań niezależnie od samplingu trace'ów. Koszty, tokeny i odsetek błędów licz z metryk, a trace'y traktuj jako przykłady do diagnozy.</p>
+
+<h2>Dashboard i alerty</h2>
+<p>Minimalny dashboard funkcji AI w PromQL (języku zapytań Prometheusa), po jednym panelu Grafany na zapytanie:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="PromQL: panele dashboardu „HelpDesk AI”">
+  # 1. Koszt na godzinę per funkcja (licznik z LlmCostObservationHandler)
+  sum by (helpdesk_feature) (increase(helpdesk_llm_cost_usd_total[1h]))
+
+  # 2. p95 czasu odpowiedzi czatu (endpoint bez streamingu)
+  histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/api/assistant/chat"}[5m])))
+
+  # 3. p95 pojedynczego wywołania modelu per alias
+  histogram_quantile(0.95, sum by (le, gen_ai_request_model) (rate(gen_ai_client_operation_seconds_bucket[5m])))
+
+  # 4. Odsetek błędów czatu
+  sum(rate(http_server_requests_seconds_count{uri="/api/assistant/chat", outcome="SERVER_ERROR"}[5m]))
+    / sum(rate(http_server_requests_seconds_count{uri="/api/assistant/chat"}[5m]))
+
+  # 5. Odsetek fallbacków (wzorzec nazwy zależy od tego, co LiteLLM zwraca w polu model)
+  sum(rate(gen_ai_client_operation_seconds_count{gen_ai_request_model="helpdesk-default", gen_ai_response_model=~"gpt-.*"}[15m]))
+    / sum(rate(gen_ai_client_operation_seconds_count{gen_ai_request_model="helpdesk-default"}[15m]))
+
+  # 6. Tokeny wejściowe na jedno pytanie
+  sum(rate(gen_ai_client_token_usage_total{gen_ai_token_type="input", helpdesk_feature="info-chat"}[1h]))
+    / sum(rate(helpdesk_assistant_chat_seconds_count{helpdesk_feature="info-chat"}[1h]))
+
+  # 7. Wywołania modelu na pytanie (iteracje pętli; skok = zapętlanie)
+  sum(rate(gen_ai_client_operation_seconds_count{helpdesk_feature="info-chat"}[1h]))
+    / sum(rate(helpdesk_assistant_chat_seconds_count{helpdesk_feature="info-chat"}[1h]))
+</script>
+<p>Progi alertów wylicz z założeń i skoryguj po dwóch tygodniach. Przykład z ilustracyjnymi cenami (sprawdź aktualny cennik): 2 000 pytań dziennie, średnio 2 wywołania modelu po 2 000 tokenów wejścia i 200 wyjścia, 3 USD za 1M tokenów wejściowych i 15 USD za 1M wyjściowych. Wywołanie to 0,006 + 0,003 = 0,009 USD, pytanie ok. 0,018 USD, doba ok. 36 USD. W szczytowej godzinie (ok. 15% ruchu, 300 pytań) to ok. 5,4 USD/h, więc alert ustawiamy na mniej więcej trzykrotność szczytu.</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts.yml (Prometheus, dwie reguły; pozostałe analogicznie)">
+  groups:
+    - name: helpdesk-ai
+      rules:
+        - alert: AiCostPerHourHigh
+          expr: sum(increase(helpdesk_llm_cost_usd_total[1h])) > 15
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Koszt LLM > 15 USD/h (ok. 3× szczyt). Sprawdź panel 7: pętle i nowe wersje promptów."
+        - alert: AiChatErrorRateHigh
+          expr: |
+            sum(rate(http_server_requests_seconds_count{uri="/api/assistant/chat", outcome="SERVER_ERROR"}[10m]))
+              / sum(rate(http_server_requests_seconds_count{uri="/api/assistant/chat"}[10m])) > 0.05
+          for: 10m
+          labels: { severity: critical }
+</script>
+<table>
+  <tr><th>Alert</th><th>Próg startowy</th><th>Dlaczego tak</th></tr>
+  <tr><td>Koszt na godzinę</td><td>3× typowy szczyt</td><td>Łapie pętle i nadużycia, nie budzi przy zwykłym szczycie</td></tr>
+  <tr><td>p95 czatu</td><td>20 s przez 10 min</td><td>Odpowiedź z narzędziem to typowo 3–8 s. 20 s oznacza problem u dostawcy albo długi kontekst</td></tr>
+  <tr><td>Błędy</td><td>5% przez 10 min</td><td>Pojedyncze 429 (<dfn data-t="rate-limit">rate limit</dfn>) i timeouty są normalne (lekcja 1.5), stały poziom 5% już nie</td></tr>
+  <tr><td>Fallback</td><td>20% przez 15 min</td><td>Działa, ale na innym modelu, więc jakość i koszt są inne niż w evalach</td></tr>
+  <tr><td>Wywołania modelu na pytanie</td><td>&gt; 4 średnio</td><td>Typowo 1–2. Wzrost po zmianie promptu lub modelu to sygnał zapętlania</td></tr>
+</table>
+<p>W opisie każdego alertu wskaż panel i filtr trace'ów, od których zacząć diagnozę.</p>
+
+<h2>Frontend: traceparent i kod błędu dla wsparcia</h2>
+<p>Gdy coś pójdzie źle, użytkownik powinien dostać krótki kod, który wsparcie wklei do wyszukiwarki trace'ów lub logów. Backend dokłada <code>traceId</code> do każdego <dfn data-t="problem-detail">ProblemDetail</dfn>, a analogicznym <code>OncePerRequestFilter</code> także nagłówek <code>X-Trace-Id</code> do każdej odpowiedzi:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="observability/ProblemTraceIdAdvice.kt">
+  /** traceId w treści każdego błędu. Działa wewnątrz obserwacji żądania HTTP, więc span już istnieje. */
+  @RestControllerAdvice
+  class ProblemTraceIdAdvice(private val tracer: Tracer) : ResponseBodyAdvice<ProblemDetail> {
+      override fun supports(type: MethodParameter, converter: Class<out HttpMessageConverter<*>>) =
+          ProblemDetail::class.java.isAssignableFrom(type.parameterType)
+
+      override fun beforeBodyWrite(
+          body: ProblemDetail?, type: MethodParameter, mediaType: MediaType,
+          converter: Class<out HttpMessageConverter<*>>, req: ServerHttpRequest, res: ServerHttpResponse,
+      ): ProblemDetail? = body?.apply {
+          tracer.currentSpan()?.context()?.traceId()?.let { setProperty("traceId", it) }
+      }
+  }
+</script>
+<p>Jeśli frontend działa pod inną domeną niż API, dodaj <code>X-Trace-Id</code> do <code>exposedHeaders</code> w konfiguracji CORS, inaczej przeglądarka go ukryje. Po stronie Reacta:</p>
+<script type="text/x-code" data-lang="typescript" data-title="components/ErrorNotice.tsx">
+  export function ErrorNotice({ error }: { error: ApiError }) {
+    const traceId = typeof error.problem.traceId === "string" ? error.problem.traceId : undefined;
+    const shortCode = traceId?.slice(0, 8);          // do podyktowania przez telefon
+    return (
+      <div role="alert" className="error">
+        <p>{error.problem.detail ?? "Coś poszło nie tak. Spróbuj ponownie za chwilę."}</p>
+        {traceId && (
+          <p>
+            Jeśli problem się powtarza, podaj ten kod wsparciu: <code>{shortCode}</code>{" "}
+            <button onClick={() => navigator.clipboard.writeText(traceId)}>Kopiuj pełny kod</button>
+          </p>
+        )}
+      </div>
+    );
+  }
+</script>
+<p>Pełne 32 znaki są potrzebne do otwarcia trace'a w Jaegerze lub Langfuse. Pierwsze 8 wystarczy do wyszukania w logach w wąskim oknie czasu, a łatwo je podyktować. Ten sam <code>traceId</code> wysyłamy z przyciskiem oceny odpowiedzi, żeby ocena trafiła do właściwego trace'a w Langfuse.</p>
+
+<h3>Opcjonalnie: traceparent z przeglądarki</h3>
+<p>Żeby mierzyć czas także w przeglądarce (np. od kliknięcia do pierwszego tokenu), frontend może sam rozpocząć trace. Pełne rozwiązanie to <code>@opentelemetry/sdk-trace-web</code>. Minimalna wersja ręczna:</p>
+<script type="text/x-code" data-lang="typescript" data-title="api/tracing.ts">
+  const hex = (bytes: number) =>
+    Array.from(crypto.getRandomValues(new Uint8Array(bytes)), b => b.toString(16).padStart(2, "0")).join("");
+
+  export const newTraceparent = () => `00-${hex(16)}-${hex(8)}-01`;   // 01 = sampled
+  // fetch(url, { headers: { traceparent: newTraceparent(), ... } }); EventSource nie ustawi nagłówka, fetch tak
+</script>
+<p>Backend zaczyna wtedy ufać identyfikatorom od klienta: atakujący może podawać ten sam <code>traceId</code> w wielu żądaniach albo wymuszać zapis flagą <code>01</code> (przy naszej architekturze bez znaczenia, bo decyduje Collector). Przy publicznym frontendzie zwykle prościej nie przyjmować <code>traceparent</code> z przeglądarki i polegać na <code>X-Trace-Id</code>. Przy API na innej domenie nagłówek musi być dozwolony w CORS (<code>allowedHeaders</code>).</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Uruchom środowisko z Collectorem, Jaegerem i Prometheusem. Zadaj asystentowi pytanie o status zgłoszenia Acme i znajdź trace: wskaż obie iteracje modelu, span narzędzia i zapytanie SQL. Potem wyłącz w LiteLLM model główny (np. zły klucz) i sprawdź, jak zmienia się <code>gen_ai.response.model</code> i panel fallbacków.</li>
+  <li>Dodaj <code>FeatureKeysPropagationFilter</code> i <code>LlmCostObservationHandler</code>. W <code>/actuator/prometheus</code> sprawdź, czy <code>gen_ai_client_token_usage_total</code> ma etykietę <code>helpdesk_feature</code>. Następnie na chwilę dodaj <code>user.id</code> jako low cardinality, wygeneruj ruch od 50 użytkowników i policz serie zapytaniem <code>count({__name__=~"gen_ai.*"})</code>. Usuń zmianę.</li>
+  <li>Przenieś wywołanie narzędzia do metody <code>@Async</code> bez <code>ContextPropagatingTaskDecorator</code> i pokaż, że test <code>AssistantTracingIT</code> zaczyna nie przechodzić. Dodaj dekorator i sprawdź, że test znów przechodzi.</li>
+  <li>Wywołaj błąd (np. zatrzymaj LiteLLM), odczytaj kod z <code>ErrorNotice</code> i znajdź po nim wpisy w logach JSON oraz trace w Jaegerze. Zmierz, ile czasu zajęła droga „kod od użytkownika → przyczyna”.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Chcesz filtrować trace'y po ID zgłoszenia, którego dotyczy pytanie. Gdzie je umieścić?</p>
+  <button>Jako etykietę low cardinality, żeby mieć też metrykę per zgłoszenie</button>
+  <button>Nigdzie, ID zgłoszenia to dane osobowe</button>
+  <button>Jako atrybut high cardinality: trafi tylko do trace'ów</button>
+  <p class="explain">ID zgłoszenia ma nieograniczoną liczbę wartości. W metrykach każda wartość tworzy osobne serie (razy kubełki histogramu i instancje), co szybko wysadza bazę metryk. W trace'ach to zwykły atrybut spanu.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego obok <code>gen_ai.request.model</code> potrzebujesz <code>gen_ai.response.model</code>?</p>
+  <button>Bo za aliasem i po fallbacku mógł odpowiedzieć inny model niż ten, o który prosiłeś</button>
+  <button>Bo <code>request.model</code> jest zawsze pusty przy LiteLLM</button>
+  <button>Bo wymaga tego RODO</button>
+  <p class="explain">Aplikacja prosi o <code>helpdesk-default</code>, a po fallbacku odpowiada model zapasowy z innym zachowaniem i ceną. Bez tej informacji nie wyjaśnisz nagłej zmiany jakości ani kosztów.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Aplikacja ma <code>sampling.probability: 0.1</code>. Klient zgłasza błąd sprzed godziny, a trace'a nie ma. Co poprawić?</p>
+  <button>Zwiększyć retencję w Jaegerze</button>
+  <button>Wysyłać 100% do Collectora i stosować tail sampling, który zawsze zachowuje błędy, wolne i drogie żądania</button>
+  <button>Logować pełną treść promptów do logów aplikacji</button>
+  <p class="explain">Head sampling decyduje na początku żądania, zanim wiadomo, czy skończy się błędem, więc 90% błędów przepada. Tail sampling decyduje po zakończeniu trace'a na podstawie statusu, czasu i atrybutów.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Przy czacie strumieniowym spany zapytań SQL z narzędzi pojawiają się w Jaegerze jako osobne, jednospanowe trace'y. Najbardziej prawdopodobna przyczyna?</p>
+  <button>Collector gubi spany przy dużym ruchu</button>
+  <button>Narzędzia trzeba oznaczyć adnotacją <code>@Observed</code></button>
+  <button>Kontekst trace'a z <code>ThreadLocal</code> nie przechodzi na wątki Reactora; brakuje m.in. <code>spring.reactor.context-propagation=auto</code></button>
+  <p class="explain">Streaming wykonuje część pracy na innych wątkach. Bez automatycznej propagacji kontekstu kod narzędzia nie widzi bieżącego spanu, więc instrumentacja JDBC zaczyna nowy trace. Wykryje to test z <code>InMemorySpanExporter</code> sprawdzający jeden <code>traceId</code>.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Z czego liczyć koszt LLM na godzinę per funkcja w dashboardzie?</p>
+  <button>Z sumy <code>gen_ai.usage.*</code> w trace'ach, bo są dokładniejsze</button>
+  <button>Z metryk (liczniki tokenów i kosztu), bo nie są próbkowane</button>
+  <button>Z logów aplikacji z włączonym <code>log-prompt</code></button>
+  <p class="explain">Trace'y to próbka (np. 10% plus błędy), więc suma z nich zaniża koszt w nieprzewidywalny sposób. Metryki Micrometera liczą każde wywołanie. Trace'y służą do diagnozy konkretnych przypadków.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
