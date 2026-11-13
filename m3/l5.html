@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.5 Idempotencja i potwierdzenia – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="3.5">
+<main>
+<p class="meta">Lekcja 3.5 · ok. 65 min</p>
+<h1>Idempotencja i potwierdzenia</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zaprojektować kartę potwierdzenia, która pokazuje dokładnie to, co się stanie, i nie uczy użytkownika klikania na ślepo.</li>
+  <li>Zbudować maszynę stanów akcji asystenta z atomowymi przejściami w SQL, wygasaniem i wykrywaniem nieaktualnych propozycji.</li>
+  <li>Zrozumieć, skąd biorą się duplikaty żądań, i obsłużyć je nagłówkiem <code>Idempotency-Key</code> po stronie serwera i klienta.</li>
+  <li>Napisać <code>AssistantActionExecutor.confirm</code>, który w jednej transakcji ponownie waliduje, wykonuje akcję, zapisuje historię i audyt.</li>
+  <li>Obsłużyć skutki uboczne poza bazą (e-mail do klienta) i przetestować wyścigi, ponowienia, wygaśnięcie i kill switch.</li>
+</ul></div>
+
+<h2>Po co potwierdzenia, skoro backend sprawdza uprawnienia</h2>
+<p>W lekcji 3.1 narzędzia zapisu przestały cokolwiek zmieniać: <code>TicketWriteTools</code> zapisują w <code>assistant_actions</code> <em>propozycję</em> ze statusem <code>PROPOSED</code>, a model mówi „przygotowałem zmianę do zatwierdzenia”. W 3.3 polityka <code>AssistantActionPolicy</code> zawęziła, co asystent w ogóle może zaproponować. Zostaje pytanie: po co jeszcze człowiek, skoro backend i tak odrzuci akcję niedozwoloną?</p>
+<p>Bo uprawnienia odpowiadają na pytanie „<em>czy wolno</em>”, a potwierdzenie na „<em>czy tego chcę</em>”. Piotr może dodać publiczny komentarz do HD-1042. Jeśli jednak model, zmanipulowany przez <dfn data-t="prompt-injection">prompt injection</dfn> (ukryte polecenia w treści, którą czyta model) w komentarzu Anny, przygotuje komentarz z notatkami wewnętrznymi, uprawnienia go przepuszczą. Incydent z lekcji 3.4 wydarzył się dokładnie tak: prototyp wykonywał akcje od razu. Potwierdzenie z dokładnym podglądem to ostatnia warstwa, w której człowiek widzi treść przed klientem.</p>
+<p>To jest <dfn data-t="hitl">human-in-the-loop</dfn> (człowiek zatwierdza decyzje AI) na poziomie <strong>pojedynczej akcji</strong>: autor prośby zatwierdza propozycję w trakcie rozmowy. W lekcji 5.3 zobaczysz HITL na poziomie <strong>procesu</strong>: agent działa w tle, a niepewne przypadki trafiają do kolejki zespołu. Problemy będą inne (kolejka rośnie), ale maszyna stanów i idempotencja z tej lekcji zostaną.</p>
+<div class="box tip"><span class="label">Zasada</span><p>Potwierdzenie nie zastępuje walidacji w backendzie. Kolejność jest zawsze ta sama: polityka przy propozycji (3.3), podgląd i decyzja człowieka (ta lekcja), ponowna pełna walidacja przy wykonaniu. Każda warstwa łapie inne błędy.</p></div>
+
+<h2>Anatomia dobrej karty potwierdzenia</h2>
+<p>Karta to element UI w oknie czatu z propozycją i przyciskami. Użytkownik ma na nią kilka sekund uwagi, więc musi zobaczyć wszystko, co zmienia jego decyzję, bez klikania „więcej”.</p>
+<table>
+  <tr><th>Element</th><th>Co pokazać</th><th>Dlaczego</th></tr>
+  <tr><td>Obiekt</td><td>Numer i tytuł zgłoszenia (HD-1042 „Nie działa eksport faktur do PDF”), tenant, gdy użytkownik obsługuje kilku</td><td>Piotr pracuje dla Acme i Globex; pomyłka zgłoszenia jest realna</td></tr>
+  <tr><td>Dokładna zmiana</td><td>Diff: <code>IN_PROGRESS → WAITING_FOR_CUSTOMER</code>, <code>HIGH → NORMAL</code>; pełna treść komentarza, bez skracania</td><td>Zatwierdza się to, co widać. Skrót „Dodam komentarz z wyjaśnieniem” ukrywa treść</td></tr>
+  <tr><td>Widoczność komentarza</td><td>Duża etykieta „PUBLICZNY – zobaczy klient” lub „Wewnętrzny – tylko zespół”, inny kolor tła</td><td>Pomylenie widoczności to wyciek notatek wewnętrznych</td></tr>
+  <tr><td>Skutki uboczne</td><td>E-mail do anna@acme, wstrzymanie lub zmiana terminu <dfn data-t="sla">SLA</dfn>, spełnienie pierwszej reakcji</td><td>Zmiana statusu wygląda niewinnie, dopóki nie wiesz, że wyśle e-mail i zatrzyma zegar SLA</td></tr>
+  <tr><td>Ryzyko</td><td><code>ActionRisk</code> z 3.1: PUBLIC = HIGH, zmiany pól = MEDIUM, INTERNAL = LOW</td><td>Steruje wyglądem i tarciem karty</td></tr>
+  <tr><td>Kto zatwierdza</td><td>„Zatwierdzasz Ty. W historii: Asystent w imieniu Piotra”</td><td>Odpowiedzialność jest po stronie człowieka</td></tr>
+  <tr><td>Uzasadnienie</td><td>Pole <code>reason</code>, oznaczone jako tekst modelu</td><td>Pomaga ocenić sens, ale nie jest faktem</td></tr>
+  <tr><td>Wygaśnięcie</td><td>„Ważne do 10:57”</td><td>Stan sprzed 15 minut mógł się zmienić</td></tr>
+</table>
+<p>Podgląd i skutki liczy <strong>backend</strong>, nie model i nie frontend. Model mógłby opisać skutki niezgodnie z prawdą, a frontend nie zna reguł SLA ani powiadomień. Widok akcji zwracany przez API:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/ActionView.kt">
+  enum class ActionStatus { PROPOSED, CONFIRMED, EXECUTED, REJECTED, EXPIRED, FAILED }
+
+  data class ActionView(
+      val id: UUID, val type: AssistantActionType, val status: ActionStatus, val risk: ActionRisk,
+      val ticket: TicketRefView,               // id, displayNumber "HD-1042", title, tenantName
+      val preview: ActionPreview,
+      val effects: List<String>,               // gotowe zdania z ActionDescriber
+      val reason: String?,                     // uzasadnienie modelu
+      val proposedAt: Instant, val expiresAt: Instant, val decidedAt: Instant?, val errorCode: String?,
+  )
+
+  sealed interface ActionPreview {
+      data class Comment(val body: String, val visibility: Visibility) : ActionPreview
+      data class FieldChange(val field: String, val from: String?, val to: String?) : ActionPreview
+  }
+</script>
+<p><code>ActionDescriber</code> buduje <code>effects</code> z wiedzy domenowej: „Klient dostanie e-mail”, „Spełni pierwszą reakcję SLA”, „SLA zostanie wstrzymane” (<code>WAITING_FOR_CUSTOMER</code>), nowy termin rozwiązania z <code>SlaApi</code> przy zmianie priorytetu.</p>
+
+<h2>Antywzorce i zmęczenie potwierdzeniami</h2>
+<ul>
+  <li><strong>„Czy wykonać akcję?”</strong> bez treści. Użytkownik zatwierdza zaufanie do modelu, a nie zmianę. Atak z 3.4 przechodzi bez przeszkód.</li>
+  <li><strong>„Zatwierdź wszystkie”.</strong> Wstrzyknięta instrukcja dorzuca jedną złośliwą akcję do kilku sensownych, a przycisk hurtowy przepuszcza ją jednym kliknięciem.</li>
+  <li><strong>Wszystko wygląda tak samo.</strong> Notatka wewnętrzna i odpowiedź do klienta mają identyczną kartę, więc wzrok przestaje czytać.</li>
+  <li><strong>Autofokus na „Zatwierdź”.</strong> Enter wciśnięty, by wysłać kolejne pytanie, zatwierdza akcję.</li>
+</ul>
+<p>Wspólny mianownik to <dfn data-t="confirmation-fatigue">zmęczenie potwierdzeniami</dfn> (confirmation fatigue): przy częstych, podobnych pytaniach ludzie odruchowo klikają „tak”. Znasz to z okienek UAC w Windows i banerów cookies. Środki zaradcze:</p>
+<table>
+  <tr><th>Środek</th><th>W HelpDesk</th></tr>
+  <tr><td>Mniej propozycji</td><td><code>max-proposals-per-turn: 3</code> (3.2) i deduplikacja przez <code>payload_hash</code> (niżej)</td></tr>
+  <tr><td>Tarcie proporcjonalne do ryzyka</td><td>LOW: kompaktowa karta, jeden klik. HIGH: pełna treść, przycisk nazwany skutkiem („Opublikuj klientowi”), inny kolor</td></tr>
+  <tr><td>Grupowanie wizualne</td><td>Propozycje z jednej tury dla jednego zgłoszenia w jednym bloku, ale każda z własnym przyciskiem</td></tr>
+  <tr><td>Pomiar</td><td>Odsetek zatwierdzeń, czas do decyzji, odrzucenia z powodem</td></tr>
+</table>
+<p>A automatyczne wykonanie akcji LOW (notatka wewnętrzna)? <strong>Na razie nie.</strong> Notatka nie trafia do klienta, ale zaśmieca historię, a jej treść czytają później asystent i agenci, więc wstrzyknięta instrukcja może przetrwać do kolejnej rozmowy (3.4). Oszczędność jest mała: notatek jest niewiele, klik trwa sekundę. Wrócimy do tego z danymi: gdy odsetek odrzuceń LOW na kilkuset akcjach spadnie poniżej progu, a evale bezpieczeństwa (3.7) przechodzą w 100%, auto-potwierdzanie można włączyć per tenant jako <dfn data-t="feature-flag">feature flag</dfn>, z audytem i trybem cienia z 5.4.</p>
+<div class="box warn"><span class="label">Sygnał ostrzegawczy</span><p>Mediana czasu do zatwierdzenia karty HIGH poniżej 2 sekund (z <code>proposed_at</code> i <code>decided_at</code>) oznacza, że nikt nie czyta treści.</p></div>
+
+<h2>Maszyna stanów akcji</h2>
+<p><dfn data-t="state-machine">Maszyna stanów</dfn> to skończony zbiór stanów i dozwolonych przejść między nimi; każde inne przejście jest błędem. Znasz ją z <code>TicketStateMachine</code> w 1.1. Akcja asystenta ma sześć stanów:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="cykl życia assistant_actions">
+                  confirm: claim             fasada OK
+   ┌──────────┐ ────────────────► ┌───────────┐ ─────────► ┌──────────┐
+   │ PROPOSED │                   │ CONFIRMED │            │ EXECUTED │
+   └──────────┘                   └───────────┘            └──────────┘
+     │   │   │      błąd domeny: rollback, potem osobna transakcja
+     │   │   └─────────────────────────────────────────────► FAILED
+     │   │ reject
+     │   └─────────► REJECTED
+     │ expires_at minął / kill switch / rozmowa zamknięta
+     └─────────────► EXPIRED
+
+   EXECUTED, REJECTED, EXPIRED, FAILED = stany końcowe (nic z nich nie wychodzi)
+</script>
+<table>
+  <tr><th>Przejście</th><th>Kto</th><th>Warunek w SQL</th></tr>
+  <tr><td>PROPOSED → CONFIRMED</td><td>użytkownik (confirm)</td><td><code>status = 'PROPOSED' AND expires_at &gt; now</code></td></tr>
+  <tr><td>CONFIRMED → EXECUTED</td><td>executor, ta sama transakcja</td><td><code>status = 'CONFIRMED'</code></td></tr>
+  <tr><td>PROPOSED → FAILED</td><td>executor po wycofaniu transakcji</td><td><code>status = 'PROPOSED'</code></td></tr>
+  <tr><td>PROPOSED → REJECTED</td><td>użytkownik (reject)</td><td><code>status = 'PROPOSED'</code></td></tr>
+  <tr><td>PROPOSED → EXPIRED</td><td>job, kill switch, zamknięcie rozmowy</td><td><code>status = 'PROPOSED'</code></td></tr>
+</table>
+<p>W ścieżce synchronicznej <code>CONFIRMED</code> istnieje tylko wewnątrz transakcji. Stan zostaje, bo oddziela decyzję człowieka (kto, kiedy, jakim kluczem) od wykonania; gdy w module 5 wykonanie stanie się asynchroniczne, będzie widoczny i wznawiany po restarcie (5.5). Błąd domenowy wycofuje <code>CONFIRMED</code>, więc <code>FAILED</code> zapisujemy osobno ze stanu <code>PROPOSED</code>.</p>
+
+<h3>Przejścia warunkowe zamiast „przeczytaj, sprawdź, zapisz”</h3>
+<p>Naiwna implementacja wczytuje encję, sprawdza <code>status == PROPOSED</code> i zapisuje nowy. Między odczytem a zapisem drugie żądanie robi to samo i oba wykonują akcję. To klasyczny <dfn data-t="race-condition">wyścig</dfn> (race condition): wynik zależy od przypadkowej kolejności równoległych operacji. Rozwiązanie to warunkowy <code>UPDATE</code>, który sprawdza i zmienia stan w jednej atomowej instrukcji (wzorzec compare-and-set):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/AssistantActionRepository.kt">
+  @Repository
+  class AssistantActionRepository(private val jdbc: JdbcClient) {
+
+      /** PROPOSED → CONFIRMED. Zwraca wiersz albo null, gdy akcja nie jest (już) do zatwierdzenia. */
+      fun claim(id: UUID, userId: UUID, key: String, now: Instant): ActionRow? = jdbc.sql("""
+          UPDATE assistant_actions
+             SET status = 'CONFIRMED', idempotency_key = :key, decided_at = :now
+           WHERE id = :id AND user_id = :userId
+             AND status = 'PROPOSED' AND expires_at > :now
+          RETURNING *
+          """)
+          .param("id", id).param("userId", userId).param("key", key).param("now", Timestamp.from(now))
+          .query(ActionRow.MAPPER).optional().orElse(null)
+
+      // analogicznie, zawsze z warunkiem na stan źródłowy:
+      // markExecuted:  SET status='EXECUTED', executed_at, result  WHERE id AND status='CONFIRMED'
+      // markFailed:    SET status='FAILED', error_code, idempotency_key, decided_at  WHERE id AND user_id AND status='PROPOSED'
+      // find(id), findByKey(userId, key): zwykłe SELECT
+  }
+</script>
+<p><code>JdbcClient</code> to płynne API Springa 6.1 (Boot 3.2+) nad <code>JdbcTemplate</code>. <code>RETURNING *</code> zwraca zmieniony wiersz w tym samym poleceniu. Warunek <code>user_id</code> dubluje <dfn data-t="rls">RLS</dfn> „tylko autor” z 2.5. Kluczowa własność Postgresa w domyślnym READ COMMITTED: drugi <code>UPDATE</code> tego samego wiersza <strong>czeka</strong> na koniec pierwszej transakcji, a potem ponownie sprawdza <code>WHERE</code> na nowej wersji wiersza.</p>
+<script type="text/x-code" data-lang="sql" data-title="migracja: potwierdzenia (fragment)">
+  -- klucz unikalny per użytkownik; NULL (przed decyzją) nie koliduje
+  CREATE UNIQUE INDEX ux_actions_user_idem_key
+      ON assistant_actions (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+  -- job wygaszający skanuje tylko oczekujące
+  CREATE INDEX ix_actions_pending_expiry
+      ON assistant_actions (expires_at) WHERE status = 'PROPOSED';
+
+  -- spójność stanów pilnowana przez bazę, nie tylko przez kod
+  ALTER TABLE assistant_actions ADD CONSTRAINT ck_actions_executed
+      CHECK (status <> 'EXECUTED' OR (executed_at IS NOT NULL AND idempotency_key IS NOT NULL));
+</script>
+
+<h2>Wygaśnięcie propozycji</h2>
+<p>Propozycja ma <code>expires_at = proposed_at + 15 min</code>: dłużej to większa szansa, że świat się zmienił; krócej to ponowne pytanie po każdej kawie. Egzekwują to dwa niezależne mechanizmy: <strong>warunek w <code>claim</code></strong> (nawet gdy job nie działa, przeterminowanej akcji nie da się zatwierdzić) i <strong>job</strong>, który ustawia <code>EXPIRED</code>, zapisuje audyt <code>ACTION_EXPIRED</code> (3.6) i sprawia, że karta pokazuje prawdę.</p>
+<script type="text/x-code" data-lang="sql" data-title="ActionExpiryJob (@Scheduled co minutę, tryb systemowy RLS)">
+  -- powtarzane partiami po 500, dopóki zwraca pełną partię;
+  -- dla każdego zwróconego wiersza audyt ACTION_EXPIRED w tej samej transakcji
+  WITH due AS (
+      SELECT id FROM assistant_actions
+       WHERE status = 'PROPOSED' AND expires_at <= :now
+       ORDER BY expires_at LIMIT 500
+       FOR UPDATE SKIP LOCKED)
+  UPDATE assistant_actions a
+     SET status = 'EXPIRED', decided_at = :now, error_code = 'TIMEOUT'
+    FROM due WHERE a.id = due.id
+  RETURNING a.id, a.tenant_id, a.user_id, a.conversation_id, a.config_version;
+</script>
+<p><code>FOR UPDATE SKIP LOCKED</code> to <dfn data-t="skip-locked">blokada z pomijaniem zablokowanych wierszy</dfn>: zapytanie blokuje wybrane wiersze, a te, które już blokuje ktoś inny, po prostu pomija zamiast czekać. Dzięki temu dwie instancje aplikacji uruchamiające job równolegle nie wygaszą tej samej akcji dwa razy, a job nie czeka na potwierdzenie, które właśnie trwa. Wiersz zajęty przez <code>claim</code> zostanie pominięty, a po commicie będzie już <code>EXECUTED</code>.</p>
+<p>Tym samym <code>UPDATE … WHERE status = 'PROPOSED'</code> wygaszasz propozycje w innych sytuacjach, z innym <code>error_code</code>:</p>
+<ul>
+  <li><strong>Kill switch</strong> (3.2): <code>ACTIONS_DISABLED</code>. Najlepiej w tej samej transakcji co zmiana przełącznika w <code>PUT /api/admin/ai/settings</code>, zawężając po tenancie lub typie. Wtedy potwierdzenie po commicie przełącznika trafi na <code>EXPIRED</code> niezależnie od 15-sekundowego cache ustawień.</li>
+  <li><strong>Zamknięcie lub usunięcie rozmowy</strong> (2.5): <code>CONVERSATION_CLOSED</code>, <code>CONVERSATION_DELETED</code>.</li>
+</ul>
+
+<h2>Nieaktualna propozycja: stale proposal</h2>
+<p>Asystent zaproponował o 10:42 „<code>IN_PROGRESS → WAITING_FOR_CUSTOMER</code>, bo czekamy na logi od klienta”. O 10:44 Anna dodała logi. Piotr zatwierdza o 10:45. Uprawnienia i przejście statusu są w porządku, a mimo to zmiana jest błędna: jej uzasadnienie przestało być prawdziwe.</p>
+<p>To przypadek <dfn data-t="toctou">TOCTOU</dfn> (time of check to time of use): decyzja zapadła na podstawie stanu z chwili sprawdzenia, a wykonanie dotyczy stanu z chwili użycia. Lekarstwo znasz z 1.1: <dfn data-t="optimistic-locking">optimistic locking</dfn>. Narzędzie zapisuje w akcji <code>ticket_version</code>, a executor przekazuje ją do fasady jako <code>expectedVersion</code>. Każda zmiana zgłoszenia od chwili propozycji kończy się 409 <code>action-stale</code>.</p>
+<p>Decyzja projektowa: w HelpDesk dodanie komentarza podbija <code>tickets.version</code> (zmienia się czas ostatniej aktywności). Dzięki temu wiadomość Anny z logami unieważnia też przygotowaną odpowiedź „proszę o przesłanie logów”.</p>
+<table>
+  <tr><th>Sytuacja</th><th>Wynik</th><th>Co pokazuje UI</th></tr>
+  <tr><td>Wersja bez zmian</td><td>Wykonanie</td><td>„Zrobione”, odświeżenie zgłoszenia</td></tr>
+  <tr><td>Ktoś zmienił zgłoszenie</td><td>409 <code>action-stale</code>, akcja <code>FAILED</code> (<code>STALE</code>)</td><td>„Zgłoszenie zmieniło się od czasu propozycji.” + przycisk „Poproś o nową propozycję”</td></tr>
+  <tr><td>Dwie propozycje dla jednego zgłoszenia</td><td>Pierwsza wykonana podbija wersję, druga dostaje 409</td><td>Jak wyżej; zamierzone, bo druga zakładała stan sprzed pierwszej</td></tr>
+</table>
+<div class="box warn"><span class="label">Pułapka: automatyczne „odświeżenie” propozycji</span><p>Kusi, żeby przy 409 po cichu przepisać <code>ticket_version</code> na bieżącą i wykonać. To dokładnie wyłącza ochronę: użytkownik zatwierdził zmianę na tle stanu, którego już nie ma. Nową propozycję musi przygotować model, znając nowy stan, a człowiek musi ją zobaczyć.</p></div>
+
+<h2>Skąd biorą się duplikaty</h2>
+<p><dfn data-t="idempotency">Idempotencja</dfn> to właściwość operacji, której wielokrotne wykonanie daje ten sam efekt co jednokrotne. <code>PUT</code> ustawiający priorytet na NORMAL jest idempotentny z natury. „Dodaj komentarz” nie jest: dwa wykonania to dwa komentarze i dwa e-maile do klienta. W systemie z asystentem duplikaty mają wiele źródeł:</p>
+<table>
+  <tr><th>Źródło</th><th>Przykład</th><th>Co chroni</th></tr>
+  <tr><td>Podwójne kliknięcie</td><td>Drugi klik przed wyłączeniem przycisku</td><td>Blokada w UI + ten sam klucz</td></tr>
+  <tr><td>Retry klienta lub proxy</td><td>Ponowienie <code>fetch</code>, load balancer po zerwaniu połączenia</td><td>Ten sam klucz</td></tr>
+  <tr><td>Timeout, choć serwer wykonał</td><td>Odpowiedź zginęła w sieci</td><td>Ten sam klucz zwraca zapisany wynik</td></tr>
+  <tr><td>Dwie karty przeglądarki</td><td>Ta sama propozycja zatwierdzona w obu</td><td>Maszyna stanów: druga dostaje 409 <code>action-already-decided</code></td></tr>
+  <tr><td>Model proponuje to samo dwa razy</td><td>Pętla agenta albo powtórzone pytanie</td><td><code>payload_hash</code> → <code>DUPLICATE</code></td></tr>
+  <tr><td>Ponowne dostarczenie zdarzenia</td><td>Wysyłka e-maila po restarcie</td><td>Idempotentny konsument outboxa</td></tr>
+</table>
+<p>Najtrudniejszy jest timeout: nie ponawiać (nie wiadomo, czy komentarz poszedł) czy ponowić na ślepo (dwa komentarze)? Poprawne jest tylko ponowienie, które serwer rozpozna jako powtórzenie, a do tego potrzebny jest identyfikator intencji.</p>
+
+<h2>Nagłówek Idempotency-Key</h2>
+<p><dfn data-t="idempotency-key"><code>Idempotency-Key</code></dfn> to nagłówek żądania z unikalnym kluczem wygenerowanym przez klienta; serwer zapamiętuje klucz z wynikiem i przy powtórzeniu zwraca zapisany wynik zamiast wykonywać operację ponownie. Wzorzec spopularyzowały API płatności (Stripe), a IETF standaryzuje go w drafcie <code>draft-ietf-httpapi-idempotency-key-header</code> grupy HTTPAPI. W listopadzie 2026 to wciąż Internet-Draft (wersja -08 z października 2026), nie RFC, więc szczegóły mogą się zmienić. Najważniejsze ustalenia draftu:</p>
+<table>
+  <tr><th>Sytuacja</th><th>Draft (SHOULD)</th><th>HelpDesk</th></tr>
+  <tr><td>Format</td><td>Structured Field typu String, czyli w cudzysłowie: <code>Idempotency-Key: "8e03…"</code>; zalecany UUID</td><td>Akceptujemy z cudzysłowem i bez (wiele klientów wysyła bez)</td></tr>
+  <tr><td>Brak klucza tam, gdzie wymagany</td><td>400 z odnośnikiem do dokumentacji</td><td>400 <code>idempotency-key-required</code></td></tr>
+  <tr><td>Ten sam klucz, inny payload</td><td>422</td><td>422 <code>idempotency-key-reused</code> (klucz użyty dla innej akcji)</td></tr>
+  <tr><td>Równoległe żądanie z tym samym kluczem w toku</td><td>409</td><td>Czekamy do 3 s na blokadę wiersza, potem replay; po przekroczeniu 409 <code>action-in-progress</code></td></tr>
+  <tr><td>Ważność kluczy</td><td>Opcjonalna, polityka powinna być opublikowana</td><td>Klucz żyje tyle co wiersz akcji</td></tr>
+</table>
+<p>„Payload” w naszym przypadku to akcja: <code>POST /actions/{id}/confirm</code> nie ma body, więc odcisk żądania (fingerprint) to <code>actionId</code>. Ten sam klucz dla innej akcji oznacza błąd klienta, nie powtórzenie. Klucz jest unikalny per <code>(user_id, idempotency_key)</code>, a nie globalnie: klucze różnych użytkowników nie mogą kolidować ani zdradzać sobie nawzajem wyników.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/IdempotencyKey.kt">
+  object IdempotencyKey {
+      const val HEADER = "Idempotency-Key"
+      private val FORMAT = Regex("^[A-Za-z0-9_-]{16,64}$")
+
+      /** Draft IETF: wartość to sf-string w cudzysłowie; akceptujemy też surowy UUID. */
+      fun parse(raw: String?): String {
+          val v = raw?.trim()?.removeSurrounding("\"")
+          if (v.isNullOrEmpty()) throw IdempotencyKeyRequiredException("Brak nagłówka $HEADER")
+          if (!FORMAT.matches(v)) throw IdempotencyKeyRequiredException("$HEADER: 16–64 znaki [A-Za-z0-9_-]")
+          return v
+      }
+  }
+</script>
+<div class="box tip"><span class="label">Kto generuje klucz</span><p>Klient, <strong>per intencja</strong>: jedna decyzja „Zatwierdź” w jednej karcie przeglądarki = jeden klucz na wszystkie ponowienia. Klucz nowy przy każdej próbie niczego nie chroni, a klucz wyliczany z <code>actionId</code> zlewa dwie karty i ukrywa, że ktoś zatwierdził akcję gdzie indziej.</p></div>
+
+<h2>Równoległe żądania z tym samym kluczem</h2>
+<p>Popularne implementacje idempotencji trzymają klucze w osobnej tabeli. Porównanie podejść:</p>
+<table>
+  <tr><th>Podejście</th><th>Jak działa</th><th>Kiedy</th></tr>
+  <tr><td>Insert-first do tabeli kluczy</td><td><code>INSERT (key, IN_PROGRESS)</code>; konflikt unikalności = powtórzenie; na końcu zapis odpowiedzi</td><td>Wspólny filtr dla wielu endpointów bez własnego wiersza stanu</td></tr>
+  <tr><td><dfn data-t="advisory-lock">Advisory lock</dfn></td><td><code>pg_advisory_xact_lock(hashtext(key))</code>: blokada na liczbie wybranej przez aplikację, zwalniana z końcem transakcji</td><td>Gdy nie ma wiersza do zablokowania; uwaga na kolizje hashy</td></tr>
+  <tr><td>Blokada wiersza stanu</td><td>Warunkowy <code>UPDATE</code> wiersza akcji; drugie żądanie czeka na blokadę</td><td><strong>Nasz przypadek</strong>: akcja i tak ma wiersz ze statusem</td></tr>
+</table>
+<p>Klucz zapisujemy w <code>assistant_actions.idempotency_key</code> (kontrakt z 3.1). Prześledźmy dwa równoległe żądania A i B z tym samym kluczem:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="oś czasu: ten sam klucz">
+  A: findByKey(k) → brak                B: findByKey(k) → brak
+  A: claim → 1 wiersz, blokada wiersza
+                                        B: claim → CZEKA na blokadę A
+  A: fasada, ticket_events, audyt
+  A: markExecuted, COMMIT
+                                        B: UPDATE sprawdza WHERE ponownie → status EXECUTED → 0 wierszy
+                                        B: find(id) → EXECUTED, idempotency_key == k → replay: 200, ten sam wynik
+</script>
+<p>Gdyby B miało <em>inny</em> klucz (druga karta), ostatni krok znajdzie <code>EXECUTED</code> z cudzym kluczem i zwróci 409 <code>action-already-decided</code> z polami <code>status</code> i <code>decidedAt</code>. Gdy A wycofa transakcję (np. restart instancji), B dostanie wiersz w stanie <code>PROPOSED</code> i wykona akcję samo, co jest poprawne, bo A nie zostawiło żadnego efektu.</p>
+<p>Czekanie na blokadę ograniczamy przez <code>SET LOCAL lock_timeout = '3s'</code> na początku transakcji. Po przekroczeniu Postgres zwraca błąd 55P03, który Spring tłumaczy na <code>CannotAcquireLockException</code> (sprawdź mapowanie w swojej wersji), a my na 409 <code>action-in-progress</code> z <code>Retry-After: 1</code>. Potwierdzenie nie woła modelu, więc normalnie trwa kilkadziesiąt milisekund; 3 s to margines na zatory w bazie.</p>
+<div class="box warn"><span class="label">Pułapka: poziom izolacji</span><p>To zachowanie dotyczy READ COMMITTED. Przy REPEATABLE READ lub SERIALIZABLE drugie żądanie dostanie błąd serializacji zamiast replay.</p></div>
+
+<h2>Deduplikacja propozycji: payload_hash</h2>
+<p>Idempotencja potwierdzeń nie pomoże, gdy model dwa razy <em>zaproponuje</em> ten sam komentarz, bo użytkownik powtórzył pytanie. Dostanie dwie karty i może zatwierdzić obie. Dlatego narzędzie liczy <code>payload_hash</code>: SHA-256 z kanonicznego JSON-a (mapper <code>Canonical</code> z 2.4: posortowane klucze, stały format) z typu, zgłoszenia i znormalizowanego payloadu (treść po <code>trim</code> i ujednoliceniu końców linii).</p>
+<script type="text/x-code" data-lang="sql" data-title="TicketWriteTools → zapis propozycji">
+  -- indeks z kontraktu 3.1:
+  -- CREATE UNIQUE INDEX ux_actions_pending_payload
+  --     ON assistant_actions (conversation_id, payload_hash) WHERE status = 'PROPOSED';
+  INSERT INTO assistant_actions (id, tenant_id, conversation_id, user_id, type, ticket_id,
+                                 payload, payload_hash, risk, status, ticket_version,
+                                 proposed_at, expires_at, config_version)
+  VALUES (:id, :tenantId, :conversationId, :userId, :type, :ticketId,
+          :payload::jsonb, :hash, :risk, 'PROPOSED', :ticketVersion,
+          :now, :now + interval '15 minutes', :configVersion)
+  ON CONFLICT (conversation_id, payload_hash) WHERE status = 'PROPOSED' DO NOTHING
+  RETURNING id;
+</script>
+<p>Brak zwróconego wiersza oznacza duplikat. Narzędzie odpowiada wtedy modelowi <code>ToolResult.Error(DUPLICATE, "Ta zmiana czeka już na zatwierdzenie (akcja 7f3e…). Nie proponuj jej ponownie.")</code>, a model powinien odesłać użytkownika do istniejącej karty. Klauzula <code>WHERE</code> w <code>ON CONFLICT</code> wskazuje indeks częściowy; bez niej Postgres nie dopasuje indeksu i zgłosi błąd. Indeks obejmuje tylko <code>PROPOSED</code>, więc tę samą zmianę można zaproponować ponownie po odrzuceniu lub wygaśnięciu.</p>
+<p>Hash łapie identyczne propozycje, nie parafrazy. Na parafrazy pomagają limit propozycji na turę (3.2) i reguła w prompcie.</p>
+
+<h2>AssistantActionExecutor.confirm: jedna transakcja</h2>
+<p>Serce lekcji. Executor robi w jednej transakcji: zajęcie akcji, ponowną walidację, wywołanie fasady z <code>Actor.assistant(user, actionId)</code>, zapis <code>ticket_events</code> (robi go fasada, z <code>on_behalf_of</code> i <code>assistant_action_id</code>), audyt i zapis wyniku. Albo wszystko, albo nic. Modelu nie ma tu wcale: wykonujemy dokładnie ten payload, który widział człowiek.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/AssistantActionExecutor.kt">
+  @Service
+  class AssistantActionExecutor(
+      private val actions: AssistantActionRepository,
+      private val tickets: TicketApi,
+      private val comments: CommentApi,
+      private val availability: AiAvailability,
+      private val policy: AssistantActionPolicy,        // 3.3
+      private val audit: AssistantAuditLog,             // 3.6
+      private val tenantSession: TenantSession,
+      private val jdbc: JdbcClient,
+      private val json: ObjectMapper,
+      private val tx: TransactionTemplate,              // propagacja REQUIRED, READ COMMITTED
+      private val clock: Clock,
+  ) {
+      fun confirm(user: CurrentUser, actionId: UUID, idempotencyKey: String): ActionResult {
+          actions.findByKey(user.userId, idempotencyKey)?.let { prior ->          // szybka ścieżka replay
+              if (prior.id != actionId) throw IdempotencyKeyReusedException(idempotencyKey)
+              return replay(prior)
+          }
+          try {
+              return tx.execute { execute(user, actionId, idempotencyKey) }!!
+          } catch (e: DuplicateKeyException) {                                   // ten sam klucz równolegle dla innej akcji
+              throw IdempotencyKeyReusedException(idempotencyKey)
+          } catch (e: RuntimeException) {
+              val code = failureCode(e) ?: throw e                               // np. kill switch: bez zmiany stanu
+              tx.executeWithoutResult {                                          // NOWA transakcja: poprzednia wycofana
+                  tenantSession.bind(user)
+                  if (actions.markFailed(actionId, user.userId, idempotencyKey, code, clock.instant()) == 1) {
+                      audit.record(AuditEvent.actionFailed(actionId, user, code))
+                  }
+              }
+              throw e
+          }
+      }
+
+      private fun execute(user: CurrentUser, actionId: UUID, key: String): ActionResult {
+          tenantSession.bind(user)
+          jdbc.sql("SET LOCAL lock_timeout = '3s'").update()
+          val now = clock.instant()
+          val a = actions.claim(actionId, user.userId, key, now) ?: return explainUnclaimed(user, actionId, key, now)
+
+          // ponowna walidacja na BIEŻĄCYM stanie, nie na stanie z chwili propozycji
+          if (availability.actionsStatus(a.tenantId) != ActionsStatus.ENABLED ||
+              !availability.isActionTypeEnabled(a.type)) throw AssistantActionsDisabledException()
+          tickets.dryRun(user, a.ticketId, a.intent(), Actor.assistant(user, a.id)).decision.orThrow()  // 3.3: bieżące uprawnienia + polityka
+          if (tickets.currentVersion(user, a.ticketId) != a.ticketVersion) throw ActionStaleException(a.id)
+
+          val actor = Actor.assistant(user, a.id)
+          val ticket: TicketView = when (val p = a.payload) {
+              is CommentPayload -> {
+                  comments.add(user, a.ticketId, p.body, p.visibility, actor)
+                  tickets.get(user, a.ticketId)
+              }
+              is StatusPayload -> tickets.changeStatus(user, a.ticketId, p.to, a.ticketVersion, actor)
+              is PriorityPayload -> tickets.changePriority(user, a.ticketId, p.to, a.ticketVersion, actor)
+              is AssignPayload -> tickets.assign(user, a.ticketId, p.assigneeId, a.ticketVersion, actor)
+          }
+          val result = ActionResult(a.id, ActionStatus.EXECUTED, ticket)
+          actions.markExecuted(a.id, json.writeValueAsString(result), now)
+          audit.record(AuditEvent.actionConfirmed(a, user, key))
+          audit.record(AuditEvent.actionExecuted(a, user))
+          return result
+      }
+  }
+</script>
+<p>Kilka miejsc wymaga komentarza:</p>
+<ul>
+  <li><strong>Najpierw <code>claim</code>, potem walidacja.</strong> Blokada wiersza serializuje równoległe potwierdzenia, zanim ktokolwiek zacznie pracę. Wyjątek z walidacji wycofuje też <code>claim</code>.</li>
+  <li><strong>Bieżące uprawnienia.</strong> Jeśli Piotrowi odebrano rolę AGENT lub dostęp do Acme, <code>CurrentUser</code> z nowego tokenu już tego nie ma. Akcja nie niesie uprawnień z przeszłości.</li>
+  <li><strong><code>tickets.currentVersion(user, id)</code></strong> to rozszerzenie <code>TicketApi</code> (404 dla niewidocznego). Sprawdzenie dotyczy też komentarzy, bo <code>CommentApi.add</code> nie przyjmuje <code>expectedVersion</code>; dla zmian pól fasada sprawdza wersję drugi raz, pod <code>@Version</code>.</li>
+  <li><strong>Osobna transakcja na <code>FAILED</code>.</strong> Wyjątek z metody fasady oznaczonej <code>@Transactional</code> (dołączonej do naszej transakcji) oznacza transakcję jako rollback-only. Nawet gdybyś go złapał w środku, commit skończy się <code>UnexpectedRollbackException</code>. Dlatego <code>confirm</code> nie jest <code>@Transactional</code>, a porażkę zapisuje po wycofaniu, w nowej transakcji.</li>
+</ul>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantActionExecutor.kt (ciąg dalszy)">
+      /** claim nie zajął wiersza: ustal dlaczego. Bez wyjątku w środku, żeby EXPIRED się zapisał. */
+      private fun explainUnclaimed(user: CurrentUser, id: UUID, key: String, now: Instant): ActionResult {
+          val a = actions.find(id)?.takeIf { it.userId == user.userId } ?: throw ActionNotFoundException(id)
+          return when {
+              a.idempotencyKey == key -> replay(a)                                  // równoległy duplikat po commicie
+              a.status == ActionStatus.PROPOSED -> {                                 // expires_at minął, job jeszcze nie
+                  jdbc.sql("UPDATE assistant_actions SET status='EXPIRED', decided_at=:now, error_code='TIMEOUT' " +
+                           "WHERE id=:id AND status='PROPOSED'").param("now", Timestamp.from(now)).param("id", id).update()
+                  ActionResult(id, ActionStatus.EXPIRED, null)                       // kontroler zamieni na 410
+              }
+              a.status == ActionStatus.EXPIRED && a.errorCode == "ACTIONS_DISABLED" -> throw AssistantActionsDisabledException()
+              a.status == ActionStatus.EXPIRED -> throw ActionExpiredException(id, a.expiresAt)
+              else -> throw ActionAlreadyDecidedException(id, a.status, a.decidedAt)
+          }
+      }
+
+      /** Ten sam klucz: ten sam wynik, także błąd. */
+      private fun replay(a: ActionRow): ActionResult = when (a.status) {
+          ActionStatus.EXECUTED -> json.readValue(a.result, ActionResult::class.java)
+          ActionStatus.FAILED -> throw failureFromCode(a)        // STALE → ActionStaleException, FORBIDDEN → ...
+          else -> throw ActionAlreadyDecidedException(a.id, a.status, a.decidedAt)
+      }
+
+      private fun failureCode(e: RuntimeException): String? = when (e) {
+          is ActionStaleException, is StaleTicketException,
+          is ObjectOptimisticLockingFailureException -> "STALE"
+          is InvalidTransitionException -> "INVALID_TRANSITION"
+          is ActionForbiddenException, is ForbiddenActionException -> "FORBIDDEN"
+          is TicketNotFoundException -> "TICKET_NOT_FOUND"
+          else -> null              // kill switch, lock timeout, 5xx: stan akcji bez zmian, można ponowić
+      }
+</script>
+<p>Replay zwraca zapisany <code>ActionResult</code> z dawnym widokiem zgłoszenia (ta sama odpowiedź), a UI i tak odświeża zgłoszenie. <code>EXPIRED</code> z <code>explainUnclaimed</code> jest zwracany, a nie rzucany, bo wyjątek w <code>tx.execute</code> wycofałby zapis statusu.</p>
+<div class="box bug"><span class="label">Błąd z pilotażu: e-mail z wycofanej transakcji</span><p>Pierwsza wersja wysyłała e-mail bezpośrednio z <code>CommentApi.add</code>. Gdy potem audyt rzucił wyjątek, transakcja się wycofała: komentarza nie było, a klient miał e-mail z jego treścią. Po nowej propozycji dostał drugi, nieco inny.</p></div>
+
+<h2>Skutki uboczne poza bazą: e-mail przez outbox</h2>
+<p>E-mail czy webhook nie wycofają się razem z transakcją. Rozwiązaniem jest <dfn data-t="outbox">transactional outbox</dfn>: w tej samej transakcji co komentarz zapisujesz „do wysłania”, a osobny proces wysyła po commicie. W Spring Modulith robi to rejestr publikacji zdarzeń (Event Publication Registry): zdarzenie z transakcji trafia do tabeli <code>event_publication</code>, a listener działa po commicie. Niedokończone publikacje można ponowić (interfejs <code>IncompleteEventPublications</code> albo ponowienie przy starcie; nazwy właściwości sprawdź w dokumentacji swojej wersji).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="notification/CustomerNotificationListener.kt">
+  // comment/internal: w tej samej transakcji co INSERT komentarza
+  //   if (visibility == Visibility.PUBLIC) events.publishEvent(PublicCommentAdded(comment.id, ticketId, tenantId))
+
+  data class PublicCommentAdded(val commentId: UUID, val ticketId: UUID, val tenantId: UUID)
+
+  @Component
+  class CustomerNotificationListener(
+      private val jdbc: JdbcClient,
+      private val mail: MailGateway,
+      private val composer: CommentEmailComposer,
+  ) {
+      @ApplicationModuleListener            // Spring Modulith: po commicie, asynchronicznie, z rejestrem publikacji
+      fun on(e: PublicCommentAdded) {
+          val dedupKey = "comment-email:${e.commentId}"
+          val claimed = jdbc.sql("""
+              INSERT INTO notification_deliveries (dedup_key, status, attempts) VALUES (:k, 'SENDING', 1)
+              ON CONFLICT (dedup_key) DO UPDATE SET attempts = notification_deliveries.attempts + 1
+                  WHERE notification_deliveries.status <> 'SENT'
+              RETURNING dedup_key
+              """).param("k", dedupKey).query(String::class.java).optional().isPresent
+          if (!claimed) return                                       // już wysłane: duplikat zdarzenia
+          mail.send(composer.compose(e), providerIdempotencyKey = dedupKey)
+          jdbc.sql("UPDATE notification_deliveries SET status = 'SENT', sent_at = now() WHERE dedup_key = :k")
+              .param("k", dedupKey).update()
+      }
+  }
+</script>
+<p>Outbox daje dostarczenie <dfn data-t="at-least-once">co najmniej raz</dfn> (at-least-once): zdarzenie nie zginie, ale po awarii może przyjść ponownie. „Dokładnie raz” między bazą a serwerem SMTP nie istnieje. Efekt „raz” uzyskujesz idempotentnym konsumentem: <code>notification_deliveries</code> z unikalnym <code>dedup_key</code> pomija wysłane, a gdy dostawca e-maili przyjmuje własny klucz idempotencji, przekazujesz mu ten sam klucz. Pozostaje jedno okno: awaria po wysłaniu, a przed <code>SENT</code>. Bez wsparcia dostawcy akceptujesz w takim wypadku rzadki duplikat e-maila, bo zgubiony e-mail byłby gorszy. Treść e-maila buduje się z komentarza w bazie, nie z payloadu akcji.</p>
+
+<h2>Endpointy i mapowanie błędów</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantActionController.kt">
+  @RestController
+  @RequestMapping("/api/assistant/actions")
+  class AssistantActionController(
+      private val executor: AssistantActionExecutor,
+      private val queries: AssistantActionQueries,
+      private val rejecter: AssistantActionRejecter,
+  ) {
+      @GetMapping
+      fun list(user: CurrentUser, @RequestParam conversationId: UUID): List<ActionView> =
+          queries.list(user, conversationId)          // cudza rozmowa → 404 conversation-not-found (2.5)
+
+      @PostMapping("/{id}/confirm")
+      fun confirm(
+          user: CurrentUser,
+          @PathVariable id: UUID,
+          @RequestHeader(IdempotencyKey.HEADER, required = false) rawKey: String?,
+      ): ActionResult {
+          val result = executor.confirm(user, id, IdempotencyKey.parse(rawKey))
+          if (result.status == ActionStatus.EXPIRED) throw ActionExpiredException(id, null)
+          return result
+      }
+
+      @PostMapping("/{id}/reject")
+      fun reject(user: CurrentUser, @PathVariable id: UUID, @RequestBody(required = false) body: RejectRequest?) =
+          rejecter.reject(user, id, body?.reason)      // REJECTED; ponowne odrzucenie → 200 z tym samym stanem
+  }
+
+  data class ActionResult(val actionId: UUID, val status: ActionStatus, val ticket: TicketView?)
+  data class RejectRequest(@field:Size(max = 500) val reason: String?)   // „zła treść”, „złe zgłoszenie”… – sygnał do evali
+</script>
+<p><code>reject</code> nie wymaga klucza, bo jest idempotentne z natury: stan docelowy jest ten sam przy każdym powtórzeniu. Odrzucenie akcji wykonanej to 409 <code>action-already-decided</code>.</p>
+<table>
+  <tr><th>Sytuacja</th><th>HTTP</th><th><code>type</code> (sufiks)</th><th>Stan akcji</th></tr>
+  <tr><td>Brak lub zły nagłówek</td><td>400</td><td><code>idempotency-key-required</code></td><td>bez zmian</td></tr>
+  <tr><td>Akcja cudza lub nie istnieje</td><td>404</td><td><code>action-not-found</code></td><td>–</td></tr>
+  <tr><td>Zgłoszenie zmienione</td><td>409</td><td><code>action-stale</code></td><td>FAILED (STALE)</td></tr>
+  <tr><td>Przejście statusu niedozwolone</td><td>409</td><td><code>invalid-transition</code></td><td>FAILED</td></tr>
+  <tr><td>Już zatwierdzona/odrzucona (inny klucz)</td><td>409</td><td><code>action-already-decided</code></td><td>bez zmian</td></tr>
+  <tr><td>Równoległe żądanie trzyma blokadę &gt; 3 s</td><td>409</td><td><code>action-in-progress</code> + <code>Retry-After</code></td><td>bez zmian</td></tr>
+  <tr><td>Kill switch</td><td>403</td><td><code>assistant-actions-disabled</code></td><td>bez zmian lub EXPIRED</td></tr>
+  <tr><td>Polityka lub uprawnienia</td><td>403</td><td><code>action-forbidden</code></td><td>FAILED</td></tr>
+  <tr><td>Zgłoszenie niewidoczne lub usunięte</td><td>404</td><td><code>ticket-not-found</code></td><td>FAILED</td></tr>
+  <tr><td>Wygasła</td><td>410</td><td><code>action-expired</code></td><td>EXPIRED</td></tr>
+  <tr><td>Ten sam klucz, inna akcja</td><td>422</td><td><code>idempotency-key-reused</code></td><td>bez zmian</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantActionProblems.kt">
+  @RestControllerAdvice(assignableTypes = [AssistantActionController::class])
+  class AssistantActionProblems {
+      private fun problem(status: HttpStatus, slug: String, detail: String) =
+          ProblemDetail.forStatusAndDetail(status, detail).apply {
+              type = URI.create("https://helpdesk.example/problems/$slug")
+          }
+
+      @ExceptionHandler fun stale(e: ActionStaleException) = problem(HttpStatus.CONFLICT, "action-stale",
+          "Zgłoszenie zmieniło się od czasu propozycji. Poproś asystenta o nową propozycję.")
+
+      @ExceptionHandler fun decided(e: ActionAlreadyDecidedException) = problem(HttpStatus.CONFLICT,
+          "action-already-decided", "Ta propozycja została już rozpatrzona.").apply {
+          setProperty("status", e.status); setProperty("decidedAt", e.decidedAt)
+      }
+
+      @ExceptionHandler fun busy(e: CannotAcquireLockException) =
+          ResponseEntity.status(HttpStatus.CONFLICT).header(HttpHeaders.RETRY_AFTER, "1")
+              .body(problem(HttpStatus.CONFLICT, "action-in-progress", "Potwierdzenie jest właśnie przetwarzane."))
+      // pozostałe analogicznie; invalid-transition i ticket-not-found obsługuje handler z 1.1
+  }
+</script>
+
+<h2>Frontend: karta, klucz i ponowienia</h2>
+<p>Najpierw zdarzenie <dfn data-t="sse">SSE</dfn> z 2.3: po każdej rundzie narzędzi <code>AssistantToolLoop</code> sprawdza nowe propozycje rozmowy w <code>assistant_actions</code> i emituje <code>ChatEvent.ActionProposed(actionId, type, summary, risk, expiresAt)</code> jako zdarzenie <code>action</code>. Pułapka: parser z 2.3 buduje <code>{ type: msg.event, ...JSON.parse(msg.data) }</code>, więc pole <code>type</code> akcji („ADD_COMMENT”) nadpisałoby dyskryminator „action”. W JSON-ie zmieniamy nazwę adnotacją <code>@JsonProperty("actionType")</code>, w Kotlinie zostaje zgodna z kontraktem.</p>
+<p>Zdarzenie SSE jest tylko sygnałem. Źródłem prawdy jest <code>GET /api/assistant/actions?conversationId=…</code>: po przeładowaniu, w drugiej karcie czy po zerwaniu strumienia karta musi się odtworzyć.</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/actions/useConfirmAction.ts">
+  export type ActionStatus = "PROPOSED" | "CONFIRMED" | "EXECUTED" | "REJECTED" | "EXPIRED" | "FAILED";
+  type Phase = "idle" | "sending" | "done" | "error";
+  const RETRYABLE = new Set([502, 503, 504]);
+  const channel = new BroadcastChannel("assistant-actions");           // synchronizacja kart przeglądarki
+
+  function keyFor(actionId: string): string {                         // jeden klucz na decyzję w tej karcie
+    const k = `idem:${actionId}`;
+    const saved = sessionStorage.getItem(k);                         // przeżyje przeładowanie tej karty
+    if (saved) return saved;
+    const fresh = crypto.randomUUID();
+    sessionStorage.setItem(k, fresh);
+    return fresh;
+  }
+
+  export function useConfirmAction(action: ActionView, conversationId: string) {
+    const { token } = useAuth();
+    const qc = useQueryClient();
+    const [phase, setPhase] = useState<Phase>("idle");
+    const [problem, setProblem] = useState<Problem | null>(null);
+    const inFlight = useRef(false);
+
+    const confirm = useCallback(async () => {
+      if (inFlight.current) return;                                  // podwójne kliknięcie
+      inFlight.current = true;
+      setPhase("sending"); setProblem(null);
+      const key = keyFor(action.id);
+      try {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await api<ActionResult>(`/api/assistant/actions/${action.id}/confirm`, {
+              token, method: "POST", headers: { "Idempotency-Key": `"${key}"` },
+              signal: AbortSignal.timeout(10_000),
+            });
+            setPhase("done"); break;
+          } catch (e) {
+            const status = e instanceof ApiError ? e.status : 0;    // 0 = sieć lub timeout
+            const inProgress = e instanceof ApiError && e.problem.type?.endsWith("/action-in-progress");
+            if ((status === 0 || RETRYABLE.has(status) || inProgress) && attempt < 3) {
+              await sleep(500 * 2 ** attempt + Math.random() * 250);  // backoff z jitterem
+              continue;                                               // TEN SAM klucz
+            }
+            setProblem(e instanceof ApiError ? e.problem
+              : { title: "Nie wiemy, czy zmiana została zapisana. Odśwież listę.", status: 0 });
+            setPhase("error"); break;
+          }
+        }
+      } finally {
+        inFlight.current = false;
+        void qc.invalidateQueries({ queryKey: ["assistant-actions", conversationId] });
+        void qc.invalidateQueries({ queryKey: ["ticket", action.ticket.id] });
+        channel.postMessage({ conversationId });                     // inne karty odświeżą listę
+      }
+    }, [action.id, action.ticket.id, token, qc, conversationId]);
+
+    return { phase, problem, confirm };
+  }
+</script>
+<p><code>sessionStorage</code> jest osobne dla każdej karty przeglądarki: przeładowanie zachowa klucz, a druga karta wygeneruje własny i dostanie 409 <code>action-already-decided</code>. <code>crypto.randomUUID()</code> działa tylko w bezpiecznym kontekście (HTTPS lub localhost). Ponowienia z <dfn data-t="backoff">wykładniczym opóźnieniem i jitterem</dfn> dotyczą tylko błędów sieci, 502–504 i <code>action-in-progress</code>; pozostałe 4xx są ostateczne.</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/actions/ActionCard.tsx">
+  const MESSAGES: Record<string, string> = {          // 409/410/403 → zdanie dla człowieka
+    "action-stale": "Zgłoszenie zmieniło się od czasu propozycji.",
+    "action-already-decided": "Ta propozycja została już rozpatrzona, np. w innej karcie.",
+    "assistant-actions-disabled": "Akcje asystenta są wyłączone. Możesz wprowadzić zmianę ręcznie.",
+  };
+  const slug = (p: Problem | null) => p?.type?.split("/").pop() ?? "";
+
+  export function ActionCard({ action, conversationId, onAskAgain }: Props) {
+    const { phase, problem, confirm } = useConfirmAction(action, conversationId);
+    const { reject, rejecting } = useRejectAction(action, conversationId);
+    const titleId = `action-${action.id}-title`;
+    const open = action.status === "PROPOSED" && phase !== "done";
+    const p = action.preview;
+    const isPublic = p.kind === "comment" && p.visibility === "PUBLIC";
+
+    return (
+      <section role="group" aria-labelledby={titleId} className={`action-card risk-${action.risk.toLowerCase()}`}>
+        <h3 id={titleId}>Propozycja asystenta · {action.ticket.displayNumber} „{action.ticket.title}”</h3>
+        {p.kind === "comment" ? (
+          <>
+            <p className={isPublic ? "badge-public" : "badge-internal"}>
+              {isPublic ? "Komentarz PUBLICZNY – zobaczy klient" : "Notatka wewnętrzna – tylko zespół"}
+            </p>
+            <blockquote className="comment-preview">{p.body}</blockquote>   {/* tekst, nie HTML (2.3) */}
+          </>
+        ) : (
+          <p>{FIELD_LABEL[p.field]}: <del>{p.from ?? "brak"}</del> → <ins>{p.to ?? "brak"}</ins></p>
+        )}
+        <ul>{action.effects.map(e => <li key={e}>{e}</li>)}</ul>
+        <p className="muted">W historii: Asystent w Twoim imieniu · ważne do {formatTime(action.expiresAt)}</p>
+
+        <div aria-live="polite" className="action-status">
+          {phase === "done" ? "Zmiana zapisana." : !open && STATUS_LABEL[action.status]}
+          {problem && (MESSAGES[slug(problem)] ?? problem.detail ?? problem.title)}
+        </div>
+        {slug(problem) === "action-stale" && <button onClick={onAskAgain}>Poproś o nową propozycję</button>}
+
+        {open && (
+          <div className="actions">
+            <button onClick={confirm} disabled={phase === "sending" || rejecting} aria-busy={phase === "sending"}>
+              {CONFIRM_LABEL[action.type](isPublic)}   {/* np. „Opublikuj klientowi”, „Zmień status” */}
+            </button>
+            <button onClick={reject} disabled={phase === "sending" || rejecting}>Odrzuć</button>
+          </div>
+        )}
+      </section>
+    );
+  }
+</script>
+<p>Dostępność: <code>role="group"</code> z <code>aria-labelledby</code> mówi czytnikowi ekranu, czego dotyczą przyciski; wynik trafia do regionu <dfn data-t="aria-live">aria-live</dfn>; przyciski nazywają skutek zamiast „OK”. Bez autofokusu i skrótu klawiszowego na „Zatwierdź”. Wygaśnięcie jako godzina, nie odliczanie co sekundę, które czytnik ogłaszałby bez końca. Pozostałe karty po komunikacie z <code>BroadcastChannel</code> unieważniają zapytanie <code>["assistant-actions", conversationId]</code>.</p>
+
+<h2>Testy: wyścigi, ponowienia, wygaśnięcie</h2>
+<p>Testy integracyjne na Postgresie z Testcontainers (jak w 1.1), bo blokady wierszy, <code>SKIP LOCKED</code> i indeksy częściowe w H2 nie działają tak samo. <code>TestClock</code> to własna implementacja <code>Clock</code> z metodą <code>advance</code>, podstawiona jako bean.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantActionExecutorIT.kt">
+  @SpringBootTest @Testcontainers
+  class AssistantActionExecutorIT(
+      @Autowired val executor: AssistantActionExecutor,
+      @Autowired val fx: ActionFixtures,          // propozycje przez TicketWriteTools, odczyt stanu w trybie systemowym
+      @Autowired val clock: TestClock,
+      @Autowired val settings: SystemSettingsAdmin,
+  ) {
+      private fun parallel(vararg calls: () -> ActionResult): List<Result<ActionResult>> {
+          val start = CountDownLatch(1)
+          val pool = Executors.newFixedThreadPool(calls.size)
+          val futures = calls.map { c -> pool.submit<Result<ActionResult>> { start.await(); runCatching(c) } }
+          start.countDown()
+          return futures.map { it.get(10, TimeUnit.SECONDS) }.also { pool.shutdown() }
+      }
+
+      @Test
+      fun `ten sam klucz rownolegle - jedno wykonanie, dwa identyczne wyniki`() {
+          val id = fx.proposeComment(PIOTR, HD_1042, "Prosimy o logi.", Visibility.PUBLIC)
+          val k = "key-aaaaaaaaaaaaaaaa"
+          val r = parallel({ executor.confirm(PIOTR, id, k) }, { executor.confirm(PIOTR, id, k) })
+          assertThat(r).allMatch { it.getOrNull()?.status == ActionStatus.EXECUTED }
+          assertThat(fx.publicComments(HD_1042, "Prosimy o logi.")).isEqualTo(1)
+          assertThat(fx.ticketEventsFor(id)).isEqualTo(1)
+      }
+
+      @Test
+      fun `rozne klucze (dwie karty) - jedna wygrywa, druga 409`() {
+          val id = fx.proposeStatus(PIOTR, HD_1042, TicketStatus.WAITING_FOR_CUSTOMER)
+          val r = parallel({ executor.confirm(PIOTR, id, "tab-1-aaaaaaaaaaaaaa") },
+                           { executor.confirm(PIOTR, id, "tab-2-bbbbbbbbbbbbbb") })
+          assertThat(r.count { it.isSuccess }).isEqualTo(1)
+          assertThat(r.single { it.isFailure }.exceptionOrNull()).isInstanceOf(ActionAlreadyDecidedException::class.java)
+      }
+
+      @Test
+      fun `retry po timeoucie zwraca zapisany wynik bez drugiego komentarza`() {
+          val id = fx.proposeComment(PIOTR, HD_1042, "Poprawka jutro.", Visibility.PUBLIC)
+          val first = executor.confirm(PIOTR, id, "retry-aaaaaaaaaaaaaa")    // odpowiedź „zginęła w sieci”
+          assertThat(executor.confirm(PIOTR, id, "retry-aaaaaaaaaaaaaa")).isEqualTo(first)
+          assertThat(fx.publicComments(HD_1042, "Poprawka jutro.")).isEqualTo(1)
+      }
+
+      @Test
+      fun `zmiana zgloszenia po propozycji - stale, FAILED i ten sam blad przy replay`() {
+          val id = fx.proposeStatus(PIOTR, HD_1042, TicketStatus.WAITING_FOR_CUSTOMER)
+          fx.humanChangesPriority(PIOTR, HD_1042, TicketPriority.NORMAL)
+          assertThrows<ActionStaleException> { executor.confirm(PIOTR, id, "stale-aaaaaaaaaaaaaa") }
+          assertThat(fx.action(id).status).isEqualTo(ActionStatus.FAILED)
+          assertThrows<ActionStaleException> { executor.confirm(PIOTR, id, "stale-aaaaaaaaaaaaaa") }
+      }
+
+      @Test
+      fun `po 15 minutach propozycja wygasa nawet bez joba`() {
+          val id = fx.proposeStatus(PIOTR, HD_1042, TicketStatus.WAITING_FOR_CUSTOMER)
+          clock.advance(Duration.ofMinutes(16))
+          val r = executor.confirm(PIOTR, id, "exp-aaaaaaaaaaaaaaaa")
+          assertThat(r.status).isEqualTo(ActionStatus.EXPIRED)                  // kontroler: 410
+          assertThat(fx.ticket(HD_1042).status).isEqualTo(TicketStatus.IN_PROGRESS)
+      }
+
+      @Test
+      fun `kill switch miedzy propozycja a potwierdzeniem blokuje wykonanie`() {
+          val id = fx.proposeComment(PIOTR, HD_1042, "Test.", Visibility.INTERNAL)
+          settings.setActionsEnabled(false)                                     // ta sama transakcja wygasza PROPOSED
+          assertThrows<AssistantActionsDisabledException> { executor.confirm(PIOTR, id, "ks-aaaaaaaaaaaaaaaaa") }
+          assertThat(fx.internalComments(HD_1042, "Test.")).isZero()
+      }
+  }
+</script>
+<p>Do tego MockMvc (brak nagłówka → 400, klucz z cudzysłowem i bez działa tak samo, <code>EXPIRED</code> → 410) i test frontu z MSW: błąd sieci, potem 200, a oba żądania mają ten sam <code>Idempotency-Key</code>. Testy wyścigów uruchamiaj jako <code>@RepeatedTest(50)</code>, bo rzadko wychodzą za pierwszym razem.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Przypadek</th><th>Zachowanie</th></tr>
+  <tr><td>Użytkownik zatwierdza w innej karcie</td><td>Druga karta: 409 <code>action-already-decided</code> z <code>status</code>; <code>BroadcastChannel</code> odświeża listę, karta pokazuje „Zatwierdzone”</td></tr>
+  <tr><td>Rozmowa zamknięta (2.5: zmiana trasy, limit tur)</td><td>Oczekujące wygaszane z <code>CONVERSATION_CLOSED</code>; confirm → 410; historia do odczytu</td></tr>
+  <tr><td>Rozmowa usunięta</td><td>Oczekujące → <code>EXPIRED</code>, lista akcji → 404. Wykonane zostają w <code>ticket_events</code> i audycie (3.6)</td></tr>
+  <tr><td>Propozycja sprzed zmiany promptu (<code>config_version</code> v3, wdrożono v4)</td><td>Zwykle ważna: wykonujemy payload, który widział człowiek, a nie prompt. Przy wydaniu bezpieczeństwa (np. v4 z 3.4) wdrożenie wygasza <code>PROPOSED</code> ze starszą <code>config_version</code></td></tr>
+  <tr><td>Zgłoszenie usunięte lub agent stracił dostęp do tenanta</td><td>Fasada: 404 <code>ticket-not-found</code>, akcja <code>FAILED</code> (<code>TICKET_NOT_FOUND</code>); 404, a nie 403, z tych samych powodów co w 1.1</td></tr>
+  <tr><td>Model w następnej turze nie wie o decyzji</td><td>Zmienna część promptu (na końcu, pod caching z 2.4) zawiera listę akcji rozmowy ze statusami; to, że model nie pisze „zmieniłem” przed zatwierdzeniem, sprawdzają evale <code>WRITE_ACTIONS</code> (3.7)</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Zaimplementuj <code>claim</code> i <code>explainUnclaimed</code>, a potem napisz test „ten sam klucz równolegle” jako <code>@RepeatedTest(50)</code>. Celowo zamień warunkowy <code>UPDATE</code> na „wczytaj encję, sprawdź status, zapisz” i zobacz, po ilu powtórzeniach pojawia się drugi komentarz.</li>
+  <li>Dodaj do <code>ActionDescriber</code> skutek dla <code>CHANGE_PRIORITY</code>: stary i nowy termin rozwiązania SLA z <code>SlaApi</code>. Sprawdź, jak wygląda karta dla HD-1042 przy zmianie HIGH → NORMAL.</li>
+  <li>W hooku <code>useConfirmAction</code> przenieś <code>crypto.randomUUID()</code> do pętli ponowień i napisz test z MSW, który to wykrywa (dwa różne klucze w dwóch żądaniach).</li>
+  <li>Policz na danych z pilotażu (albo wygeneruj sztuczne): medianę czasu do decyzji per <code>risk</code> i odsetek odrzuceń. Zaproponuj próg, przy którym dashboard ostrzega o zmęczeniu potwierdzeniami.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Klient wysłał <code>confirm</code>, dostał timeout i ponawia. Co musi się zgadzać, żeby serwer zwrócił zapisany wynik zamiast wykonać akcję drugi raz?</p>
+  <button>Treść body i adres IP klienta</button>
+  <button>Nowy klucz wygenerowany przy ponowieniu i ten sam token JWT</button>
+  <button>Ten sam <code>Idempotency-Key</code> tego samego użytkownika i to samo <code>actionId</code></button>
+  <button>Nic, serwer sam rozpozna duplikat po czasie żądania</button>
+  <p class="explain">Klucz identyfikuje intencję i musi przeżyć ponowienia. Serwer szuka go per <code>(user_id, idempotency_key)</code>; ten sam klucz dla innej akcji to 422.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego przejście PROPOSED → CONFIRMED robimy warunkowym <code>UPDATE … WHERE status = 'PROPOSED' RETURNING</code>, a nie przez wczytanie encji i sprawdzenie statusu w Kotlinie?</p>
+  <button>Bo sprawdzenie i zmiana dzieją się atomowo, a równoległe żądanie czeka na blokadę wiersza i potem widzi nowy stan</button>
+  <button>Bo JPA nie obsługuje kolumn typu jsonb</button>
+  <button>Bo <code>RETURNING</code> jest szybsze od <code>SELECT</code>, a reszta nie ma znaczenia</button>
+  <p class="explain">„Przeczytaj, sprawdź, zapisz” zostawia okno, w którym dwa żądania widzą PROPOSED i oba wykonują akcję. Warunkowy UPDATE to compare-and-set w bazie; w READ COMMITTED drugi UPDATE po odblokowaniu ponownie sprawdza WHERE.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Między propozycją a zatwierdzeniem klient dodał komentarz, co podbiło <code>tickets.version</code>. Co powinien zrobić system?</p>
+  <button>Przepisać <code>ticket_version</code> na bieżącą i wykonać akcję, bo użytkownik już ją zatwierdził</button>
+  <button>Zwrócić 409 <code>action-stale</code>, oznaczyć akcję FAILED i zaproponować w UI prośbę o nową propozycję</button>
+  <button>Zwrócić 410, bo propozycja wygasła</button>
+  <button>Wykonać akcję i dopisać ostrzeżenie do historii</button>
+  <p class="explain">Użytkownik zatwierdził zmianę na tle stanu, którego już nie ma. Nową propozycję musi przygotować model znający nowy stan, a człowiek musi ją zobaczyć.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="3">
+  <p class="q">Komentarz PUBLIC ma wysłać e-mail do klienta. Jak to zrobić poprawnie w <code>confirm</code>?</p>
+  <button>Wysłać e-mail w środku transakcji, zaraz po INSERT komentarza</button>
+  <button>Wysłać e-mail z frontendu po otrzymaniu 200</button>
+  <button>Wysłać e-mail przed transakcją, żeby klient dostał go szybciej</button>
+  <button>Zapisać zdarzenie w outboxie w tej samej transakcji, wysłać po commicie z deduplikacją po ID komentarza</button>
+  <p class="explain">Outbox gwarantuje, że e-mail powstanie tylko dla zatwierdzonego komentarza i nie zginie. Dostarczenie jest at-least-once, więc konsument musi być idempotentny.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Dlaczego w HelpDesk nie wykonujemy automatycznie akcji o ryzyku LOW (notatki wewnętrzne)?</p>
+  <button>Bo backend nie potrafi rozróżnić ryzyka akcji</button>
+  <button>Bo oszczędność jest mała, a notatki zaśmiecają historię i mogą przenieść wstrzykniętą instrukcję do kolejnych rozmów; wrócimy do tego z danymi i flagą per tenant</button>
+  <button>Bo RODO zabrania automatycznych notatek</button>
+  <p class="explain">Zmęczenie potwierdzeniami ograniczamy limitem propozycji, deduplikacją i tarciem zależnym od ryzyka. Auto-wykonanie wymaga danych o odrzuceniach, evali bezpieczeństwa i trybu cienia.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

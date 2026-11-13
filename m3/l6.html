@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.6 Audyt działań agenta – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="3.6">
+<main>
+<p class="meta">Lekcja 3.6 · ok. 60 min</p>
+<h1>Audyt działań agenta</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Rozumieć, po co audyt działań asystenta i czym różni się od logów, trace'ów i historii rozmowy.</li>
+  <li>Zaprojektować <code>assistant_audit</code> i rozszerzenie <code>ticket_events</code>: migracje, RLS, partycje, append-only na poziomie bazy.</li>
+  <li>Wiedzieć, co zapisywać przy każdym zdarzeniu, a czego nigdy (prompty, dane osobowe, sekrety), i jak mimo to odtworzyć „dlaczego asystent to zaproponował”.</li>
+  <li>Zapewnić integralność: zapis w tej samej transakcji, łańcuch hashy, eksport do niezmiennego magazynu.</li>
+  <li>Pokazać audyt ludziom (historia zgłoszenia, panel admina, alerty) i przetestować jego gwarancje.</li>
+</ul></div>
+
+<h2>Po co audyt działań asystenta</h2>
+<p>Od lekcji 3.1 asystent proponuje zmiany, a od 3.5 człowiek je zatwierdza i backend wykonuje. W systemie pojawia się nowy rodzaj sprawcy zmian: model, który działa <em>w imieniu</em> użytkownika, na podstawie danych, które sam wybrał. Pierwsza reklamacja klienta („kto opublikował ten komentarz?”) pokaże, czy umiesz odpowiedzieć na trzy pytania: <strong>kto zatwierdził</strong>, <strong>w czyim imieniu działał asystent</strong> i <strong>na podstawie czego</strong> to zaproponował.</p>
+<p>Tę zdolność wykazania odpowiedzialności nazywa się <dfn data-t="accountability">rozliczalnością</dfn>. Narzędziem jest <dfn data-t="audit-log">log audytowy</dfn> (audit trail): trwały, kompletny i chroniony przed zmianą zapis tego, kto, kiedy i co zrobił. Kiedy jest potrzebny:</p>
+<table>
+  <tr><th>Sytuacja</th><th>Pytanie</th><th>Czego potrzebujesz</th></tr>
+  <tr><td>Reklamacja klienta</td><td>„Dlaczego zgłoszenie HD-1042 zamknięto bez odpowiedzi?”</td><td>Kto zatwierdził, kiedy, jaka była propozycja</td></tr>
+  <tr><td>Incydent bezpieczeństwa (np. błąd #4 z 3.4)</td><td>„Które akcje wykonano z rozmów z podejrzeniem injection?”</td><td>Powiązanie akcji z rozmową i sygnałem detektora</td></tr>
+  <tr><td>Naruszenie danych osobowych</td><td>„Kogo dotyczy i od kiedy?” (zgłoszenie do organu w 72 h, art. 33 RODO)</td><td>Szybkie zapytania po tenancie, czasie, typie zdarzenia</td></tr>
+  <tr><td>Spór wewnętrzny</td><td>„Ja tego nie zatwierdzałem”</td><td>Wpis, którego nikt nie mógł zmienić po fakcie</td></tr>
+  <tr><td>Audyt zewnętrzny (ISO 27001, SOC 2)</td><td>„Pokażcie, że działania uprzywilejowane są logowane i chronione”</td><td>Polityka, retencja, kontrola dostępu, test integralności</td></tr>
+</table>
+<h3>Wymagania regulacyjne w skrócie</h3>
+<ul>
+  <li><strong>RODO</strong>: art. 5 ust. 2 (administrator musi umieć <em>wykazać</em> przestrzeganie zasad), art. 32 (bezpieczeństwo przetwarzania), art. 33 (zgłoszenie naruszenia). RODO nie mówi „miej tabelę audytu”, ale bez niej trudno wykazać, co się stało z danymi.</li>
+  <li><strong><dfn data-t="ai-act">AI Act</dfn></strong> (rozporządzenie UE 2024/1689): art. 12 wymaga, by systemy <em>wysokiego ryzyka</em> automatycznie rejestrowały zdarzenia, a art. 19 i art. 26 ust. 6 każą przechowywać te logi co najmniej 6 miesięcy (dostawca i podmiot stosujący). Asystent HelpDesk zwykle <em>nie jest</em> systemem wysokiego ryzyka, bo obsługa zgłoszeń nie należy do obszarów z załącznika III. Granicę łatwo jednak przekroczyć, np. gdy użyjesz AI do oceny pracy agentów (obszar zatrudnienia). Obowiązki dla systemów z załącznika III przesunięto porozumieniem „Digital Omnibus” z 2026 r. na 2 grudnia 2027 r. Sprawdź aktualny stan przepisów. Niezależnie od klasy ryzyka art. 50 wymaga informowania ludzi, że rozmawiają z AI.</li>
+  <li><strong>ISO/IEC 27001:2022</strong> (A.8.15 „Logging”) i <strong>SOC 2</strong> (CC7.x): audytor sprawdzi kompletność, ochronę przed modyfikacją, przeglądy i retencję logów.</li>
+</ul>
+<div class="box warn"><span class="label">To nie jest porada prawna</span><p>Klasyfikację systemu według AI Act, podstawę prawną przechowywania danych w audycie i okres retencji ustal z prawnikiem i <dfn data-t="iod">inspektorem ochrony danych</dfn>. Lekcja pokazuje technikę, która pozwala spełnić typowe wymagania, a nie rozstrzyga, które Ciebie dotyczą.</p></div>
+
+<h2>Audyt, logi, trace i historia rozmowy</h2>
+<p>Masz już trzy zapisy działania asystenta: logi aplikacji, <dfn data-t="trace">trace</dfn> (1.4) i historię rozmowy (2.5). Każdy odpowiada na inne pytanie, więc żaden nie zastąpi audytu:</p>
+<table>
+  <tr><th>Cecha</th><th>Logi aplikacji</th><th>Trace (1.4)</th><th>Historia rozmowy (2.5)</th><th>Audyt (ta lekcja)</th></tr>
+  <tr><td>Cel</td><td>Diagnoza błędów</td><td>Gdzie ucieka czas i co się wywołało</td><td>Kontekst dla modelu, wznowienie rozmowy</td><td>Rozliczalność: kto, co, w czyim imieniu</td></tr>
+  <tr><td>Odbiorca</td><td>Deweloper, dyżurny</td><td>Deweloper, zespół AI</td><td>Użytkownik (właściciel rozmowy)</td><td>Admin, bezpieczeństwo, IOD, audytor</td></tr>
+  <tr><td>Kompletność</td><td>Najlepiej, jak się da</td><td>Próbkowany (<dfn data-t="sampling">sampling</dfn>)</td><td>Pełna, ale usuwalna przez użytkownika</td><td>Pełna dla akcji, gwarantowana transakcją</td></tr>
+  <tr><td>Retencja</td><td>Dni lub tygodnie</td><td>Dni</td><td>30 dni</td><td>Np. 1 rok, eksport do archiwum</td></tr>
+  <tr><td>Treść</td><td>Komunikaty, ID, <code>traceId</code></td><td>Spany, czasy, opcjonalnie treść</td><td>Pełna treść tur i wyników narzędzi</td><td>Ustrukturyzowane fakty, bez treści rozmowy</td></tr>
+  <tr><td>Niezmienność</td><td>Brak</td><td>Brak</td><td>Edytowalna i usuwalna</td><td>Append-only, łańcuch hashy, WORM</td></tr>
+</table>
+<p>Najczęstszy błąd to „mamy przecież wszystko w Langfuse”. Trace zniknie po 14 dniach, a reklamacja przyjdzie po dwóch miesiącach; historia rozmowy jest prywatna (RLS <code>owner_only</code>) i znika po 30 dniach. Audyt przechowuje mniej, ale dłużej, i nikt nie może go poprawić.</p>
+<div class="box tip"><span class="label">Rozwijamy ToolAudit z 2.2</span><p>W lekcji 2.2 <code>ToolAudit</code> zapisywał każde wywołanie narzędzia do logu <code>helpdesk.assistant.audit</code>. To był log, a nie audyt: bez gwarancji zapisu i ochrony przed zmianą. Zostaje jako źródło metryk i logu diagnostycznego, a obok niego dopisze teraz zdarzenie <code>TOOL_CALL</code> do tabeli audytu.</p></div>
+
+<h2>Dwa zapisy: ticket_events i assistant_audit</h2>
+<p>Zmiany domenowe i decyzje asystenta lądują w dwóch miejscach o różnych odbiorcach:</p>
+<ul>
+  <li><strong><code>ticket_events</code></strong> (1.1) to historia zgłoszenia widoczna dla użytkowników. Każda zmiana wykonana przez asystenta ma <code>actor_type = 'ASSISTANT'</code>, <code>actor_id</code> = konto techniczne <code>assistant@system</code>, <code>on_behalf_of</code> = użytkownik i <code>assistant_action_id</code> = akcja z <code>assistant_actions</code>.</li>
+  <li><strong><code>assistant_audit</code></strong> to dziennik decyzji asystenta dla admina: propozycje, zatwierdzenia, odrzucenia, odmowy polityki, wywołania narzędzi. Obejmuje też to, co <em>nie</em> zmieniło zgłoszenia, np. odrzuconą propozycję.</li>
+</ul>
+<p>Kolumny <code>on_behalf_of</code> i <code>assistant_action_id</code> wprowadziła lekcja 3.1. Jeśli już je masz, ta migracja doda tylko ograniczenia i indeks (numery migracji są przykładowe):</p>
+<script type="text/x-code" data-lang="sql" data-title="V36__ticket_events_assistant.sql">
+  ALTER TABLE ticket_events
+      ADD COLUMN IF NOT EXISTS on_behalf_of        uuid,
+      ADD COLUMN IF NOT EXISTS assistant_action_id uuid;
+
+  -- akcja asystenta zawsze ma "w czyim imieniu" i "która akcja"; NOT VALID = bez długiej blokady
+  ALTER TABLE ticket_events ADD CONSTRAINT ck_ticket_events_assistant CHECK (
+      actor_type <> 'ASSISTANT' OR (
+          on_behalf_of IS NOT NULL AND assistant_action_id IS NOT NULL
+          AND actor_id = '00000000-0000-4000-8000-0000000a551e')) NOT VALID;
+  ALTER TABLE ticket_events VALIDATE CONSTRAINT ck_ticket_events_assistant;
+
+  -- jedna akcja = najwyżej jedno zdarzenie danego typu (siatka pod idempotencję z 3.5)
+  CREATE UNIQUE INDEX ux_ticket_events_action ON ticket_events (assistant_action_id, type)
+      WHERE assistant_action_id IS NOT NULL;
+
+  -- historia zgłoszenia też jest dowodem: aplikacja tylko dopisuje
+  REVOKE UPDATE, DELETE, TRUNCATE ON ticket_events FROM helpdesk_app;
+</script>
+<p>Dlaczego <code>actor_id</code> to konto techniczne, a nie Piotr? Gdyby było inaczej, raport „zmiany Piotra” mieszałby jego kliknięcia z propozycjami modelu, a reguły „asystent nie zamyka zgłoszeń” nie dałoby się sprawdzić w danych.</p>
+
+<h2>Tabela assistant_audit: migracja, partycje, RLS</h2>
+<p>Kontrakt M3 definiuje kolumny podstawowe. Dokładamy pięć (rozszerzenie): <code>actor_type</code> (kto spowodował zdarzenie: asystent, człowiek czy job), <code>ticket_id</code> (filtr po zgłoszeniu w panelu) oraz <code>chain_seq</code>, <code>prev_hash</code> i <code>row_hash</code> do łańcucha hashy.</p>
+<p>Audyt rośnie liniowo i nigdy nie jest aktualizowany, więc warto go od początku podzielić na <dfn data-t="table-partitioning">partycje</dfn>: fizyczne podtabele po miesiącu, widoczne jako jedna tabela. Zapytania z zakresem dat czytają tylko właściwe miesiące, a usunięcie starego miesiąca to <code>DROP</code> partycji zamiast milionów <code>DELETE</code>.</p>
+<script type="text/x-code" data-lang="sql" data-title="V37__assistant_audit.sql">
+  CREATE TABLE assistant_audit (
+      id               bigserial,
+      occurred_at      timestamptz NOT NULL DEFAULT now(),
+      tenant_id        uuid,                 -- NULL tylko dla zmian globalnych (KILL_SWITCH_CHANGED)
+      actor_type       text NOT NULL CHECK (actor_type IN ('USER','ASSISTANT','SYSTEM')),
+      user_id          uuid,                 -- człowiek: autor albo on_behalf_of; NULL dla jobów
+      conversation_id  uuid,
+      action_id        uuid,
+      ticket_id        uuid,
+      event_type       text NOT NULL CHECK (event_type IN ('TOOL_CALL','ACTION_PROPOSED',
+                           'ACTION_CONFIRMED','ACTION_REJECTED','ACTION_EXECUTED','ACTION_FAILED',
+                           'ACTION_EXPIRED','POLICY_DENIED','KILL_SWITCH_CHANGED','INJECTION_SUSPECTED')),
+      tool_name        text,
+      arguments        jsonb,                -- po sanityzacji, bez danych osobowych
+      result_code      text,
+      config_version   text,
+      trace_id         text,
+      chain_seq        bigint,               -- wypełnia trigger łańcucha
+      prev_hash        bytea,
+      row_hash         bytea,
+      PRIMARY KEY (id, occurred_at),         -- klucz partycji musi być w PK
+      CHECK (tenant_id IS NOT NULL OR event_type = 'KILL_SWITCH_CHANGED')
+  ) PARTITION BY RANGE (occurred_at);
+
+  CREATE TABLE assistant_audit_2026_11 PARTITION OF assistant_audit
+      FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+  CREATE TABLE assistant_audit_default PARTITION OF assistant_audit DEFAULT;  -- siatka, z alertem
+
+  CREATE INDEX ix_audit_tenant_time ON assistant_audit (tenant_id, occurred_at DESC, id DESC);
+  CREATE INDEX ix_audit_action      ON assistant_audit (action_id) WHERE action_id IS NOT NULL;
+  CREATE INDEX ix_audit_ticket      ON assistant_audit (ticket_id, occurred_at) WHERE ticket_id IS NOT NULL;
+  CREATE INDEX ix_audit_conv        ON assistant_audit (conversation_id) WHERE conversation_id IS NOT NULL;
+  CREATE INDEX ix_audit_type_time   ON assistant_audit (event_type, occurred_at);
+
+  ALTER TABLE assistant_audit ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE assistant_audit FORCE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON assistant_audit USING (
+      current_setting('app.bypass_rls', true) = 'on'
+      OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+</script>
+<ul>
+  <li><strong>Partycja domyślna</strong> przyjmie wiersz, gdy job zapomni utworzyć nowy miesiąc. Bez niej <code>INSERT</code> by się nie udał, a razem z nim zatwierdzenie akcji. Wiersze w <code>assistant_audit_default</code> to alert: przed utworzeniem właściwej partycji trzeba je przenieść.</li>
+  <li><strong>Partycje tworzy job</strong> z kontem właściciela, z wyprzedzeniem 3 miesięcy (np. <code>pg_cron</code> albo rozszerzenie pg_partman; sprawdź, co oferuje Twój Postgres zarządzany).</li>
+  <li><strong>RLS</strong> działa tak jak w 1.1 i 2.5. Audyt czyta tylko ADMIN (obejście RLS) przez panel; AGENT nie ma endpointu, a polityka jest dodatkową siatką. Brak <code>WITH CHECK</code> oznacza, że ta sama reguła obowiązuje przy <code>INSERT</code>.</li>
+  <li><strong>Brak kluczy obcych</strong> do rozmów i akcji jest celowy: rozmowa zniknie po 30 dniach, a wpis audytu ma przetrwać rok.</li>
+</ul>
+
+<h2>Append-only na poziomie bazy</h2>
+<p>Tabela <dfn data-t="append-only">append-only</dfn> pozwala tylko dopisywać wiersze. Zapewnia to baza, a nie konwencja w kodzie, bo audyt ma chronić także przed błędem i złą wolą w aplikacji. Obrona ma trzy warstwy: osobne role, odebrane uprawnienia i trigger.</p>
+<script type="text/x-code" data-lang="sql" data-title="V37__assistant_audit.sql (ciąg dalszy)">
+  -- role: właściciel (migracje), aplikacja (tylko dopisuje i czyta), czytelnik (raporty, BI)
+  CREATE ROLE helpdesk_audit_reader NOLOGIN;
+  GRANT SELECT ON assistant_audit TO helpdesk_audit_reader;
+
+  GRANT INSERT, SELECT ON assistant_audit TO helpdesk_app;
+  GRANT USAGE ON SEQUENCE assistant_audit_id_seq TO helpdesk_app;
+  -- jawnie, bo wcześniejsze "GRANT ... ON ALL TABLES" lub default privileges mogły dać więcej
+  REVOKE UPDATE, DELETE, TRUNCATE ON assistant_audit FROM helpdesk_app, helpdesk_audit_reader;
+
+  -- trigger chroni nawet przed kontem z uprawnieniami (np. właścicielem w trakcie "szybkiej poprawki")
+  CREATE FUNCTION forbid_audit_change() RETURNS trigger LANGUAGE plpgsql AS $$
+  BEGIN
+      RAISE EXCEPTION 'assistant_audit jest append-only: % zablokowane', TG_OP
+          USING ERRCODE = 'insufficient_privilege';
+  END $$;
+
+  CREATE TRIGGER assistant_audit_no_update BEFORE UPDATE OR DELETE ON assistant_audit
+      FOR EACH ROW EXECUTE FUNCTION forbid_audit_change();
+  CREATE TRIGGER assistant_audit_no_truncate BEFORE TRUNCATE ON assistant_audit
+      FOR EACH STATEMENT EXECUTE FUNCTION forbid_audit_change();
+</script>
+<ul>
+  <li>Wiersze triggerów <code>BEFORE … FOR EACH ROW</code> na tabeli partycjonowanej obsługuje PostgreSQL od wersji 13. Trigger jest wtedy klonowany do każdej partycji, także tworzonej później.</li>
+  <li>Właściciel tabeli może wykonać <code>ALTER TABLE … DISABLE TRIGGER</code> albo <code>DROP</code>. Trigger chroni przed pomyłką, nie przed administratorem bazy. Przed nim chronią łańcuch hashy i kopia w magazynie WORM (dalej w lekcji), a także zasada, że hasło do roli właściciela ma tylko pipeline migracji.</li>
+  <li>Uprawnienia do <em>partycji</em> są osobne od tabeli głównej, więc job tworzący partycje nie nadaje do nich żadnych praw.</li>
+</ul>
+
+<h2>Co zapisywać przy każdym zdarzeniu</h2>
+<p>Każde zdarzenie ma stałe kolumny (tenant, aktor, rozmowa, akcja, <code>trace_id</code>, <code>config_version</code>) i mały, ustrukturyzowany <code>arguments</code>. Tryb „sync” oznacza zapis w tej samej transakcji co zmiana, „async” to bufor zapisywany partiami.</p>
+<table>
+  <tr><th><code>event_type</code></th><th>Kto zapisuje, tryb</th><th>Aktor / <code>user_id</code></th><th><code>arguments</code> (przykład)</th><th><code>result_code</code></th></tr>
+  <tr><td><code>TOOL_CALL</code></td><td><code>ToolAudit</code> po każdym narzędziu; async</td><td>ASSISTANT / on_behalf_of</td><td><code>{"ticket":"HD-1042","resultHmac":"9f2c…","resultChars":1840,"round":2,"durationMs":41}</code></td><td><code>OK</code>, <code>NOT_FOUND</code>, <code>ROUTE_MISMATCH</code>…</td></tr>
+  <tr><td><code>ACTION_PROPOSED</code></td><td><code>TicketWriteTools</code> razem z INSERT do <code>assistant_actions</code>; sync</td><td>ASSISTANT / on_behalf_of</td><td><code>{"type":"CHANGE_STATUS","risk":"MEDIUM","from":"IN_PROGRESS","to":"RESOLVED","ticketVersion":7,"payloadHash":"…"}</code></td><td><code>PROPOSED</code></td></tr>
+  <tr><td><code>ACTION_CONFIRMED</code></td><td><code>AssistantActionExecutor.confirm</code>; sync</td><td>USER / zatwierdzający</td><td><code>{"risk":"MEDIUM","decisionDelaySec":38,"idempotencyKeyHmac":"…"}</code></td><td><code>CONFIRMED</code></td></tr>
+  <tr><td><code>ACTION_REJECTED</code></td><td>endpoint <code>reject</code>; sync</td><td>USER</td><td><code>{"risk":"HIGH","decisionDelaySec":12}</code></td><td><code>REJECTED</code></td></tr>
+  <tr><td><code>ACTION_EXECUTED</code></td><td>executor po wywołaniu fasady; sync</td><td>ASSISTANT / on_behalf_of</td><td><code>{"ticketEventId":88123,"commentId":null,"ticketVersionAfter":8}</code></td><td><code>OK</code></td></tr>
+  <tr><td><code>ACTION_FAILED</code></td><td>executor, nowa transakcja po rollbacku; sync</td><td>ASSISTANT / on_behalf_of</td><td><code>{"stage":"EXECUTE","confirmedBy":"…","error":"StaleTicketException"}</code></td><td><code>ACTION_STALE</code>, <code>INVALID_TRANSITION</code>, <code>ERROR</code></td></tr>
+  <tr><td><code>ACTION_EXPIRED</code></td><td>job wygaszania (3.2, 3.5); sync</td><td>SYSTEM / autor propozycji</td><td><code>{"reason":"TTL"}</code> albo <code>"KILL_SWITCH"</code></td><td><code>EXPIRED</code></td></tr>
+  <tr><td><code>POLICY_DENIED</code></td><td><code>AssistantActionPolicy</code>, <code>InternalLeakGuard</code>, kill switch przy potwierdzeniu; sync, własna transakcja</td><td>ASSISTANT albo USER</td><td><code>{"stage":"PROPOSE","rule":"NO_CLOSE","requested":"CLOSED"}</code></td><td><code>FORBIDDEN</code>, <code>ACTIONS_DISABLED</code>, <code>INTERNAL_LEAK</code></td></tr>
+  <tr><td><code>KILL_SWITCH_CHANGED</code></td><td><code>PUT /api/admin/ai/settings</code> razem ze zmianą; sync</td><td>USER (admin) albo SYSTEM (alert)</td><td><code>{"scope":"TENANT","key":"ai_actions_enabled","old":true,"new":false,"incident":"INC-311"}</code></td><td><code>OK</code></td></tr>
+  <tr><td><code>INJECTION_SUSPECTED</code></td><td><code>InjectionDetector</code> (3.4); async</td><td>ASSISTANT / on_behalf_of</td><td><code>{"source":"COMMENT","commentId":"…","detector":"heuristic","rule":"ROLE_OVERRIDE","score":0.91}</code></td><td><code>DETECTED</code></td></tr>
+</table>
+<p><code>POLICY_DENIED</code> przy propozycji nie ma transakcji, do której można się dołączyć (nic nie trafia do <code>assistant_actions</code>), a mimo to zapisujemy go synchronicznie we własnej krótkiej transakcji: to sygnał bezpieczeństwa, którego nie wolno zgubić.</p>
+
+<h2>Czego NIE zapisywać</h2>
+<p>Audyt żyje rok, ma szersze grono czytelników niż rozmowa i nie da się go poprawić. Wszystko, co do niego trafi, zostanie na długo. Dlatego zasada brzmi: <strong>zapisuj fakty i identyfikatory, a nie treść</strong>.</p>
+<table>
+  <tr><th>Nie zapisuj</th><th>Dlaczego</th><th>Co zamiast</th></tr>
+  <tr><td>Pełnego promptu, odpowiedzi modelu, historii</td><td>Dane osobowe, rozmiar, a prompt systemowy i tak jest w repo</td><td><code>config_version</code> (2.4) i <code>trace_id</code></td></tr>
+  <tr><td>Treści komentarzy i wyników narzędzi</td><td>Treść jest w domenie (<code>comments</code>) albo w rozmowie</td><td><code>commentId</code>, długość, HMAC treści</td></tr>
+  <tr><td>Imion, e-maili, telefonów, PESEL</td><td><dfn data-t="pii">Dane osobowe</dfn> w danych niezmiennych to problem przy żądaniu usunięcia</td><td>UUID użytkownika; nazwę rozwiązuje się przy odczycie</td></tr>
+  <tr><td>Tokenów, kluczy API, <code>Idempotency-Key</code> w jawnej postaci</td><td>Sekrety albo dane pozwalające powtórzyć żądanie</td><td>HMAC albo nic</td></tr>
+  <tr><td>Swobodnego tekstu od modelu (np. <code>reason</code>)</td><td>Może zawierać cokolwiek, także treść wstrzykniętą przez atakującego</td><td>Kody i enumy; tekst jako HMAC i długość</td></tr>
+</table>
+<p>Przy treściach przydaje się <dfn data-t="hmac">HMAC</dfn>, czyli hash liczony z tajnym kluczem. Zwykły SHA-256 z e-maila albo krótkiej odpowiedzi „tak” da się odwrócić słownikiem: wystarczy policzyć hashe znanych adresów. HMAC bez klucza jest bezużyteczny, a z kluczem (<code>HmacSHA256</code>, klucz z Key Vault, rotowany co rok, z prefiksem wersji w wartości, np. <code>k2026:9f2c…</code>) pozwala sprawdzić, czy treść z historii rozmowy jest tą, którą widział model.</p>
+<p>Redakcja przez Presidio (2.7) nie nadaje się do ścieżki synchronicznej. Gdyby zatwierdzenie akcji czekało na usługę redakcji, awaria <dfn data-t="presidio">Presidio</dfn> blokowałaby wykonywanie akcji. Zamiast redagować tekst, w ogóle go nie przyjmujemy: <code>arguments</code> budujemy z białej listy typów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/audit/AuditArgs.kt">
+  @Component
+  class AuditArgs(private val hmac: AuditHmac) {
+      private val code = Regex("^[A-Z0-9_]{1,48}$")        // enumy i kody błędów
+      private val ticketRef = Regex("^HD-\\d{1,12}$")
+
+      fun of(vararg pairs: Pair<String, Any?>): Map<String, Any?> = pairs.associate { (k, v) -> k to safe(v) }
+
+      /** Swobodny tekst nigdy nie trafia do audytu: tylko odcisk i długość. */
+      fun text(raw: String): Map<String, Any> = mapOf("hmac" to hmac.of(raw), "chars" to raw.length)
+
+      private fun safe(v: Any?): Any? = when (v) {
+          null, is Boolean, is Int, is Long, is Double -> v
+          is UUID, is Instant, is Enum<*> -> v.toString()
+          is String -> if (code.matches(v) || ticketRef.matches(v)) v else text(v)
+          is Collection<*> -> v.map(::safe)
+          else -> throw IllegalArgumentException("Niedozwolony typ w audycie: ${v::class.simpleName}")
+      }
+  }
+
+</script>
+<p>E-mail czy zdanie „klient prosi o zwrot” zamieniają się w odcisk, a <code>IN_PROGRESS</code> i <code>HD-1042</code> zostają czytelne. Zapytanie z <code>searchTickets(query)</code> to tekst użytkownika, więc też trafia jako HMAC.</p>
+
+<h2>„Dlaczego asystent to zaproponował”</h2>
+<p>Najtrudniejsze pytanie z reklamacji brzmi: <em>dlaczego</em> asystent zaproponował zamknięcie, skoro klient czekał na odpowiedź? Nie zapisujemy promptów, ale zapisujemy wszystko, co pozwala odtworzyć wejście modelu:</p>
+<ol>
+  <li><strong><code>config_version</code></strong> wpisu <code>ACTION_PROPOSED</code>, np. <code>assistant-chat/v4|helpdesk-default|tools-v3-staff|cfg-1a2b3c4d</code>. Z niej odczytasz plik promptu z repozytorium (2.4: opublikowanej wersji się nie edytuje), alias modelu i wersję zestawu narzędzi. Jaki model stał wtedy za aliasem, powiedzą logi LiteLLM (1.3).</li>
+  <li><strong><code>TOOL_CALL</code> z tym samym <code>trace_id</code></strong>: które narzędzia model wywołał przed propozycją, z jakimi ID i z jakim wynikiem (<code>resultHmac</code>, długość, kod).</li>
+  <li><strong>Historia rozmowy</strong>, jeśli jeszcze istnieje (do 30 dni): wyniki narzędzi z <code>assistant_messages</code>. HMAC ich treści porównany z <code>resultHmac</code> potwierdza, że to dokładnie te dane widział model.</li>
+  <li><strong>Stan zgłoszenia w chwili propozycji</strong>: <code>ticket_events</code> do momentu <code>occurred_at</code> i <code>ticketVersion</code> z <code>arguments</code>.</li>
+</ol>
+<p>Z tymi danymi możesz odtworzyć sytuację w środowisku <dfn data-t="eval">evali</dfn> (2.8): ta sama wersja konfiguracji, te same wyniki narzędzi jako atrapy. Pamiętaj, że model jest niedeterministyczny. Jeśli propozycja powtarza się w 8 na 10 prób, problem leży w prompcie lub danych, a nie w pechu.</p>
+<div class="box tip"><span class="label">trace_id jako klucz tury</span><p>Identyfikator trace'a istnieje także wtedy, gdy sampling trace'a nie zapisał, więc <code>trace_id</code> łączy wpisy jednej tury nawet po zniknięciu trace'a. Sprawdź to w swojej konfiguracji (Micrometer Tracing z mostem OTel): przy wyłączonym tracingu <code>tracer.currentSpan()</code> zwróci <code>null</code> i trzeba zapisywać własne <code>turnId</code> w <code>arguments</code>.</p></div>
+
+<h2>AssistantAuditLog: synchronicznie czy asynchronicznie</h2>
+<p>Kontrakt przewiduje jedną metodę <code>record(event)</code>. To, czy zapis jest synchroniczny, wynika z typu zdarzenia:</p>
+<table>
+  <tr><th>Tryb</th><th>Zdarzenia</th><th>Zaleta</th><th>Koszt</th></tr>
+  <tr><td>W transakcji zmiany</td><td>akcje, polityka, kill switch</td><td>Atomowość: jest zmiana ⇔ jest wpis</td><td>Kilka ms na akcję; błąd audytu = brak zmiany</td></tr>
+  <tr><td>Bufor w pamięci, zapis partiami</td><td><code>TOOL_CALL</code>, <code>INJECTION_SUSPECTED</code></td><td>Zero wpływu na latencję czatu; odczyt nie zależy od audytu</td><td>Utrata do ok. 1 s wpisów przy awarii instancji</td></tr>
+  <tr><td><dfn data-t="outbox">Outbox</dfn></td><td>gdy <code>TOOL_CALL</code> musi być kompletny</td><td>Nic nie ginie</td><td>Wymaga transakcji zapisu w ścieżce odczytu</td></tr>
+</table>
+<p>Narzędzia odczytu działają w transakcjach <code>readOnly = true</code>, w których Postgres odrzuci <code>INSERT</code>, więc outbox dla <code>TOOL_CALL</code> (np. rejestr publikacji zdarzeń Spring Modulith) wymagałby osobnej transakcji przy każdym narzędziu. Dla HelpDesk utrata sekundy <code>TOOL_CALL</code> jest akceptowalna; zapisz ten kompromis w dokumentacji audytu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/audit/AssistantAuditLog.kt">
+  enum class AuditEventType { TOOL_CALL, ACTION_PROPOSED, ACTION_CONFIRMED, ACTION_REJECTED, ACTION_EXECUTED,
+      ACTION_FAILED, ACTION_EXPIRED, POLICY_DENIED, KILL_SWITCH_CHANGED, INJECTION_SUSPECTED;
+      val async get() = this == TOOL_CALL || this == INJECTION_SUSPECTED }
+
+  data class AuditEvent(
+      val type: AuditEventType, val actorType: ActorType, val tenantId: UUID?, val userId: UUID?,
+      val conversationId: UUID? = null, val actionId: UUID? = null, val ticketId: UUID? = null,
+      val toolName: String? = null, val arguments: Map<String, Any?> = emptyMap(),
+      val resultCode: String? = null, val configVersion: String? = null,
+      val traceId: String? = null,                 // łapane w wątku żądania, nie w wątku zapisu
+      val occurredAt: Instant,
+  ) {
+      // companion object z fabrykami: actionConfirmed/Executed/Failed/Expired, killSwitchChanged,
+      // injectionSuspected – skróty używane w 3.2, 3.4 i 3.5; każda wypełnia type i pola powyżej
+  }
+
+  @Component
+  class AssistantAuditLog(
+      private val jdbc: NamedParameterJdbcTemplate, private val json: ObjectMapper,
+      private val buffer: AuditBuffer, private val meters: MeterRegistry,
+  ) {
+      fun record(event: AuditEvent) {
+          meters.counter("helpdesk.assistant.audit.events", "event_type", event.type.name,
+              "tenant", event.tenantId?.toString() ?: "global").increment()
+          if (event.type.async) { buffer.offer(event); return }
+          check(TransactionSynchronizationManager.isActualTransactionActive()) {
+              "${event.type} musi być zapisany w transakcji zmiany"
+          }
+          insert(listOf(event))                    // ten sam Connection = ta sama transakcja
+      }
+
+      internal fun insert(events: List<AuditEvent>) {
+          jdbc.batchUpdate("""
+              insert into assistant_audit (occurred_at, tenant_id, actor_type, user_id, conversation_id,
+                  action_id, ticket_id, event_type, tool_name, arguments, result_code, config_version, trace_id)
+              values (:at, :tenant, :actor, :user, :conv, :action, :ticket, :type, :tool,
+                  cast(:args as jsonb), :result, :config, :trace)""",
+              events.sortedBy { it.tenantId?.toString() ?: "" }   // stała kolejność blokad łańcucha
+                  .map { e -> MapSqlParameterSource(mapOf(
+                      "at" to Timestamp.from(e.occurredAt), "tenant" to e.tenantId, "actor" to e.actorType.name,
+                      "user" to e.userId, "conv" to e.conversationId, "action" to e.actionId,
+                      "ticket" to e.ticketId, "type" to e.type.name, "tool" to e.toolName,
+                      "args" to json.writeValueAsString(e.arguments), "result" to e.resultCode,
+                      "config" to e.configVersion, "trace" to e.traceId)) }.toTypedArray())
+      }
+  }
+</script>
+<p><code>AuditBuffer</code> działa jak <code>UsageRecorder</code> z 2.6: ograniczona kolejka, wątek opróżniający ją co sekundę, transakcja z <code>app.bypass_rls = on</code>, licznik odrzuconych wpisów przy przepełnieniu i opróżnienie kolejki przy zamykaniu aplikacji (<code>@PreDestroy</code>). Sortowanie po tenancie ma znaczenie przy łańcuchu hashy (następna sekcja).</p>
+<h3>Ścieżka akcji w executorze</h3>
+<p>Szczegóły wykonania należą do lekcji 3.5. Tu ważne jest jedno: co się dzieje z audytem, gdy wykonanie się nie uda.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/AssistantActionExecutor.kt (fragment)">
+  fun confirm(user: CurrentUser, actionId: UUID, idempotencyKey: String): ActionResult = try {
+      tx.execute {                                           // jedna transakcja: akcja + zgłoszenie + audyt
+          val action = actions.lockForDecision(user, actionId)       // RLS, status PROPOSED, nie wygasła
+          checks.requireStillAllowed(user, action)                   // kill switch, polityka, uprawnienia
+          audit.record(events.confirmed(user, action, idempotencyKey))
+          val outcome = domain.apply(action, Actor.assistant(user, actionId))   // fasada + ticket_events
+          actions.markExecuted(action, outcome)
+          audit.record(events.executed(user, action, outcome))
+          ActionResult(actionId, "EXECUTED", outcome.ticket)
+      }!!
+  } catch (e: PolicyDeniedException) {
+      newTx.execute { audit.record(events.policyDenied(user, actionId, e, stage = "CONFIRM")) }
+      throw e
+  } catch (e: RuntimeException) {
+      // rollback skasował też ACTION_CONFIRMED; zapisujemy decyzję i błąd w NOWEJ transakcji
+      newTx.execute {
+          val action = actions.markFailed(user, actionId, errorCode(e))
+          audit.record(events.confirmed(user, action, idempotencyKey))
+          audit.record(events.failed(user, action, e))
+      }
+      throw e
+  }
+  // newTx = TransactionTemplate z PROPAGATION_REQUIRES_NEW
+</script>
+<p>Gdy zapis audytu się nie uda, wyjątek wycofa zmianę zgłoszenia. To świadoma decyzja: <strong>bez wpisu audytu nie ma akcji asystenta</strong>, a czytanie i zmiany przez UI działają dalej. Jeśli instancja padnie między rollbackiem a nową transakcją, akcja zostaje w stanie <code>PROPOSED</code> i job zapisze ją potem jako <code>ACTION_EXPIRED</code>. Ślad nie jest pełny, ale nie kłamie.</p>
+
+<h2>Integralność: łańcuch hashy</h2>
+<p>Append-only nie chroni przed właścicielem bazy ani przed kimś, kto odtworzy bazę z kopii z „poprawionym” wierszem. <dfn data-t="hash-chain">Łańcuch hashy</dfn> sprawia, że taka zmiana jest wykrywalna. Każdy wpis zawiera hash poprzedniego, a jego własny hash obejmuje treść i ten poprzedni hash. Zmiana jednego wiersza psuje wszystkie kolejne, a usunięcie wiersza zostawia dziurę w <code>chain_seq</code>.</p>
+<p>Łańcuch prowadzimy osobno dla każdego tenanta. Weryfikacja i eksport też są per tenant, a współbieżne zapisy różnych tenantów nie czekają na siebie. Hash liczy trigger w bazie, więc aplikacja nie może go pominąć:</p>
+<script type="text/x-code" data-lang="sql" data-title="V38__assistant_audit_chain.sql">
+  CREATE TABLE assistant_audit_chain (           -- głowa łańcucha per tenant; aplikacja nie ma do niej praw
+      tenant_key uuid PRIMARY KEY,              -- tenant_id albo 0000... dla zdarzeń globalnych
+      last_seq   bigint NOT NULL,
+      last_hash  bytea  NOT NULL
+  );
+
+  CREATE FUNCTION assistant_audit_link() RETURNS trigger
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = public SET timezone = 'UTC' AS $$
+  DECLARE
+      k    uuid := coalesce(NEW.tenant_id, '00000000-0000-0000-0000-000000000000');
+      head assistant_audit_chain%ROWTYPE;
+  BEGIN
+      INSERT INTO assistant_audit_chain VALUES (k, 0, decode(repeat('00', 32), 'hex'))
+          ON CONFLICT (tenant_key) DO NOTHING;
+      SELECT * INTO head FROM assistant_audit_chain WHERE tenant_key = k FOR UPDATE;  -- serializacja per tenant
+      NEW.chain_seq := head.last_seq + 1;
+      NEW.prev_hash := head.last_hash;
+      NEW.row_hash  := sha256(NEW.prev_hash || convert_to(
+          jsonb_strip_nulls(to_jsonb(NEW) - 'row_hash' - 'prev_hash')::text, 'UTF8'));
+      UPDATE assistant_audit_chain SET last_seq = NEW.chain_seq, last_hash = NEW.row_hash
+          WHERE tenant_key = k;
+      RETURN NEW;
+  END $$;
+
+  CREATE TRIGGER assistant_audit_chain_link BEFORE INSERT ON assistant_audit
+      FOR EACH ROW EXECUTE FUNCTION assistant_audit_link();
+</script>
+<p>Cztery szczegóły, które decydują o tym, czy weryfikacja zadziała za rok:</p>
+<ul>
+  <li><strong><code>SECURITY DEFINER</code></strong>: funkcja działa z prawami właściciela, więc aplikacja przesuwa głowę łańcucha tylko przez trigger i nie może jej zmienić bezpośrednio. <code>SET search_path</code> chroni przed podmianą funkcji przez obcy schemat.</li>
+  <li><strong><code>SET timezone = 'UTC'</code></strong>: <code>to_jsonb</code> formatuje <code>timestamptz</code> według strefy sesji. Bez tego ten sam wiersz dałby inny hash przy weryfikacji z innej sesji.</li>
+  <li><strong><code>jsonb_strip_nulls</code></strong>: gdy za pół roku dodasz kolumnę, stare wiersze dostaną w niej <code>NULL</code>. Bez usuwania nulli zmieniłby się ich JSON, a więc i hash całej historii.</li>
+  <li><strong>Współbieżność</strong>: <code>FOR UPDATE</code> trzyma blokadę głowy łańcucha do końca transakcji, więc wpisy jednego tenanta zapisują się po kolei. Rollback cofa też przesunięcie głowy, więc nie powstaje dziura. Bufor <code>TOOL_CALL</code> sortuje partię po tenancie, żeby dwie instancje nie blokowały głów w odwrotnej kolejności (zakleszczenie). Przy dziesiątkach zapisów na sekundę na tenanta to wystarcza; przy większym ruchu hashe może dopisywać później osobny job, kosztem okna bez ochrony.</li>
+</ul>
+<h3>Weryfikacja</h3>
+<p>Każdy wiersz da się sprawdzić niezależnie: hash musi zgadzać się z treścią, a <code>prev_hash</code> z <code>row_hash</code> poprzednika. Nie trzeba rekurencji:</p>
+<script type="text/x-code" data-lang="sql" data-title="weryfikacja łańcucha (konto helpdesk_audit_reader)">
+  SET LOCAL timezone = 'UTC';                    -- ta sama strefa co w triggerze
+  SELECT tenant_id, chain_seq, problem FROM (
+      SELECT a.tenant_id, a.chain_seq,
+             CASE
+               WHEN a.row_hash <> sha256(a.prev_hash || convert_to(
+                        jsonb_strip_nulls(to_jsonb(a) - 'row_hash' - 'prev_hash')::text, 'UTF8'))
+                 THEN 'ZMIENIONA TREŚĆ'
+               WHEN a.prev_hash IS DISTINCT FROM lag(a.row_hash) OVER w AND lag(a.chain_seq) OVER w IS NOT NULL
+                 THEN 'ZERWANE POWIĄZANIE'
+               WHEN a.chain_seq - lag(a.chain_seq) OVER w <> 1 THEN 'BRAKUJĄCY WPIS'
+             END AS problem
+      FROM assistant_audit a
+      WHERE a.tenant_id = :tenant AND a.occurred_at >= :from
+      WINDOW w AS (ORDER BY a.chain_seq)
+  ) x WHERE problem IS NOT NULL ORDER BY chain_seq LIMIT 100;
+</script>
+<p>Kolumny dodawaj tylko do tabeli głównej, nigdy do pojedynczej partycji, bo <code>to_jsonb</code> musi dawać te same klucze. Weryfikację uruchamia nocny job, który ustawia metrykę <code>helpdesk.assistant.audit.chain.broken</code> (alert krytyczny przy wartości większej od 0) i zapisuje głowę łańcucha każdego tenanta do eksportu.</p>
+
+<h2>Eksport do WORM i podpisy</h2>
+<p>Łańcuch wykrywa zmianę pojedynczego wiersza, ale ktoś z pełnym dostępem może przeliczyć cały łańcuch od nowa. Dlatego głowę łańcucha trzeba regularnie zapisać tam, gdzie nikt, łącznie z Tobą, nie może jej zmienić. Służy do tego magazyn <dfn data-t="worm">WORM</dfn> (write once, read many): obiekt można zapisać raz, a przez okres retencji nie da się go nadpisać ani usunąć.</p>
+<table>
+  <tr><th>Usługa</th><th>Mechanizm</th><th>Tryby</th></tr>
+  <tr><td>AWS S3</td><td>S3 Object Lock (wymaga wersjonowania kubełka)</td><td><em>Governance</em> (uprawnieni mogą zdjąć blokadę) i <em>Compliance</em> (nikt, łącznie z kontem root, do końca retencji); osobno <em>legal hold</em></td></tr>
+  <tr><td>Azure Blob Storage</td><td>Immutable storage: zasady retencji czasowej (time-based retention) i legal hold, na poziomie kontenera lub wersji</td><td>Zasada odblokowana (do testów) i zablokowana (<em>locked</em>), której nie da się skrócić ani usunąć</td></tr>
+</table>
+<p>Codzienny job eksportuje wpisy z poprzedniego dnia jako JSONL (gzip, jeden plik na tenanta), a do tego manifest z liczbą wierszy, zakresem <code>chain_seq</code>, ostatnim <code>row_hash</code> i SHA-256 pliku. Przy weryfikacji porównujesz głowę łańcucha w bazie z manifestem: przeliczony łańcuch nie zgodzi się z tym, co zapisano w WORM.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/audit/AuditArchiveWriter.kt (S3, AWS SDK v2)">
+  fun putImmutable(key: String, bytes: ByteArray, retainDays: Long) {
+      val request = PutObjectRequest.builder()
+          .bucket(props.bucket).key(key)                       // np. audit/acme/2026/11/13.jsonl.gz
+          .objectLockMode(ObjectLockMode.COMPLIANCE)
+          .objectLockRetainUntilDate(clock.instant().plus(Duration.ofDays(retainDays)))
+          .checksumAlgorithm(ChecksumAlgorithm.SHA256)         // Object Lock wymaga sumy kontrolnej
+          .build()
+      s3.putObject(request, RequestBody.fromBytes(bytes))
+  }
+</script>
+<p>Nazwy metod builderów sprawdź w Javadoc swojej wersji SDK. W Azure ustawiasz zasadę na kontenerze, np. <code>az storage container immutability-policy create --period 365</code>, a po testach blokujesz ją poleceniem <code>… immutability-policy lock</code> (sprawdź parametry w dokumentacji CLI). Testuj w trybie Governance: pomyłki w trybie Compliance nie da się cofnąć.</p>
+<p><strong>Podpisy</strong> to opcjonalna warstwa wyżej: manifest podpisany kluczem z AWS KMS albo Azure Key Vault (klucz nie opuszcza HSM), ewentualnie ze znacznikiem czasu RFC 3161, dowodzi, kto i kiedy go wystawił. Dla większości zespołów WORM z łańcuchem hashy wystarcza.</p>
+
+<h2>Retencja, partycje i prawo do usunięcia</h2>
+<table>
+  <tr><th>Dane</th><th>Retencja (przykład)</th><th>Uzasadnienie</th></tr>
+  <tr><td>Rozmowy (2.5)</td><td>30 dni</td><td>Pełna treść, dużo danych osobowych</td></tr>
+  <tr><td>Trace z treścią (1.4)</td><td>do 14 dni</td><td>Diagnostyka</td></tr>
+  <tr><td><code>assistant_audit</code> w bazie</td><td>12 miesięcy</td><td>Reklamacje, incydenty, audyt roczny</td></tr>
+  <tr><td>Eksport WORM</td><td>12 miesięcy (lub dłużej, jeśli wymaga tego polityka)</td><td>Dowód niezmienności</td></tr>
+  <tr><td><code>ticket_events</code></td><td>Tyle co zgłoszenie</td><td>Część domeny</td></tr>
+</table>
+<p><dfn data-t="retention">Retencję</dfn> realizuje <code>DROP</code> partycji starszej niż 12 miesięcy. Robi to job działający na koncie właściciela (pg_cron, Kubernetes CronJob), a nie aplikacja. Trigger append-only nie blokuje operacji DDL, więc job przed usunięciem partycji sprawdza w tabeli <code>assistant_audit_exports</code>, że każdy dzień tego miesiąca ma potwierdzony eksport. Po usunięciu partycji łańcuch zaczyna się od wiersza, którego <code>prev_hash</code> zgadza się z ostatnim manifestem w WORM. Weryfikacja przyjmuje go jako punkt startowy.</p>
+<h3>Prawo do usunięcia a niezmienny audyt</h3>
+<p>Konflikt jest prawdziwy: <dfn data-t="right-to-erasure">prawo do usunięcia</dfn> (art. 17 RODO) kontra tabela, której nie wolno zmienić, i łańcuch, który zmiana by zerwała. Rozwiązanie zaczyna się od projektu, a nie od obsługi żądania:</p>
+<ul>
+  <li><strong>Audyt nie zawiera danych identyfikujących wprost</strong>, tylko UUID użytkownika. Nazwisko i e-mail są w module <code>identity</code>. Przy usunięciu konta identity kasuje lub <dfn data-t="pseudonymization">pseudonimizuje</dfn> swój rekord, a audyt pokazuje „Użytkownik usunięty (6a1f…)”.</li>
+  <li><strong>UUID to nadal dane osobowe</strong> (dane spseudonimizowane, motyw 26 RODO), bo z kopią zapasową identity da się je przypisać do osoby. Przechowywanie wymaga podstawy prawnej. Typowe argumenty to obowiązek prawny albo prawnie uzasadniony interes (art. 6 ust. 1 lit. c lub f) i wyjątek z art. 17 ust. 3 lit. e (ustalenie, dochodzenie lub obrona roszczeń). Decyzję i okres retencji uzgodnij z IOD i wpisz do rejestru czynności przetwarzania.</li>
+  <li><strong>Nie przepisuj audytu przy żądaniu usunięcia</strong>. Podmiana <code>user_id</code> na pseudonim po fakcie zerwałaby łańcuch i wymagała obejścia triggera. Jeśli IOD uzna, że UUID nie może zostać, wybierz od początku <em>crypto-shredding</em>: w audycie zapisujesz identyfikator zaszyfrowany kluczem per użytkownik, a usunięcie klucza czyni go nieczytelnym bez zmiany wiersza.</li>
+</ul>
+
+<h2>Historia zgłoszenia w UI</h2>
+<p>Użytkownicy nie zajrzą do panelu admina, ale zobaczą historię zgłoszenia. Wpis ma odpowiadać na pytanie „kto to zrobił” bez czytania dokumentacji: <em>„Status zmieniony przez Asystenta w imieniu Piotra (zatwierdzone 10:42)”</em>.</p>
+<p>Jest tu pułapka. <code>assistant_actions</code> widzi tylko autor propozycji (RLS jak w rozmowach), więc join z historią zgłoszenia dla innego agenta zwróci pustą godzinę zatwierdzenia. Dlatego executor zapisuje <code>confirmedAt</code> i <code>conversationId</code> w <code>ticket_events.payload</code> w chwili wykonania, a historia nie potrzebuje joina. <code>TicketHistoryApi.history(user, ticketId)</code> najpierw woła <code>tickets.get(user, ticketId)</code> (404 dla cudzego), a potem mapuje zdarzenia na <code>TicketEventView</code>: <code>actorName = "Asystent"</code> dla ASSISTANT, nazwę z <code>on_behalf_of</code> rozwiązaną w identity, <code>confirmedAt</code> z payloadu i <code>conversationId</code> tylko wtedy, gdy <code>on_behalf_of == user.userId</code>.</p>
+<script type="text/x-code" data-lang="typescript" data-title="tickets/TicketHistory.tsx">
+  const time = new Intl.DateTimeFormat("pl-PL", { hour: "2-digit", minute: "2-digit" });
+
+  function describe(e: TicketEventDto): string {
+    const what = e.type === "STATUS_CHANGED" ? `Status zmieniony na ${e.details.to}` : eventLabel(e.type);
+    if (e.actorType === "ASSISTANT") {
+      const confirmed = e.confirmedAt ? ` (zatwierdzone ${time.format(new Date(e.confirmedAt))})` : "";
+      return `${what} przez Asystenta w imieniu ${e.onBehalfOfName ?? "usuniętego użytkownika"}${confirmed}`;
+    }
+    return `${what} przez ${e.actorType === "SYSTEM" ? "system" : e.actorName}`;
+  }
+
+  export function TicketHistory({ events }: { events: TicketEventDto[] }) {
+    return (
+      <ol className="history">
+        {events.map((e) => (
+          <li key={e.id} data-actor={e.actorType}>
+            <time dateTime={e.at}>{time.format(new Date(e.at))}</time> {describe(e)}
+            {e.conversationId && (
+              <a href={`/assistant/conversations/${e.conversationId}`}>Pokaż rozmowę</a>
+            )}
+          </li>
+        ))}
+      </ol>
+    );
+  }
+</script>
+<ul>
+  <li><strong>Link do rozmowy</strong> widzi tylko Piotr, bo rozmowa jest prywatna (2.5). Po 30 dniach link prowadzi do 404 <code>conversation-not-found</code>, więc UI pokazuje „rozmowa usunięta zgodnie z retencją”. Wpis audytu zostaje.</li>
+  <li><strong>Klient</strong> (anna@acme) nie widzi zdarzeń wewnętrznych. Publiczny komentarz zatwierdzony przez Piotra wyświetla się jako „Piotr” z oznaczeniem „przygotowane z pomocą asystenta AI”. To decyzja o przejrzystości. Czy oznaczenie jest wymagane prawnie, ustal z prawnikiem (art. 50 AI Act).</li>
+</ul>
+
+<h2>Panel admina i typowe zapytania</h2>
+<p>Endpoint z kontraktu, rozszerzony o filtry i stronicowanie. Audyt rośnie szybko, więc <code>OFFSET</code> odpada: strona 2000 kazałaby bazie przeczytać i odrzucić 100 tys. wierszy. <dfn data-t="keyset-pagination">Stronicowanie keyset</dfn> pamięta ostatni zwrócony klucz <code>(occurred_at, id)</code> i prosi o wiersze „starsze niż ten klucz”, co indeks <code>ix_audit_tenant_time</code> obsługuje równie szybko na każdej stronie.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/audit/AssistantAuditController.kt">
+  @RestController
+  @RequestMapping("/api/admin/assistant/audit")
+  @PreAuthorize("hasRole('ADMIN')")
+  class AssistantAuditController(private val query: AssistantAuditQuery) {
+
+      @GetMapping
+      fun list(
+          user: CurrentUser,
+          @RequestParam(required = false) tenantId: UUID?,
+          @RequestParam(required = false) ticketId: UUID?,
+          @RequestParam(required = false) userId: UUID?,
+          @RequestParam(required = false) eventType: Set<AuditEventType>?,
+          @RequestParam from: Instant,                                   // wymagane: przycina partycje
+          @RequestParam(required = false) to: Instant?,
+          @RequestParam(required = false) cursor: String?,
+          @RequestParam(defaultValue = "50") @Max(200) limit: Int,
+      ): AuditPage {
+          val until = to ?: Instant.now()
+          require(Duration.between(from, until) <= Duration.ofDays(93)) { "Zakres najwyżej 93 dni" }
+          return query.page(user, AuditFilter(tenantId, ticketId, userId, eventType, from, until),
+              cursor?.let(AuditCursor::decode), limit)
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="sql" data-title="AssistantAuditQuery: strona keyset">
+  SELECT id, occurred_at, tenant_id, actor_type, user_id, conversation_id, action_id, ticket_id,
+         event_type, tool_name, arguments, result_code, config_version, trace_id
+  FROM assistant_audit
+  WHERE occurred_at >= :from AND occurred_at < :to
+    AND (cast(:tenant AS uuid) IS NULL OR tenant_id = :tenant)
+    AND (cast(:ticket AS uuid) IS NULL OR ticket_id = :ticket)
+    AND (cast(:user AS uuid)   IS NULL OR user_id = :user)
+    AND (:anyType OR event_type = ANY (:types))
+    AND (:first OR (occurred_at, id) < (:cursorAt, :cursorId))     -- porównanie krotek
+  ORDER BY occurred_at DESC, id DESC
+  LIMIT :limitPlusOne;                                              -- +1: czy jest następna strona
+</script>
+<p>Kursor to <code>base64url("2026-11-13T09:42:00.123456Z|88123")</code>. Wpisy z bufora trafiają do bazy z opóźnieniem do sekundy, ale z <code>occurred_at</code> zdarzenia, więc panel może je przeoczyć na bieżącej stronie; eksport i weryfikacja idą po <code>chain_seq</code>. Każde wywołanie panelu zapisz do logu aplikacji (kto, jakie filtry): dostęp do audytu też podlega rozliczalności.</p>
+<h3>Zapytania do typowych pytań</h3>
+<script type="text/x-code" data-lang="sql" data-title="1. Akcje i wskaźnik odrzuceń per tenant (tydzień)">
+  SELECT tenant_id,
+         count(*) FILTER (WHERE event_type = 'ACTION_EXECUTED') AS executed,
+         count(*) FILTER (WHERE event_type = 'ACTION_REJECTED') AS rejected,
+         count(*) FILTER (WHERE event_type = 'ACTION_CONFIRMED') AS confirmed,
+         count(*) FILTER (WHERE event_type = 'ACTION_EXPIRED') AS expired,
+         round(100.0 * count(*) FILTER (WHERE event_type = 'ACTION_REJECTED')
+               / nullif(count(*) FILTER (WHERE event_type <> 'ACTION_EXECUTED'), 0), 1) AS rejection_pct
+  FROM assistant_audit
+  WHERE event_type IN ('ACTION_EXECUTED','ACTION_REJECTED','ACTION_CONFIRMED','ACTION_EXPIRED')
+    AND occurred_at >= now() - interval '7 days'
+  GROUP BY tenant_id ORDER BY rejection_pct DESC NULLS LAST;
+</script>
+<script type="text/x-code" data-lang="sql" data-title="2. Kto zatwierdził zmianę statusu HD-1042 z 13.11">
+  SELECT e.created_at, e.payload->>'from' AS from_status, e.payload->>'to' AS to_status,
+         e.on_behalf_of, c.user_id AS confirmed_by, c.occurred_at AS confirmed_at,
+         p.config_version, p.trace_id
+  FROM ticket_events e
+  JOIN tickets t ON t.id = e.ticket_id AND t.number = 1042
+  JOIN assistant_audit c ON c.action_id = e.assistant_action_id AND c.event_type = 'ACTION_CONFIRMED'
+  JOIN assistant_audit p ON p.action_id = e.assistant_action_id AND p.event_type = 'ACTION_PROPOSED'
+  WHERE e.type = 'STATUS_CHANGED' AND e.created_at >= '2026-11-13' AND e.created_at < '2026-11-14';
+</script>
+<script type="text/x-code" data-lang="sql" data-title="3. Wszystkie akcje z rozmów z podejrzeniem injection">
+  WITH suspicious AS (
+      SELECT conversation_id, min(occurred_at) AS first_signal
+      FROM assistant_audit
+      WHERE event_type = 'INJECTION_SUSPECTED' AND occurred_at >= now() - interval '90 days'
+      GROUP BY conversation_id
+  )
+  SELECT a.occurred_at, a.tenant_id, a.event_type, a.action_id, a.ticket_id, a.user_id,
+         a.arguments->>'type' AS action_type, a.result_code, a.occurred_at >= s.first_signal AS after_signal
+  FROM assistant_audit a JOIN suspicious s USING (conversation_id)
+  WHERE a.event_type IN ('ACTION_PROPOSED','ACTION_CONFIRMED','ACTION_EXECUTED','POLICY_DENIED')
+  ORDER BY a.conversation_id, a.occurred_at;
+</script>
+<p>Trzecie zapytanie to pierwszy krok reakcji na incydent z 3.4. Daje listę wykonanych akcji do przeglądu, a kolumna <code>after_signal</code> pokazuje, czy człowiek zatwierdził akcję już po sygnale detektora. Jeśli tak, karta potwierdzenia (3.5) powinna ten sygnał wyraźniej pokazywać.</p>
+
+<h2>Dashboard i alerty</h2>
+<p>Licznik <code>helpdesk.assistant.audit.events</code> z <code>AssistantAuditLog</code> ma tagi <code>event_type</code> i <code>tenant</code>, oba o niskiej <dfn data-t="cardinality">kardynalności</dfn>. Na dashboardzie: akcje, odrzucenia, odmowy polityki i błędy per tenant oraz czas decyzji (<code>decisionDelaySec</code>; zatwierdzenia poniżej 2 s sugerują klikanie bez czytania).</p>
+<script type="text/x-code" data-lang="yaml" data-title="prometheus/rules/assistant-audit.yml">
+  groups:
+    - name: assistant-audit
+      rules:
+        - alert: AssistantActionFailedSpike
+          expr: |
+            sum by (tenant) (increase(helpdesk_assistant_audit_events_total{event_type="ACTION_FAILED"}[30m]))
+              / sum by (tenant) (increase(helpdesk_assistant_audit_events_total{event_type="ACTION_CONFIRMED"}[30m])) > 0.2
+            and sum by (tenant) (increase(helpdesk_assistant_audit_events_total{event_type="ACTION_CONFIRMED"}[30m])) >= 5
+          labels: { severity: warning }
+        - alert: AssistantPolicyDeniedSpike           # model uparcie próbuje rzeczy zabronionych
+          expr: sum by (tenant) (increase(helpdesk_assistant_audit_events_total{event_type="POLICY_DENIED"}[15m])) > 10
+          labels: { severity: warning }
+        - alert: AssistantAuditWriteFailures          # każdy błąd zapisu = zablokowane akcje
+          expr: increase(helpdesk_assistant_audit_write_failures_total[5m]) > 0
+          labels: { severity: critical }
+        - alert: AssistantAuditChainBroken
+          expr: max(helpdesk_assistant_audit_chain_broken) > 0
+          labels: { severity: critical }
+</script>
+<p>Skok <code>POLICY_DENIED</code> razem z <code>INJECTION_SUSPECTED</code> w jednym tenancie to dobry kandydat na automatyczne wyzwolenie <dfn data-t="kill-switch">kill switcha</dfn> akcji (opcja z 3.2). Wyzwolenie zapisze się jako <code>KILL_SWITCH_CHANGED</code> z <code>actor_type = SYSTEM</code> i nazwą reguły w <code>arguments</code>. Progi ustaw po tygodniu obserwacji, tak jak w 2.2.</p>
+
+<h2>Testy gwarancji audytu</h2>
+<p>Audyt, którego gwarancji nikt nie sprawdza, przestaje działać przy pierwszej migracji z <code>GRANT … ON ALL TABLES</code>. Cztery testy integracyjne na Testcontainers, z aplikacją łączącą się jako <code>helpdesk_app</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantAuditIT.kt">
+  @SpringBootTest @Testcontainers
+  class AssistantAuditIT(
+      @Autowired val jdbc: JdbcTemplate, @Autowired val tx: TransactionTemplate,
+      @Autowired val executor: AssistantActionExecutor, @Autowired val fixtures: AuditFixtures,
+  ) {
+      @Test
+      fun `aplikacja nie moze zmienic ani usunac wpisu audytu`() {
+          fixtures.anyAuditRow()
+          val e = assertThrows<DataAccessException> {
+              jdbc.update("update assistant_audit set result_code = 'OK'")
+          }
+          assertThat((e.rootCause as SQLException).sqlState).isEqualTo("42501")   // insufficient_privilege
+          assertThrows<DataAccessException> { jdbc.update("delete from assistant_audit") }
+      }
+
+      @Test
+      fun `blad wykonania wycofuje zmiane i zostawia CONFIRMED oraz FAILED`() {
+          val action = fixtures.proposedStatusChange(piotr, HD_1042, to = TicketStatus.RESOLVED)
+          fixtures.bumpTicketVersion(HD_1042)                       // ktoś zmienił zgłoszenie w międzyczasie
+          assertThrows<ActionStaleException> { executor.confirm(piotr, action.id, "key-1") }
+          assertThat(fixtures.ticketStatus(HD_1042)).isEqualTo(TicketStatus.IN_PROGRESS)
+          assertThat(fixtures.auditTypes(action.id)).containsExactly("ACTION_PROPOSED", "ACTION_CONFIRMED", "ACTION_FAILED")
+          assertThat(fixtures.ticketEventsFor(action.id)).isEmpty()
+      }
+
+      @Test
+      fun `blad zapisu audytu wycofuje zmiane zgloszenia`() {
+          val action = fixtures.proposedStatusChange(piotr, HD_1042, to = TicketStatus.RESOLVED)
+          fixtures.breakAuditInsertFor("ACTION_EXECUTED")           // trigger testowy rzucający wyjątek
+          assertThrows<DataAccessException> { executor.confirm(piotr, action.id, "key-2") }
+          assertThat(fixtures.ticketStatus(HD_1042)).isEqualTo(TicketStatus.IN_PROGRESS)
+      }
+
+      @Test
+      fun `lancuch hashy wykrywa zmiane wiersza`() {
+          repeat(5) { fixtures.anyAuditRow(tenant = ACME) }
+          assertThat(fixtures.verifyChain(ACME)).isEmpty()
+          fixtures.asSuperuser("""SET session_replication_role = replica;   -- wyłącza triggery w sesji
+              UPDATE assistant_audit SET result_code = 'OK' WHERE tenant_id = '$ACME' AND chain_seq = 3""")
+          assertThat(fixtures.verifyChain(ACME)).extracting("chainSeq", "problem")
+              .containsExactly(tuple(3L, "ZMIENIONA TREŚĆ"))
+      }
+  }
+</script>
+<p>Brak danych osobowych w <code>arguments</code> sprawdza test oparty na <dfn data-t="canary-data">danych-kanarkach</dfn> (2.8). W seedzie testowym jest komentarz z adresem <code>canary-7f3a@acme.example</code> i numerem PESEL kanarka. Po scenariuszach czatu i akcji zapytanie <code>select count(*) from assistant_audit where arguments::text like '%canary-7f3a%'</code> musi zwrócić 0. Do tego test jednostkowy <code>AuditArgs</code>: e-mail, nazwisko i zdanie zamieniają się w <code>{"hmac":…,"chars":…}</code>, a nieznany typ rzuca wyjątek.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Przypadek</th><th>Co zapisujemy i dlaczego</th></tr>
+  <tr><td><strong>Akcja zatwierdzona, wykonanie FAILED</strong></td><td>Rollback zmiany, potem nowa transakcja: <code>ACTION_CONFIRMED</code> i <code>ACTION_FAILED</code> z kodem (<code>ACTION_STALE</code>, <code>INVALID_TRANSITION</code>, <code>ERROR</code>). Decyzja człowieka jest zapisana, choć zmiany nie było. W historii zgłoszenia nie ma wpisu, bo nic się nie zmieniło.</td></tr>
+  <tr><td><strong>Kill switch w trakcie</strong></td><td>Propozycja istnieje, admin wyłącza akcje: <code>KILL_SWITCH_CHANGED</code> (USER, admin). Potwierdzenie daje 403 <code>assistant-actions-disabled</code> i <code>POLICY_DENIED</code> z <code>ACTIONS_DISABLED</code>, stage <code>CONFIRM</code>. Job wygasza resztę: <code>ACTION_EXPIRED</code>, reason <code>KILL_SWITCH</code>. Tura w toku kończy się z <code>StopReason.KILL_SWITCH</code> (3.2).</td></tr>
+  <tr><td><strong>Zmiana <code>config_version</code> między propozycją a wykonaniem</strong></td><td>Wszystkie wpisy akcji niosą <code>config_version</code> z propozycji (kolumna w <code>assistant_actions</code>), bo to ta konfiguracja wytworzyła decyzję. Wykonanie nie używa modelu, więc człowiek zatwierdza konkretny payload i zmiana konfiguracji tego nie unieważnia. Wyjątek: gdy wycofujesz wersję z powodu błędu (rollback promptu), job może wygasić propozycje tej wersji (<code>reason: CONFIG_REVOKED</code>).</td></tr>
+  <tr><td><strong>Działania ADMIN-a</strong></td><td>Admin w czacie działa jak AGENT tenanta rozmowy (2.2) i jego akcje audytują się tak samo. Zmiany przełączników zapisuje <code>KILL_SWITCH_CHANGED</code> (globalne z <code>tenant_id = NULL</code>). Admin czyta audyt, ale nie może go zmienić, bo aplikacja nie ma takich uprawnień. Odczyty panelu idą do logu aplikacji.</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Utwórz migracje V36–V38 na swojej bazie testowej. Jako <code>helpdesk_app</code> spróbuj <code>UPDATE</code>, <code>DELETE</code> i <code>TRUNCATE</code> na <code>assistant_audit</code>, potem to samo jako właściciel. Zanotuj, który mechanizm zatrzymał każdą próbę.</li>
+  <li>Wstaw 1000 wpisów dla Acme z dwóch równoległych sesji (np. <code>pgbench</code> z własnym skryptem). Uruchom weryfikację łańcucha i sprawdź, że w <code>chain_seq</code> nie ma dziur ani duplikatów. Potem dodaj do tabeli nową kolumnę i zweryfikuj ponownie.</li>
+  <li>Napisz zapytanie na pytanie z reklamacji: „Kto zatwierdził publiczny komentarz w HD-1042 i jakie narzędzia asystent wywołał przed propozycją?” (podpowiedź: <code>trace_id</code> wpisu <code>ACTION_PROPOSED</code>).</li>
+  <li>Spisz dla swojego systemu tabelę „zdarzenie → tryb zapisu (sync/async) → co tracimy przy awarii” i pokaż ją osobie odpowiedzialnej za bezpieczeństwo.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego trace z Langfuse nie zastąpi audytu działań asystenta?</p>
+  <button>Bo trace nie zawiera identyfikatora tenanta</button>
+  <button>Bo trace jest zbyt drogi w przechowywaniu</button>
+  <button>Bo trace jest próbkowany, krótko przechowywany i edytowalny, a audyt musi być kompletny, trwały i niezmienny</button>
+  <button>Bo trace nie zawiera czasów wywołań</button>
+  <p class="explain">Trace służy diagnozie. Audyt odpowiada na pytanie, kto i w czyim imieniu coś zrobił, także po miesiącach i w sporze, więc potrzebuje kompletności (transakcja), długiej retencji i ochrony przed zmianą.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Zatwierdzona akcja kończy się <code>StaleTicketException</code>. Co powinno zostać w bazie?</p>
+  <button>Zgłoszenie bez zmian, a w audycie <code>ACTION_CONFIRMED</code> i <code>ACTION_FAILED</code> zapisane w nowej transakcji po rollbacku</button>
+  <button>Nic, bo rollback wycofuje wszystko łącznie z audytem</button>
+  <button>Zmiana zgłoszenia i wpis <code>ACTION_EXECUTED</code>, bo człowiek zatwierdził</button>
+  <button>Wpis w <code>ticket_events</code> z typem FAILED</button>
+  <p class="explain">Rollback usuwa wpisy zapisane w transakcji akcji, dlatego decyzję i błąd zapisuje się w osobnej transakcji (<code>REQUIRES_NEW</code>). Historia zgłoszenia nie dostaje wpisu, bo zgłoszenie się nie zmieniło.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Po co w triggerze łańcucha hashy jest <code>SET timezone = 'UTC'</code> i <code>jsonb_strip_nulls</code>?</p>
+  <button>Żeby przyspieszyć liczenie SHA-256</button>
+  <button>Żeby ukryć dane osobowe w hashowanej treści</button>
+  <button>Bo PostgreSQL nie pozwala hashować wartości NULL</button>
+  <button>Żeby forma kanoniczna wiersza nie zależała od strefy czasowej sesji ani od kolumn dodanych później, bo inaczej weryfikacja dałaby fałszywe alarmy</button>
+  <p class="explain"><code>to_jsonb</code> formatuje <code>timestamptz</code> według strefy sesji, a nowa kolumna dodaje do starych wierszy <code>null</code>. Oba efekty zmieniłyby tekst, z którego liczysz hash, choć dane się nie zmieniły.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Klient żąda usunięcia danych. Jego UUID występuje w 300 wpisach audytu. Jakie podejście jest zgodne z projektem z lekcji?</p>
+  <button>Nadpisać <code>user_id</code> w audycie losowym UUID, wyłączając na chwilę trigger</button>
+  <button>Nie zmieniać audytu (nie zawiera danych identyfikujących wprost), usunąć lub spseudonimizować rekord w identity, a podstawę dalszego przechowywania UUID uzgodnić z IOD</button>
+  <button>Usunąć całą partycję miesiąca z wpisami klienta</button>
+  <button>Zignorować żądanie, bo audyt jest zawsze wyłączony z RODO</button>
+  <p class="explain">Przepisanie audytu zrywa łańcuch i podważa jego wartość dowodową. Projekt zakłada, że audyt przechowuje tylko pseudonimowy identyfikator, a dane identyfikujące są w identity. Czy i jak długo można trzymać UUID, rozstrzyga podstawa prawna, a nie technika.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="0">
+  <p class="q">Dlaczego <code>TOOL_CALL</code> zapisujemy przez bufor asynchroniczny, a <code>ACTION_EXECUTED</code> w transakcji zmiany?</p>
+  <button>Akcje muszą mieć gwarancję „jest zmiana ⇔ jest wpis”, a odczyty działają w transakcjach tylko do odczytu i nie powinny zwalniać czatu; utrata sekundy wpisów <code>TOOL_CALL</code> jest akceptowalna</button>
+  <button>Bo <code>TOOL_CALL</code> nie zawiera <code>tenant_id</code></button>
+  <button>Bo zapis synchroniczny nie działa z partycjonowaniem</button>
+  <button>Bo łańcuch hashy obejmuje tylko akcje</button>
+  <p class="explain">Wybór trybu to kompromis między gwarancją a kosztem. Krytyczne zdarzenia są atomowe ze zmianą. <code>TOOL_CALL</code> ma niską wagę pojedynczego wpisu, dużą liczność i działa w ścieżce odczytu, gdzie <code>INSERT</code> w transakcji <code>readOnly</code> by się nie udał.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

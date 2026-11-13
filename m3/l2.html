@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.2 Pętla agenta, limity, kill switch – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="3.2">
+<main>
+<p class="meta">Lekcja 3.2 · ok. 65 min</p>
+<h1>Pętla agenta, limity, kill switch</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć pętlę agenta i to, dlaczego przy narzędziach zapisu limity są ważniejsze niż przy odczycie.</li>
+  <li>Rozszerzyć <code>AssistantToolLoop</code> o komplet limitów tury: rundy, propozycje, wywołania, tokeny, czas i wykrywanie pętli.</li>
+  <li>Kończyć turę uczciwie: <code>StopReason</code>, <code>tool_choice: none</code>, stałe komunikaty, metryki i atrybuty spanu.</li>
+  <li>Dobrać wartości limitów na podstawie danych (percentyle), a nie intuicji.</li>
+  <li>Zbudować trzypoziomowy kill switch akcji z szybką propagacją, endpointem admina, automatycznym wyzwoleniem i runbookiem.</li>
+  <li>Przetestować limity i kill switch, łącznie z ćwiczeniem awaryjnym (game day).</li>
+</ul></div>
+
+<h2>Od jednego pytania do pętli agenta</h2>
+<p>W 2.1 aplikacja przejęła od Spring AI prowadzenie rund: model prosi o narzędzie, <code>AssistantToolLoop</code> je wykonuje, odsyła wynik i woła model ponownie. Ten cykl to <dfn data-t="agent-loop">pętla agenta</dfn>: model → żądanie narzędzia → wykonanie → wynik → kolejna decyzja, aż model odpowie tekstem. System, w którym model wybiera kolejne kroki, to <dfn data-t="agent">agent</dfn>, w odróżnieniu od workflow z krokami ustalonymi przez programistę (lekcja 5.1).</p>
+<p>W lekcji 3.1 doszły narzędzia zapisu <code>TicketWriteTools</code>: <code>proposeComment</code>, <code>proposeStatusChange</code>, <code>proposePriorityChange</code>, <code>proposeAssignment</code>. Nie zmieniają zgłoszenia, tylko zapisują propozycję (<code>PROPOSED</code>) w <code>assistant_actions</code>, którą człowiek zatwierdza w UI. Decyzja człowieka o skutku to <dfn data-t="hitl">human-in-the-loop</dfn>; pełne potwierdzenia: lekcja 3.5.</p>
+<p>Typowa tura Piotra („streść HD-1042, zaproponuj odpowiedź i ustaw oczekiwanie na klienta”) to 4 wywołania modelu: <code>getTicket</code> + <code>listComments</code> w jednej rundzie, <code>proposeComment</code>, <code>proposeStatusChange</code>, a na końcu tekst „Przygotowałem dwie zmiany do zatwierdzenia”. Każde wywołanie wysyła całą historię, więc koszt rośnie z każdą rundą szybciej niż liniowo. W M2 wystarczały 5 rund i deadline. Przy zapisie to za mało.</p>
+
+<h2>Dlaczego przy zapisie limity są ważniejsze</h2>
+<table>
+  <tr><th>Zagrożenie</th><th>Narzędzia odczytu (M2)</th><th>Narzędzia zapisu (M3)</th></tr>
+  <tr><td>Koszt</td><td>Rośnie z rundami, ale każda runda coś wnosi</td><td>+4 definicje narzędzi (ok. 750 <dfn data-t="token">tokenów</dfn> w każdym wywołaniu), rundy „sprawdzające”</td></tr>
+  <tr><td>Zapętlenie</td><td>Model ponawia wyszukiwanie z innymi frazami</td><td>Po <code>DUPLICATE</code> lub <code>FORBIDDEN</code> model zmienia uzasadnienie i ponawia</td></tr>
+  <tr><td>Seria</td><td>10 odczytów to tylko koszt</td><td>10 kart do przejrzenia; zmęczony człowiek zatwierdza „hurtem”</td></tr>
+  <tr><td><dfn data-t="prompt-injection">Prompt injection</dfn></td><td>Ryzyko wycieku w odpowiedzi</td><td>Instrukcja z wyniku narzędzia steruje kolejnymi rundami; każda to szansa na akcję atakującego</td></tr>
+</table>
+<p>Komentarz z prompt injection (3.4) model czyta w rundzie 1 i ma potem jeszcze cztery rundy na polecenia atakującego. Limity nie wykrywają ataku, tylko ograniczają jego <em>zasięg</em>: najwyżej 3 propozycje, żadna bez człowieka, a kill switch zatrzyma wszystko w kilka sekund. To <dfn data-t="defense-in-depth">obrona w głąb</dfn>: niezależne warstwy, z których każda działa, gdy inna zawiedzie.</p>
+<div class="box warn"><span class="label">Limit w kodzie, nie w prompcie</span><p>„Nie przygotowuj więcej niż 3 zmian” w prompcie to wskazówka, którą model może zignorować, a injection „odwołać”. Limity egzekwuje aplikacja.</p></div>
+
+<h2>Limity tury: kontrakt i TurnGuard</h2>
+<p><dfn data-t="turn">Tura</dfn> to jedno pytanie użytkownika i wszystko, co aplikacja robi, żeby na nie odpowiedzieć. Limity z kontraktu M3 dotyczą właśnie tury:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  helpdesk:
+    assistant:
+      agent:                          # dawniej helpdesk.assistant.max-tool-rounds / chat-deadline (2.1)
+        max-tool-rounds: 5            # bez zmian względem 2.1
+        max-proposals-per-turn: 3     # próby propozycji (także odrzucone przez walidację)
+        max-tool-calls-per-turn: 12   # wszystkie narzędzia razem
+        turn-token-budget: 30000      # wejście + wyjście wszystkich wywołań modelu w turze
+        chat-deadline: 40s            # po tym czasie żadnej nowej rundy
+        loop-threshold: 2             # to samo wywołanie po raz drugi = pętla
+        final-answer-min-time: 8s     # mniej czasu → stały komunikat zamiast ostatniego wywołania
+</script>
+<table>
+  <tr><th>Limit</th><th>Przed czym chroni</th></tr>
+  <tr><td>Rundy</td><td>Długie łańcuchy wywołań modelu</td></tr>
+  <tr><td>Propozycje</td><td>Seria kart, „zmęczenie zatwierdzaniem”, injection</td></tr>
+  <tr><td>Wywołania narzędzi</td><td><dfn data-t="parallel-tool-calls">Równoległe wywołania</dfn>: 8 narzędzi w jednej rundzie</td></tr>
+  <tr><td>Budżet tokenów</td><td>Koszt tury przy długiej rozmowie i dużych wynikach</td></tr>
+  <tr><td>Deadline</td><td>Czekanie użytkownika, <dfn data-t="time-budget">budżet czasu</dfn> warstw wyżej (1.5)</td></tr>
+  <tr><td>Wykrywanie pętli</td><td>Powtarzanie tego samego wywołania</td></tr>
+</table>
+<p>Żaden limit pojedynczo nie wystarcza. Stan tury trzyma jeden obiekt, który widzi pętla i dekorator <code>RecordingToolCallback</code> z 2.1: limit propozycji i wywołań musi działać <em>wewnątrz</em> rundy, bo pięć propozycji może przyjść w jednej odpowiedzi modelu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/agent/TurnGuard.kt">
+  enum class StopReason { COMPLETED, MAX_ROUNDS, MAX_PROPOSALS, MAX_TOOL_CALLS, BUDGET, DEADLINE, LOOP_DETECTED, KILL_SWITCH }
+
+  @ConfigurationProperties("helpdesk.assistant.agent")
+  data class AgentLimits(
+      val maxToolRounds: Int = 5, val maxProposalsPerTurn: Int = 3, val maxToolCallsPerTurn: Int = 12,
+      val turnTokenBudget: Int = 30_000, val chatDeadline: Duration = Duration.ofSeconds(40),
+      val loopThreshold: Int = 2, val finalAnswerMinTime: Duration = Duration.ofSeconds(8),
+  )
+
+  data class ToolCallRef(val name: String, val fingerprint: String, val isProposal: Boolean)
+
+  /** Stan jednej tury, współdzielony przez pętlę i dekoratory narzędzi. */
+  class TurnGuard(private val limits: AgentLimits, private val clock: Clock) {
+      private val deadline = clock.instant().plus(limits.chatDeadline)
+      private val seen = HashMap<String, Int>()
+      var toolCalls = 0; private set
+      var proposals = 0; private set
+      var tokensUsed = 0; private set
+      @Volatile var stop: StopReason? = null; private set
+
+      fun requestStop(reason: StopReason) { if (stop == null) stop = reason }   // pierwszy powód wygrywa
+      @Synchronized fun addUsage(input: Int, output: Int) { tokensUsed += input + output }
+      fun remaining(): Duration = Duration.between(clock.instant(), deadline)
+
+      /** null = wolno wykonać; w przeciwnym razie powód odmowy. */
+      @Synchronized fun admit(call: ToolCallRef): StopReason? {
+          val n = seen.merge(call.fingerprint, 1, Int::plus)!!
+          return when {
+              n >= limits.loopThreshold -> StopReason.LOOP_DETECTED
+              toolCalls >= limits.maxToolCallsPerTurn -> StopReason.MAX_TOOL_CALLS
+              call.isProposal && proposals >= limits.maxProposalsPerTurn -> StopReason.MAX_PROPOSALS
+              else -> { toolCalls++; if (call.isProposal) proposals++; null }
+          }
+      }
+  }
+</script>
+<p>Propozycja odrzucona przez walidację (<code>FORBIDDEN</code>, <code>INVALID_TRANSITION</code>) też zużywa limit: model, który „sonduje”, co mu wolno, ma się szybko zatrzymać. <code>@Synchronized</code> chroni na wypadek przyszłego współbieżnego wykonywania narzędzi z jednej rundy.</p>
+
+<h2>Wykrywanie pętli: fingerprint wywołania</h2>
+<p>W 2.1 dekorator odrzucał dokładne duplikaty (<code>nazwa|argumenty</code>). Przy zapisie to za mało: model po <code>DUPLICATE</code> zwykle zmienia tylko <code>reason</code> („klient czeka na plik” → „oczekujemy na plik”) i próbuje znowu. Potrzebny jest <dfn data-t="tool-fingerprint">fingerprint wywołania</dfn>: skrót, który ignoruje różnice bez znaczenia dla skutku.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/agent/ToolFingerprint.kt">
+  object ToolFingerprint {
+      /** Pola, które nie zmieniają skutku akcji: model lubi je przeformułowywać. */
+      private val ignored = listOf("proposeStatusChange", "proposePriorityChange", "proposeAssignment").associateWith { setOf("reason") }
+      private val spaces = Regex("\\s+")
+
+      fun of(name: String, argsJson: String): String {
+          val node = runCatching { Canonical.mapper.readTree(argsJson) }.getOrNull() as? ObjectNode
+              ?: return "$name|raw|${argsJson.trim()}"                  // zły JSON: porównujemy dosłownie
+          val parts = sortedMapOf<String, String>()
+          node.fields().forEach { (key, value) ->
+              if (key !in ignored[name].orEmpty() && !value.isNull) parts[key] = normalize(key, value)
+          }
+          return name + "|" + parts.entries.joinToString("&") { "${it.key}=${it.value}" }
+      }
+
+      private fun normalize(key: String, v: JsonNode): String {
+          val s = (if (v.isTextual) v.asText() else v.toString()).trim()
+          return when (key) {
+              "ticketId" -> s.uppercase().replace(" ", "").removePrefix("HD-").removePrefix("HD")  // HD-1042 = 1042
+              "body", "query" -> s.lowercase().replace(spaces, " ")
+              else -> s.uppercase()                                       // "resolved" = "RESOLVED"
+          }
+      }
+  }
+</script>
+<p>Dekorator z 2.1 zamiast <code>log.firstTime(...)</code> pyta <code>TurnGuard</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="RecordingToolCallback.call (zmiany względem 2.1)">
+  override fun call(toolInput: String, toolContext: ToolContext?): String {
+      val started = System.nanoTime()
+      val ref = ToolCallRef(name, ToolFingerprint.of(name, toolInput), isProposal = name in AssistantToolset.WRITE_TOOLS)
+      val denied = turn.admit(ref)
+      val raw = if (denied != null) {
+          turn.requestStop(denied)
+          rt.json.error(ToolErrorCode.LIMIT_EXCEEDED, StopMessages.forModel(denied))   // NIE wykonujemy narzędzia
+      } else execute(toolInput, toolContext)
+      // … przycięcie wyniku, outcome, ToolCallSummary i metryki jak w 2.1 …
+      if (outcome == "actions_disabled") turn.requestStop(StopReason.KILL_SWITCH)    // kod ACTIONS_DISABLED z 3.1
+      return result
+  }
+</script>
+<ul>
+  <li><strong>Odmowa jest wynikiem narzędzia</strong>, nie wyjątkiem: API wymaga odpowiedzi na każde <code>tool_call_id</code> z rundy (inaczej 400, 2.1).</li>
+  <li><strong>Próg 2</strong> = drugie identyczne wywołanie w turze. Ponowienie po <code>UNAVAILABLE</code> (timeout) bywa uzasadnione; jeśli chcesz je dopuścić, nie zapisuj fingerprintu wywołań z tym kodem.</li>
+  <li><strong>Normalizacja ma granice:</strong> komentarz przepisany innymi słowami łapie dopiero indeks <code>payload_hash</code> z 3.1 (<code>DUPLICATE</code>) albo limit propozycji.</li>
+</ul>
+
+<h2>AssistantToolLoop po rozszerzeniu</h2>
+<p>Kształt pętli z 2.1 zostaje. Dochodzą: zestaw narzędzi per żądanie (<code>AssistantToolset.forRequest(ctx)</code> z 3.1), <code>TurnGuard</code>, liczenie tokenów i kontrola limitów przed rundą i po niej.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantToolLoop.kt">
+  data class ToolLoopResult(
+      val answer: String, val toolCalls: List<ToolCallSummary>, val rounds: Int, val finishReason: FinishReason,
+      val stopReason: StopReason = StopReason.COMPLETED, val proposals: Int = 0, val tokensUsed: Int = 0,
+  )
+
+  @Component
+  class AssistantToolLoop(
+      private val toolCallingManager: ToolCallingManager,
+      private val toolset: AssistantToolset,
+      private val rt: ToolRuntime,
+      private val limits: AgentLimits,
+      private val metrics: AgentLoopMetrics,
+      private val clock: Clock,
+  ) {
+      fun run(client: ChatClient, route: ModelRoute.Use, messages: List<Message>, ctx: AssistantToolContext): ToolLoopResult {
+          val turn = TurnGuard(limits, clock)
+          val calls = ToolCallLog()
+          val callbacks = toolset.forRequest(ctx).map { RecordingToolCallback(it, calls, rt, turn) }
+          val names = callbacks.map { it.toolDefinition.name() }.toSet()
+          val context = mapOf<String, Any>(AssistantToolContext.KEY to ctx)
+          val options = rt.props.toolChatOptions(route.alias, callbacks, context)
+          val stop = { history: List<Message>, rounds: Int, reason: StopReason ->
+              finish(client, route, history, callbacks, context, turn, calls, rounds, reason) }
+
+          var prompt = Prompt(messages, options)
+          var response = call(client, prompt, turn)
+          var rounds = 0
+          while (response.hasToolCalls()) {
+              preRoundCheck(turn, rounds, response)?.let { return stop(prompt.instructions, rounds, it) } // bez niedokończonej rundy
+              rounds++
+              val requested = response.results.flatMap { it.output.toolCalls }
+              val history = if (requested.all { it.name() in names })
+                  toolCallingManager.executeToolCalls(prompt, response).conversationHistory()
+              else unknownToolHistory(prompt, response, calls, names)
+              turn.stop?.let { return stop(history, rounds, it) }        // limit w trakcie rundy: runda kompletna
+              prompt = Prompt(history, options)
+              response = call(client, prompt, turn)
+          }
+          return toResult(response, calls.summaries(), rounds)                // finish_reason jak w 2.1
+              .copy(stopReason = StopReason.COMPLETED, proposals = turn.proposals, tokensUsed = turn.tokensUsed)
+              .also { metrics.stopped(it, turn) }
+      }
+
+      private fun preRoundCheck(turn: TurnGuard, rounds: Int, response: ChatResponse): StopReason? {
+          val usage = response.metadata.usage
+          val requested = response.results.sumOf { it.output.toolCalls.size }
+          val nextCall = (usage.promptTokens ?: 0) + (usage.completionTokens ?: 0) +
+              requested * TOOL_RESULT_ESTIMATE + rt.props.maxOutputTokens
+          return when {
+              rounds >= limits.maxToolRounds -> StopReason.MAX_ROUNDS
+              turn.remaining() <= Duration.ZERO -> StopReason.DEADLINE
+              turn.tokensUsed + nextCall > limits.turnTokenBudget -> StopReason.BUDGET
+              else -> null
+          }
+      }
+
+      private fun call(client: ChatClient, prompt: Prompt, turn: TurnGuard): ChatResponse {
+          val r = client.prompt(prompt).call().chatResponse() ?: throw AssistantUnavailableException("Pusta odpowiedź modelu")
+          turn.addUsage(r.metadata.usage.promptTokens ?: 0, r.metadata.usage.completionTokens ?: 0)
+          return r
+      }
+
+      companion object { const val TOOL_RESULT_ESTIMATE = 1_000 }   // tokenów na wynik; skalibruj z llm_usage
+  }
+</script>
+<p><strong>Przed rundą</strong> sprawdzamy, czy w ogóle wykonywać kolejną (rundy, czas, budżet); historia wraca bez niedokończonej rundy, bo wiadomość z <code>tool_calls</code> bez odpowiedzi to 400. <strong>Po rundzie</strong> sprawdzamy limity zgłoszone przez dekorator (pętla, propozycje, wywołania, kill switch); runda jest kompletna, a błędy <code>LIMIT_EXCEEDED</code> w historii model zobaczy w ostatnim wywołaniu.</p>
+<p>Budżet liczymy z <code>usage</code> od dostawcy (2.6), z tokenami z cache: ograniczamy rozmiar pracy, nie tylko koszt. Przykład: system 600 + 8 definicji narzędzi 1 500 + historia 2 000 + pytanie 100 = 4 200 tokenów w wywołaniu 1, każda runda dokłada ok. 1 200. Wywołania 4 200, 5 400, 6 600, 7 800 to z odpowiedziami ok. 24 600; szacunek kolejnego (7 800 + 150 + 1 000 + 800) przekracza 30 000, więc pętla stanie na <code>BUDGET</code> przed czwartą rundą. Długie rozmowy trafiają na budżet wcześniej, co jest celowe (streszczanie: 2.5). Przy cenach ilustracyjnych z 1.2 (3 USD za 1 mln tokenów wejścia) tura kosztuje najwyżej ok. 0,09 USD, a „uprzejme zapętlenie” z 2.1 (14 wywołań po ok. 8 tys.) kosztowało ok. 0,34 USD.</p>
+<p>Pętla strumieniowa z 2.3 używa tego samego <code>TurnGuard</code>. Deadline sprawdzamy między rundami, a pojedyncze wywołanie ogranicza timeout HTTP z 1.5: 40 s plus jedno wywołanie musi się zmieścić w 55 s backendu.</p>
+
+<h2>StopReason: co widzi użytkownik, a co model</h2>
+<p>Tura zakończona limitem nie może wyglądać jak sukces ani jak awaria, a model nie może opisać akcji, których nie było. Dla każdego powodu decydujemy, czy wołamy model jeszcze raz z <dfn data-t="tool-choice"><code>tool_choice: none</code></dfn> (model nie może wtedy wołać narzędzi i musi odpowiedzieć tekstem), czy od razu zwracamy stały komunikat.</p>
+<table>
+  <tr><th>StopReason</th><th>Ostatnie wywołanie (<code>none</code>)</th><th>Użytkownik widzi</th></tr>
+  <tr><td><code>COMPLETED</code></td><td>nie dotyczy</td><td>odpowiedź, karty propozycji</td></tr>
+  <tr><td><code>MAX_ROUNDS</code></td><td>tak, historia bez ostatniej rundy</td><td>odpowiedź + „może być niepełna”</td></tr>
+  <tr><td><code>MAX_PROPOSALS</code></td><td>tak; model widzi „tej zmiany NIE przygotowano”</td><td>3 karty + „zatwierdź, potem poproś o kolejne”</td></tr>
+  <tr><td><code>MAX_TOOL_CALLS</code></td><td>tak; nadmiarowe dostają <code>LIMIT_EXCEEDED</code></td><td>odpowiedź + „może być niepełna”</td></tr>
+  <tr><td><code>LOOP_DETECTED</code></td><td>tak; „to wywołanie już było”</td><td>odpowiedź albo komunikat stały</td></tr>
+  <tr><td><code>BUDGET</code>, <code>DEADLINE</code></td><td>nie: brak tokenów lub czasu</td><td>komunikat stały + karty, jeśli powstały</td></tr>
+  <tr><td><code>KILL_SWITCH</code></td><td>nie</td><td>komunikat o wstrzymaniu akcji; czytanie działa</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantToolLoop.finish i StopMessages">
+  private fun finish(client: ChatClient, route: ModelRoute.Use, history: List<Message>, callbacks: List<ToolCallback>,
+                     context: Map<String, Any>, turn: TurnGuard, calls: ToolCallLog, rounds: Int, reason: StopReason): ToolLoopResult {
+      val askModel = reason in StopMessages.ASK_MODEL && turn.remaining() >= limits.finalAnswerMinTime
+      val final = if (askModel)
+          call(client, Prompt(history, rt.props.toolChatOptions(route.alias, callbacks, context, "none")), turn) else null
+      val usable = final?.takeIf { !it.hasToolCalls() && !it.result?.output?.text.isNullOrBlank() }
+      val base = if (usable != null) toResult(usable, calls.summaries(), rounds)
+                 else ToolLoopResult(StopMessages.forUser(reason), calls.summaries(), rounds, FinishReason.TOOL_CALLS)
+      return base.copy(stopReason = reason, proposals = turn.proposals, tokensUsed = turn.tokensUsed)
+          .also { metrics.stopped(it, turn) }
+  }
+
+  object StopMessages {
+      val ASK_MODEL = setOf(StopReason.MAX_ROUNDS, StopReason.MAX_PROPOSALS, StopReason.MAX_TOOL_CALLS, StopReason.LOOP_DETECTED)
+
+      fun forModel(r: StopReason) = when (r) {
+          StopReason.LOOP_DETECTED -> "To wywołanie było już wykonane w tej turze. Nie powtarzaj go, użyj wcześniejszego wyniku."
+          StopReason.MAX_PROPOSALS -> "Limit propozycji wyczerpany. Tej zmiany NIE przygotowano. Powiedz, o które zmiany trzeba poprosić osobno."
+          else -> "Wyczerpano limit wywołań narzędzi w tej turze. Odpowiedz na podstawie zebranych danych."
+      }
+
+      fun forUser(r: StopReason) = when (r) {
+          StopReason.MAX_PROPOSALS -> "W jednej wiadomości przygotuję najwyżej 3 zmiany. Zatwierdź lub odrzuć te poniżej i poproś o kolejne."
+          StopReason.BUDGET, StopReason.DEADLINE -> "To zadanie jest zbyt rozbudowane. Przygotowane zmiany (jeśli są) są poniżej, resztę podziel na mniejsze prośby."
+          StopReason.KILL_SWITCH -> "Akcje asystenta są wstrzymane. Nie przygotowałem nowych zmian, ale nadal odpowiem na pytania o zgłoszenia."
+          else -> "Nie udało mi się dokończyć zadania w rozsądnej liczbie kroków. Podziel prośbę albo podaj numer zgłoszenia."
+      }
+  }
+</script>
+<p>Stały komunikat pisze człowiek, więc nie twierdzi, że coś zrobiono, i nie wymyśla przyczyny. Odpowiedź modelu po limicie bywa lepsza (podsumuje dane), ale tylko gdy model widzi jawną informację o limicie: bez zdania „tej zmiany NIE przygotowano” potrafi napisać „przygotowałem 4 zmiany”, gdy kart są 3. Pole <code>stopReason</code> dochodzi do <code>ChatReply</code> (2.1) i zdarzenia <code>done</code> (2.3): <code>ChatEvent.Done(finishReason, usage, stopReason)</code>.</p>
+
+<h2>Metryki i atrybuty spanu per stopReason</h2>
+<p>Zakończenia przez limit to najcenniejszy sygnał o zdrowiu agenta: wzrost <code>LOOP_DETECTED</code> po zmianie promptu to regresja, nagły wzrost <code>MAX_PROPOSALS</code> u jednego tenanta to możliwy atak.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/agent/AgentLoopMetrics.kt">
+  @Component
+  class AgentLoopMetrics(private val registry: MeterRegistry, private val observations: ObservationRegistry) {
+      fun stopped(r: ToolLoopResult, turn: TurnGuard) {
+          registry.counter("helpdesk.assistant.loop.stops",
+              "feature", "assistant-chat", "stop_reason", r.stopReason.name).increment()
+          DistributionSummary.builder("helpdesk.assistant.turn.tokens").baseUnit("tokens")
+              .serviceLevelObjectives(10_000.0, 20_000.0, 30_000.0).register(registry).record(r.tokensUsed.toDouble())
+          observations.currentObservation?.apply {                       // span helpdesk.assistant.chat (2.1)
+              lowCardinalityKeyValue("helpdesk.agent.stop_reason", r.stopReason.name)
+              highCardinalityKeyValue("helpdesk.agent.rounds", r.rounds.toString())
+              highCardinalityKeyValue("helpdesk.agent.tool_calls", turn.toolCalls.toString())
+              highCardinalityKeyValue("helpdesk.agent.proposals", r.proposals.toString())
+              highCardinalityKeyValue("helpdesk.agent.tokens", r.tokensUsed.toString())
+          }
+      }
+  }
+</script>
+<p><dfn data-t="cardinality">Kardynalność</dfn> zostaje niska: 8 wartości <code>stop_reason</code>. Klucz low cardinality trafia też jako tag do timera <code>helpdesk.assistant.chat</code>, więc masz czasy tury per powód. Liczby rund, wywołań i tokenów są atrybutami high cardinality: widać je w <dfn data-t="trace">trace</dfn>, nie tworzą serii w Prometheusie. Rozkład rund z 2.6 (<code>helpdesk.assistant.tool.rounds</code>) uzupełnij o <code>.serviceLevelObjectives(1.0, 2.0, 3.0, 4.0, 5.0)</code>: kubełki na liczbach całkowitych dają dokładne percentyle. Alert na zgłoszenie (nie page): odsetek tur ze <code>stop_reason!="COMPLETED"</code> powyżej 3% przez 30 minut.</p>
+
+<h2>Wartości limitów z danych</h2>
+<p>Liczby z kontraktu (5, 3, 12, 30 000, 40 s) to punkt startowy. Właściwe wartości wynikają z rozkładu prawdziwego ruchu. <dfn data-t="percentile">Percentyl</dfn> p99 to wartość, poniżej której mieści się 99% tur. Limit ustawiamy powyżej p99 ruchu uprawnionego, z zapasem. Dane są w <code>llm_usage</code> (2.6, kolumny <code>question_id</code> i <code>round</code>) i w <code>assistant_audit</code> (3.6, <code>trace_id</code> = jedna tura):</p>
+<script type="text/x-code" data-lang="sql" data-title="rozkład rund, tokenów i czasu na turę (14 dni)">
+  WITH q AS (
+      SELECT question_id, max(round) - 1 AS rounds,              -- ostatnie wywołanie to odpowiedź tekstowa
+             sum(input_tokens + output_tokens) AS tokens, sum(latency_ms) AS latency_ms
+      FROM llm_usage
+      WHERE feature = 'assistant-chat' AND occurred_at >= now() - interval '14 days'
+      GROUP BY question_id
+  )
+  SELECT count(*) AS turns,
+         percentile_disc(0.95) WITHIN GROUP (ORDER BY rounds) AS p95_rounds,
+         percentile_disc(0.99) WITHIN GROUP (ORDER BY rounds) AS p99_rounds,
+         percentile_disc(0.99) WITHIN GROUP (ORDER BY tokens) AS p99_tokens,
+         percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99_latency_ms,
+         round(100.0 * count(*) FILTER (WHERE rounds > 5) / count(*), 2) AS pct_over_5_rounds
+  FROM q;
+  -- wywołania i propozycje na turę: ten sam wzorzec na assistant_audit, GROUP BY trace_id,
+  -- count(*) FILTER (WHERE event_type = 'TOOL_CALL' / 'ACTION_PROPOSED')
+</script>
+<p>Z metryk: <code>histogram_quantile(0.99, sum by (le) (rate(helpdesk_assistant_tool_rounds_bucket[1d])))</code>. Przykład po dwóch tygodniach pilotażu:</p>
+<table>
+  <tr><th>Wymiar</th><th>p50</th><th>p95</th><th>p99</th><th>max</th><th>Limit</th><th>Ucięte</th></tr>
+  <tr><td>Rundy</td><td>1</td><td>3</td><td>4</td><td>9</td><td>5</td><td>0,4%</td></tr>
+  <tr><td>Wywołania narzędzi</td><td>2</td><td>5</td><td>7</td><td>19</td><td>12</td><td>0,1%</td></tr>
+  <tr><td>Propozycje</td><td>0</td><td>1</td><td>2</td><td>6</td><td>3</td><td>0,2%</td></tr>
+  <tr><td>Tokeny tury</td><td>6 100</td><td>14 800</td><td>21 300</td><td>58 000</td><td>30 000</td><td>0,3%</td></tr>
+  <tr><td>Czas tury</td><td>3,2 s</td><td>11 s</td><td>24 s</td><td>51 s</td><td>40 s</td><td>0,2%</td></tr>
+</table>
+<p>Przejrzyj ręcznie 20 tur powyżej p99: pętle i ataki można uciąć, a uprawnione zadania („przypisz te 6 zgłoszeń do mnie”) to decyzja produktowa. Nowy limit przez tydzień tylko licz (<code>helpdesk.assistant.loop.would_stop</code>), potem egzekwuj. Cel: poniżej 0,5% uciętych tur na limit. Rozkład rund sprawdzaj po każdej zmianie promptu, modelu i narzędzi (raport evali, 2.8 i 3.7).</p>
+<div class="box warn"><span class="label">Pułapka: limit z maksimum</span><p>Limit równy maksimum z danych („raz było 9 rund”) jest bezużyteczny: maksimum to zwykle właśnie zapętlenie. Limit wyznacza p99 ruchu uprawnionego plus zapas.</p></div>
+
+<h2>Kill switch akcji: trzy poziomy</h2>
+<p>Limity chronią turę. Przy problemie systemowym (nowy model proponuje dziwne zmiany, kampania prompt injection, błąd wykonawcy akcji) potrzebny jest <dfn data-t="kill-switch">kill switch</dfn>: wyłącznik, który bez deployu zatrzymuje wszystkie akcje zapisu asystenta. Porównanie z mechanizmami z 1.5:</p>
+<table>
+  <tr><th></th><th><code>ai.enabled</code> (1.5)</th><th><dfn data-t="circuit-breaker">Circuit breaker</dfn> (1.5)</th><th>Kill switch akcji (3.2)</th></tr>
+  <tr><td>Co zatrzymuje</td><td>Całe AI: czat, streszczenia, triage</td><td>Wywołania LLM przy awarii dostawcy</td><td>Tylko akcje zapisu asystenta</td></tr>
+  <tr><td>Kto włącza</td><td>Admin (decyzja)</td><td>Automat (statystyka błędów)</td><td>Admin albo alert</td></tr>
+  <tr><td>Powrót</td><td>Ręczny</td><td>Automatyczny (HALF_OPEN)</td><td>Tylko ręczny</td></tr>
+  <tr><td>Czytanie przez czat</td><td>Nie działa</td><td>Nie działa w czasie OPEN</td><td>Działa</td></tr>
+  <tr><td>Oczekujące propozycje</td><td>Bez zmian</td><td>Bez zmian</td><td>Wygasają (<code>EXPIRED</code>)</td></tr>
+</table>
+<p>Przy „agent proponuje złe zmiany” nie odbierasz ludziom czatu, który dobrze odpowiada na pytania. To <dfn data-t="feature-flag">feature flag</dfn> o trzech poziomach:</p>
+<script type="text/x-code" data-lang="sql" data-title="V32__ai_actions_kill_switch.sql (numer: kolejny wolny)">
+  -- poziom 2: per tenant; domyślnie false = świadome włączanie w rolloucie
+  ALTER TABLE tenants ADD COLUMN ai_actions_enabled boolean NOT NULL DEFAULT false;
+
+  -- poziom 1 i 3: globalnie i per typ akcji, w system_settings z 1.5 (pozostałe kolumny jak tam)
+  INSERT INTO system_settings (key, value) VALUES
+      ('ai.actions.enabled', 'false'),                -- włączasz po wdrożeniu, endpointem admina
+      ('ai.actions.disabled_types', '')               -- np. 'ADD_COMMENT,ASSIGN'
+  ON CONFLICT (key) DO NOTHING;
+  -- seed dev: Acme ai_actions_enabled = true; Globex false (i tak nie ma czatu, M2)
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AiAvailability.kt (dopisane do klasy z 1.5)">
+  enum class ActionsStatus { ENABLED, DISABLED_GLOBALLY, DISABLED_FOR_TENANT }
+  class AssistantActionsDisabledException(val status: ActionsStatus) : RuntimeException("Akcje asystenta wyłączone: $status")
+
+  // w klasie AiAvailability:
+  private val settings = Caffeine.newBuilder().expireAfterWrite(Duration.ofSeconds(15)).build<String, String>(::readSetting)
+  private fun readSetting(key: String): String =
+      jdbc.query("select value from system_settings where key = ?", { rs, _ -> rs.getString(1) }, key).firstOrNull().orEmpty()
+
+  fun actionsStatus(tenantId: UUID): ActionsStatus = actionsStatus(tenantId) { settings.get(it) }
+
+  fun isActionTypeEnabled(type: AssistantActionType): Boolean = type !in parseTypes(settings.get("ai.actions.disabled_types"))
+
+  /** Bez cache: potwierdzenie (3.5) i job wygaszający. */
+  fun requireActionAllowed(tenantId: UUID, type: AssistantActionType) {
+      val status = actionsStatus(tenantId, ::readSetting)
+      if (status != ActionsStatus.ENABLED) throw AssistantActionsDisabledException(status)
+      if (type in parseTypes(readSetting("ai.actions.disabled_types"))) throw AssistantActionsDisabledException(ActionsStatus.DISABLED_GLOBALLY)
+  }
+
+  fun invalidate() = settings.invalidateAll()
+
+  private fun actionsStatus(tenantId: UUID, read: (String) -> String): ActionsStatus {
+      if (!read("ai.enabled").toBoolean() || !read("ai.actions.enabled").toBoolean()) return ActionsStatus.DISABLED_GLOBALLY
+      val t = tenants.get(tenantId)                        // TenantSettings + nowe pole aiActionsEnabled
+      return if (t.aiEnabled && t.aiActionsEnabled) ActionsStatus.ENABLED else ActionsStatus.DISABLED_FOR_TENANT
+  }
+
+  private fun parseTypes(raw: String): Set<AssistantActionType> = raw.split(',').map(String::trim).filter(String::isNotEmpty)
+      .mapNotNull { name -> AssistantActionType.entries.find { it.name == name }
+          ?: null.also { log.error("Nieznany typ akcji: {}", name) } }.toSet()   // literówka nie może przejść cicho
+</script>
+<ul>
+  <li><strong>Brak klucza = wyłączone</strong> (<code>"".toBoolean() == false</code>): zasada <dfn data-t="fail-closed">fail closed</dfn>.</li>
+  <li><strong>Szerszy wyłącznik wygrywa:</strong> <code>ai.enabled = false</code> wyłącza też akcje, <code>tenants.ai_enabled = false</code> daje <code>DISABLED_FOR_TENANT</code>.</li>
+  <li><code>TenantSettings</code> dostaje pole <code>aiActionsEnabled</code>; jeśli <code>TenantSettingsApi.get</code> ma cache, unieważniaj go razem z <code>settings</code>.</li>
+</ul>
+
+<h2>Propagacja: cache, wiele instancji, LISTEN/NOTIFY</h2>
+<p>Cache 15 s (jak <code>ai.enabled</code> w 1.5) oznacza, że po kliknięciu „wyłącz” każda replika może jeszcze przez 15 s budować zestawy z akcjami, plus czas trwającej tury. Dla wyłącznika awaryjnego to sporo. Opcje:</p>
+<table>
+  <tr><th>Mechanizm</th><th>Propagacja</th><th>Uwagi</th></tr>
+  <tr><td>Sam TTL cache</td><td>≤ 15 s</td><td>Zero infrastruktury; zostaje zawsze jako siatka</td></tr>
+  <tr><td>Postgres <dfn data-t="listen-notify">LISTEN/NOTIFY</dfn></td><td>&lt; 1 s</td><td>1 stałe połączenie na instancję; nie działa przez PgBouncer w trybie transakcyjnym</td></tr>
+  <tr><td>Redis pub/sub</td><td>&lt; 1 s</td><td>Nowa zależność; wiadomość ginie przy rozłączeniu</td></tr>
+  <tr><td>Service Bus / Kafka (topic)</td><td>1–2 s</td><td>Gdy broker już jest w systemie</td></tr>
+</table>
+<p>HelpDesk ma Postgresa, więc wybieramy LISTEN/NOTIFY: <code>NOTIFY</code> wysłane w transakcji trafia do sesji, które wykonały <code>LISTEN</code> na tym kanale, dopiero po commicie, więc cache nie zostanie unieważniony przed zapisem zmiany.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AiSettingsListener.kt">
+  /** Stałe połączenie poza pulą Hikari: nie zabiera połączeń żądaniom. */
+  @Component
+  class AiSettingsListener(private val props: DataSourceProperties, private val availability: AiAvailability) : SmartLifecycle {
+      @Volatile private var running = false
+      private val thread = Thread.ofVirtual().name("ai-settings-listener").unstarted(::loop)
+
+      override fun start() { running = true; thread.start() }
+      override fun stop() { running = false; thread.interrupt() }
+      override fun isRunning() = running
+
+      private fun loop() {
+          while (running) {
+              try {
+                  DriverManager.getConnection(props.url, props.username, props.password).use { c ->
+                      c.createStatement().use { it.execute("LISTEN ai_settings_changed") }
+                      availability.invalidate()                         // po (ponownym) połączeniu mogło coś umknąć
+                      val pg = c.unwrap(PGConnection::class.java)
+                      while (running) {
+                          if (!pg.getNotifications(5_000).isNullOrEmpty()) availability.invalidate()   // czeka do 5 s
+                      }
+                  }
+              } catch (e: SQLException) {
+                  log.warn("Nasłuch ai_settings_changed przerwany, ponawiam za 2 s", e)
+                  runCatching { Thread.sleep(2_000) }
+              }
+          }
+      }
+  }
+</script>
+<p><code>PGConnection.getNotifications(timeoutMillis)</code> to API sterownika pgjdbc (sprawdź w dokumentacji swojej wersji). Unieważnienie po każdym połączeniu jest kluczowe, bo powiadomienia z czasu rozłączenia przepadają. Mimo to projektujemy system tak, jakby cache mógł być nieaktualny: każda warstwa sprawdza kill switch sama.</p>
+
+<h2>Cztery skutki włączenia kill switcha</h2>
+<p>Każdy z czterech skutków z kontraktu M3 chroni przed czymś innym.</p>
+<h3>1. Narzędzia zapisu znikają z kolejnych żądań</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantToolset.forRequest (fragment z 3.1: filtr kill switcha)">
+  companion object {
+      val WRITE_TOOLS: Map<String, AssistantActionType> = mapOf(
+          "proposeComment" to AssistantActionType.ADD_COMMENT,
+          "proposeStatusChange" to AssistantActionType.CHANGE_STATUS,
+          "proposePriorityChange" to AssistantActionType.CHANGE_PRIORITY,
+          "proposeAssignment" to AssistantActionType.ASSIGN,
+      )
+  }
+
+  private fun allowedWriteTools(ctx: AssistantToolContext, byRole: List<ToolCallback>): List<ToolCallback> =
+      if (availability.actionsStatus(ctx.tenantId) != ActionsStatus.ENABLED) emptyList()
+      else byRole.filter { availability.isActionTypeEnabled(WRITE_TOOLS.getValue(it.toolDefinition.name())) }
+</script>
+<p>Model nie wywoła narzędzia, którego nie zna. Zestaw przechodzi na wariant <code>tools-v3-read</code>, co zmienia prefiks i chwilowo obniża trafienia <dfn data-t="prompt-caching">prompt caching</dfn> (2.4); w incydencie to akceptowalne. W zmiennej części promptu (na końcu) dopisz „Akcje zapisu: niedostępne”, żeby model umiał wyjaśnić, dlaczego nie przygotuje zmiany.</p>
+<h3>2. Potwierdzenie zwraca 403</h3>
+<p><code>AssistantActionExecutor.confirm</code> (3.5) na początku woła <code>availability.requireActionAllowed(action.tenantId, action.type)</code> <strong>bez cache</strong>. Wyjątek mapujemy na <dfn data-t="problem-detail">ProblemDetail</dfn> 403 <code>https://helpdesk.example/problems/assistant-actions-disabled</code> z polem <code>reason</code>. To obrona przed propozycjami sprzed przełączenia i replikami z nieaktualnym cache. Do uzgodnienia w 3.5: powtórzenie z tym samym <code>Idempotency-Key</code> dla akcji wykonanej przed przełączeniem może zwrócić zapisany wynik.</p>
+<h3>3. Oczekujące propozycje wygasają</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/actions/KillSwitchExpiryJob.kt">
+  @Component
+  class KillSwitchExpiryJob(private val jdbc: NamedParameterJdbcTemplate, private val tx: TransactionTemplate,
+                            private val availability: AiAvailability, private val audit: AssistantAuditLog) {
+
+      @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+      fun onChange(e: AiSettingsChanged) = expire()                    // od razu po zmianie
+      @Scheduled(fixedDelay = 60_000)
+      fun periodic() = expire()                                        // siatka: zgubione zdarzenia, zmiany w SQL
+
+      fun expire(): Int = tx.execute {
+          jdbc.jdbcTemplate.execute("select set_config('app.bypass_rls', 'on', true)")   // tryb systemowy (1.1)
+          val rows = jdbc.queryForList("""
+              UPDATE assistant_actions a
+              SET status = 'EXPIRED', decided_at = now(), error_code = 'KILL_SWITCH'
+              FROM tenants t
+              WHERE a.tenant_id = t.id AND a.status = 'PROPOSED'
+                AND (NOT :globalOn OR NOT t.ai_enabled OR NOT t.ai_actions_enabled
+                     OR a.type = ANY (string_to_array(:disabledTypes, ',')))
+              RETURNING a.id, a.tenant_id, a.user_id, a.conversation_id, a.type
+          """, mapOf("globalOn" to availability.globalActionsOnFresh(), "disabledTypes" to availability.disabledTypesFresh()))
+          rows.forEach { audit.record(AuditEvent.actionExpired(it, resultCode = "KILL_SWITCH")) }   // kształt AuditEvent: 3.6
+          rows.size
+      }!!
+  }
+</script>
+<p>Bez tego po przywróceniu akcji ktoś zatwierdziłby propozycję z czasu incydentu. Zapytanie jest <dfn data-t="idempotency">idempotentne</dfn>: blokady wierszy sprawiają, że przy równoczesnym uruchomieniu na kilku replikach każdy wiersz zmieni i zaudytuje tylko jedna. <code>globalActionsOnFresh()</code> i <code>disabledTypesFresh()</code> czytają ustawienia bez cache.</p>
+<h3>4. Czytanie działa dalej</h3>
+<p>Czat z odczytem, streszczenia i triage działają normalnie. Sprawdzaj to testem: najprostsza implementacja (wyjątek w <code>AiAvailability.require</code>) zamieniłaby kill switch w drugie <code>ai.enabled</code>.</p>
+
+<h2>Endpoint admina i audyt</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/admin/AiAdminController.kt">
+  data class AiSettingsUpdate(
+      val actionsEnabled: Boolean? = null,
+      val disabledActionTypes: Set<AssistantActionType>? = null,      // enum: literówka = 400, nie cichy błąd
+      val tenantId: UUID? = null, val tenantActionsEnabled: Boolean? = null,
+      @field:NotBlank @field:Size(max = 500) val reason: String,       // „dlaczego” jest obowiązkowe
+  )
+  data class AiSettingsChanged(val before: AiSettingsView, val after: AiSettingsView)
+
+  @RestController
+  @RequestMapping("/api/admin/ai")
+  class AiAdminController(private val settings: AiSettingsService) {
+      @PutMapping("/settings")
+      @PreAuthorize("hasRole('ADMIN')")
+      fun update(user: CurrentUser, @Valid @RequestBody body: AiSettingsUpdate) = settings.update(user, body, source = "ADMIN_API")
+  }
+
+  @Service
+  class AiSettingsService(private val jdbc: JdbcTemplate, private val audit: AssistantAuditLog,
+                          private val events: ApplicationEventPublisher) {
+      @Transactional
+      fun update(actor: CurrentUser?, body: AiSettingsUpdate, source: String): AiSettingsView {
+          val before = read(body.tenantId)
+          body.actionsEnabled?.let { put("ai.actions.enabled", it.toString(), actor) }
+          body.disabledActionTypes?.let { put("ai.actions.disabled_types", it.map { t -> t.name }.sorted().joinToString(","), actor) }
+          if (body.tenantId != null && body.tenantActionsEnabled != null)
+              jdbc.update("update tenants set ai_actions_enabled = ? where id = ?", body.tenantActionsEnabled, body.tenantId)
+          val after = read(body.tenantId)
+          if (after == before) return after                              // bez zmian: bez audytu i powiadomień
+          audit.record(AuditEvent.killSwitchChanged(actor?.userId, body.tenantId,
+              mapOf("before" to before, "after" to after, "reason" to body.reason, "source" to source)))
+          jdbc.execute("NOTIFY ai_settings_changed")                     // wszystkie repliki, po commicie
+          events.publishEvent(AiSettingsChanged(before, after))          // job wygaszający (AFTER_COMMIT)
+          return after
+      }
+
+      private fun put(key: String, value: String, actor: CurrentUser?) = jdbc.update("""
+          INSERT INTO system_settings (key, value, updated_at, updated_by) VALUES (?, ?, now(), ?)
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now(), updated_by = excluded.updated_by
+      """, key, value, actor?.userId)                                  // null = automat (alert)
+  }
+</script>
+<ul>
+  <li><strong>Audyt <code>KILL_SWITCH_CHANGED</code></strong> idzie do <code>assistant_audit</code> (3.6) w tej samej transakcji: stan przed i po, powód, źródło. Fabryka <code>AuditEvent.killSwitchChanged</code> to skrót, pola definiuje 3.6; dla automatu <code>actor</code> jest <code>null</code>.</li>
+  <li><strong><code>reason</code> jest wymagane:</strong> „kto i dlaczego wyłączył akcje o 14:07?” ma mieć odpowiedź w bazie, nie na komunikatorze.</li>
+  <li><code>GET /api/assistant/status</code> (1.5) dostaje pola <code>actions</code> i <code>disabledActionTypes</code>.</li>
+</ul>
+
+<h2>Automatyczne wyzwolenie z alertu</h2>
+<p>Incydent o 3:00 w nocy zauważy najpierw metryka, a zanim dyżurny zareaguje, agent przygotuje setki propozycji. Dlatego kill switch można wyzwolić z alertu: <dfn data-t="alertmanager">Alertmanager</dfn> (komponent Prometheusa, który grupuje alerty i rozsyła je do odbiorców) wywoła webhook aplikacji. Licznik <code>helpdesk.assistant.actions</code> (tagi <code>tenant</code>, <code>type</code>, <code>status</code>) zwiększamy przy każdej zmianie statusu akcji; odsetek odrzuceń przez ludzi (<code>REJECTED</code>) to dobry sygnał na zgłoszenie, ale nie do automatu.</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts/helpdesk-actions.rules.yml (Prometheus)">
+  groups:
+    - name: helpdesk-ai-actions
+      rules:
+        - alert: AssistantProposalSpike            # tenant: 5× więcej niż wczoraj, min. 50
+          expr: |
+            sum by (tenant) (increase(helpdesk_assistant_actions_total{status="PROPOSED"}[10m])) > 50
+            and sum by (tenant) (increase(helpdesk_assistant_actions_total{status="PROPOSED"}[10m]))
+              > 5 * sum by (tenant) (increase(helpdesk_assistant_actions_total{status="PROPOSED"}[10m] offset 1d))
+          for: 5m
+          labels: { severity: page, auto_kill: tenant }
+        - alert: AssistantActionFailuresHigh       # > 20% wykonań kończy się FAILED
+          expr: |
+            sum(increase(helpdesk_assistant_actions_total{status="FAILED"}[15m]))
+              / sum(increase(helpdesk_assistant_actions_total{status=~"EXECUTED|FAILED"}[15m])) > 0.2
+            and sum(increase(helpdesk_assistant_actions_total{status=~"EXECUTED|FAILED"}[15m])) > 20
+          for: 5m
+          labels: { severity: page, auto_kill: global }
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="alertmanager.yml (fragment)">
+  route:
+    receiver: oncall
+    routes:
+      - matchers: [ 'auto_kill=~"tenant|global"' ]
+        receiver: ai-kill-switch
+        group_by: [alertname, tenant]
+        continue: true                    # dyżurny też dostaje page (następna trasa)
+      - matchers: [ 'severity="page"' ]
+        receiver: oncall
+  receivers:
+    - name: ai-kill-switch
+      webhook_configs:
+        - url: https://helpdesk.internal/api/internal/ai/kill-switch/alert
+          send_resolved: false            # powrót tylko ręczny
+          http_config: { authorization: { type: Bearer, credentials_file: /etc/alertmanager/kill-switch-token } }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/admin/KillSwitchAlertWebhook.kt">
+  data class AlertmanagerPayload(val status: String, val alerts: List<Alert>) {
+      data class Alert(val status: String, val labels: Map<String, String> = emptyMap())
+  }
+
+  @RestController
+  @RequestMapping("/api/internal/ai/kill-switch")          // osobny łańcuch security (token, nie JWT), sieć wewnętrzna
+  class KillSwitchAlertWebhook(private val settings: AiSettingsService, private val props: KillSwitchProperties) {
+      @PostMapping("/alert")
+      fun onAlert(@RequestHeader(HttpHeaders.AUTHORIZATION) auth: String?, @RequestBody body: AlertmanagerPayload): ResponseEntity<Void> {
+          if (!MessageDigest.isEqual(auth.orEmpty().toByteArray(), "Bearer ${props.webhookToken}".toByteArray()))
+              return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
+          if (!props.autoTrigger) return ResponseEntity.accepted().build()        // tryb „tylko powiadom”
+          for (a in body.alerts.filter { it.status == "firing" }) {
+              val update = when (a.labels["auto_kill"]) {
+                  "tenant" -> a.labels["tenant"]?.let { AiSettingsUpdate(tenantId = UUID.fromString(it), tenantActionsEnabled = false, reason = "auto: ${a.labels["alertname"]}") }
+                  "global" -> AiSettingsUpdate(actionsEnabled = false, reason = "auto: ${a.labels["alertname"]}")
+                  else -> null
+              }
+              update?.let { settings.update(null, it, source = "ALERTMANAGER") }    // tylko wyłącza, nigdy nie włącza
+          }
+          return ResponseEntity.ok().build()
+      }
+  }
+</script>
+<p>Automat <strong>może tylko wyłączyć</strong>. Fałszywy alarm kosztuje kilkadziesiąt minut bez akcji asystenta (zmiany można wprowadzić ręcznie), a automatyczne włączenie w trakcie incydentu mogłoby kosztować dane klientów. Ryzyka:</p>
+<ul>
+  <li><strong>Fałszywe alarmy</strong> (kampania u klienta, migracja zgłoszeń): zacznij od <code>auto-trigger: false</code> i licz, ile razy automat by zadziałał. Dla nowego tenanta <code>offset 1d</code> nie ma danych i reguła milczy.</li>
+  <li><strong>Wyłączenie wywołane przez atakującego:</strong> to odmowa usługi tylko dla funkcji dodatkowej; preferuj poziom tenanta, globalny tylko dla sygnałów systemowych.</li>
+  <li><strong>Webhook jako cel ataku:</strong> osobny token z sejfu, porównanie w stałym czasie, dostęp tylko z sieci monitoringu.</li>
+</ul>
+
+<h2>Runbook incydentu</h2>
+<p><dfn data-t="runbook">Runbook</dfn> to spisana procedura dla dyżurnego, wykonalna w stresie i bez znajomości kodu. Trzymaj go w repo i linkuj w adnotacji <code>runbook_url</code> reguł.</p>
+<table>
+  <tr><th>Krok</th><th>Kto</th><th>Co konkretnie</th></tr>
+  <tr><td>Wyzwalacz</td><td>Dyżurny lub automat</td><td>Alert akcji, zgłoszenie klienta („dziwna propozycja”), <code>INJECTION_SUSPECTED</code> w audycie (3.4)</td></tr>
+  <tr><td>Decyzja</td><td>Dyżurny, bez czekania na zgodę</td><td>W razie wątpliwości wyłącz; najwęższy zakres, który na pewno obejmuje problem: typ → tenant → globalnie</td></tr>
+  <tr><td>Wyłączenie</td><td>Dyżurny (ADMIN)</td><td><code>PUT /api/admin/ai/settings</code> z <code>reason</code> (albo przycisk w panelu admina)</td></tr>
+  <tr><td>Weryfikacja (≤ 2 min)</td><td>Dyżurny</td><td>Status <code>actions != ENABLED</code>; licznik <code>PROPOSED</code> spada do zera; brak <code>PROPOSED</code> w <code>assistant_actions</code>; nowe tury z <code>tools-v3-read</code> w <code>helpdesk.config.version</code></td></tr>
+  <tr><td>Ocena szkód</td><td>Właściciel asystenta</td><td>Akcje <code>EXECUTED</code> z okna incydentu (<code>ticket_events</code>, <code>actor_type = ASSISTANT</code>, audyt 3.6) do ręcznej weryfikacji</td></tr>
+  <tr><td>Komunikacja</td><td>Product owner</td><td>„Akcje asystenta wstrzymane, czat działa”</td></tr>
+  <tr><td>Powrót</td><td>Właściciel + druga osoba</td><td>Przyczyna usunięta, evale <code>WRITE_ACTIONS</code>/<code>INJECTION</code> zielone (3.7); najpierw tenant pilotażowy na 1 h, potem reszta</td></tr>
+  <tr><td>Po incydencie</td><td>Zespół</td><td>Postmortem, nowy przypadek w <code>cases.yaml</code>, korekta alertów</td></tr>
+</table>
+
+<h2>UI: komunikat i ukryte przyciski</h2>
+<p>Frontend nie jest zabezpieczeniem (backend zwróci 403), ale decyduje, czy incydent wygląda jak awaria. Karta propozycji przy wyłączonych akcjach chowa „Zatwierdź” i wskazuje drogę ręczną:</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/ActionCard.tsx">
+  type ActionsStatus = "ENABLED" | "DISABLED_GLOBALLY" | "DISABLED_FOR_TENANT";
+  interface AssistantStatus { status: AiStatus; actions: ActionsStatus; disabledActionTypes: AssistantActionType[] }
+
+  export function ActionCard({ action, status }: { action: ActionProposal; status: AssistantStatus }) {
+    const queryClient = useQueryClient();
+    const confirm = useConfirmAction({
+      onError: (err) => {                                  // wyścig: backend wiedział wcześniej niż UI
+        if (err instanceof ApiError && err.problem.type?.endsWith("/assistant-actions-disabled"))
+          queryClient.invalidateQueries({ queryKey: ["assistant-status"] });
+      },
+    });
+    const disabled = status.actions !== "ENABLED" || status.disabledActionTypes.includes(action.type);
+
+    if (action.status === "EXPIRED")
+      return <CardShell muted>Propozycja wygasła{action.errorCode === "KILL_SWITCH" ? ": akcje asystenta zostały wstrzymane." : "."}</CardShell>;
+    return (
+      <CardShell>
+        <ActionPreview action={action} />
+        {disabled
+          ? <p role="status">Akcje asystenta są chwilowo wstrzymane. Tę zmianę możesz wprowadzić ręcznie w zgłoszeniu.</p>
+          : <ConfirmButtons action={action} onConfirm={() => confirm.mutate(action)} pending={confirm.isPending} />}
+      </CardShell>
+    );
+  }
+</script>
+<p>Status odświeżaj co minutę (1.5), po powrocie do karty i po 403 lub <code>stopReason = KILL_SWITCH</code>. Nad czatem pokaż baner „Asystent działa w trybie tylko do odczytu”, bez zdradzania przyczyny incydentu.</p>
+
+<h2>Testy, chaos i game day</h2>
+<p>Limity i kill switch działają rzadko, więc bez testów zepsują się niezauważone. Pętlę testujemy atrapą modelu zwracającą zaprogramowane odpowiedzi, np. <code>tool_calls</code> w kółko.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AssistantToolLoopLimitsTest.kt">
+  /** Atrapa ChatModel; konstruktory sprawdź w swojej wersji (nowsze: buildery). */
+  class ScriptedChatModel(private val script: (Int) -> AssistantMessage, private val onCall: (Int) -> Unit = {}) : ChatModel {
+      val prompts = mutableListOf<Prompt>()
+      override fun call(prompt: Prompt): ChatResponse {
+          prompts += prompt
+          onCall(prompts.size)
+          return ChatResponse(listOf(Generation(script(prompts.size))),
+              ChatResponseMetadata.builder().usage(DefaultUsage(4_000, 100)).build())
+      }
+  }
+  fun toolCall(name: String, args: String) =
+      AssistantMessage("", emptyMap(), listOf(AssistantMessage.ToolCall("call_${UUID.randomUUID()}", "function", name, args)))
+
+  @Test
+  fun `ten sam tool_call w kolko konczy sie LOOP_DETECTED`() {
+      val model = ScriptedChatModel({ toolCall("getTicket", """{"ticketId":"HD-1042"}""") })
+      val r = loop.run(ChatClient.create(model), ACME_ROUTE, messages, ctx(piotr))
+      assertThat(r.stopReason).isEqualTo(StopReason.LOOP_DETECTED)
+      assertThat(r.rounds).isEqualTo(2)
+      assertThat(model.prompts).hasSize(3)                       // 1 + runda 2 z odmową + wymuszona odpowiedź
+      assertThat(r.answer).isEqualTo(StopMessages.forUser(StopReason.LOOP_DETECTED))   // atrapa ignoruje none
+  }
+
+  @Test
+  fun `kill switch w trakcie tury - zadnej propozycji, bez kolejnego wywolania modelu`() {
+      val model = ScriptedChatModel(
+          script = { toolCall("proposeStatusChange", """{"ticketId":"HD-1042","status":"RESOLVED","reason":"x"}""") },
+          onCall = { n -> if (n == 1) settings.update(admin, AiSettingsUpdate(actionsEnabled = false, reason = "test"), "TEST") })
+      val r = loop.run(ChatClient.create(model), ACME_ROUTE, messages, ctx(piotr))   // zestaw zbudowany jeszcze z akcjami
+      assertThat(r.stopReason).isEqualTo(StopReason.KILL_SWITCH)
+      assertThat(model.prompts).hasSize(1)
+      assertThat(actions.countProposed(conversationId)).isZero()
+  }
+</script>
+<p>Analogicznie: pięć <code>proposeComment</code> w jednej odpowiedzi daje <code>MAX_PROPOSALS</code> i 3 wiersze <code>PROPOSED</code>; różne argumenty w każdej rundzie dają <code>MAX_ROUNDS</code> po 7 wywołaniach (jak w 2.1); <code>DefaultUsage(12_000, 100)</code> daje <code>BUDGET</code> bez wywołania końcowego; <code>Clock</code> przesuwany w <code>onCall</code> daje <code>DEADLINE</code>. Najważniejszy test kill switcha idzie przez HTTP, z bazą z Testcontainers:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KillSwitchIT.kt">
+  @Test
+  fun `propozycja nie moze zostac zatwierdzona po wlaczeniu kill switcha`() {
+      val actionId = proposeStatusChange(piotr, "HD-1042", "WAITING_FOR_CUSTOMER")   // narzędzie z 3.1 przez ToolContext
+      val versionBefore = ticketVersion("HD-1042")
+
+      mvc.put("/api/admin/ai/settings") {
+          with(jwtOf(admin)); contentType = MediaType.APPLICATION_JSON
+          content = """{"actionsEnabled":false,"reason":"test kill switcha"}"""
+      }.andExpect { status { isOk() } }
+
+      mvc.post("/api/assistant/actions/$actionId/confirm") {
+          with(jwtOf(piotr)); header("Idempotency-Key", UUID.randomUUID().toString())
+      }.andExpect {
+          status { isForbidden() }
+          jsonPath("$.type") { value(endsWith("/assistant-actions-disabled")) }
+      }
+
+      assertThat(ticketVersion("HD-1042")).isEqualTo(versionBefore)                // zgłoszenie nietknięte
+      await().atMost(Duration.ofSeconds(5)).until { actionStatus(actionId) == "EXPIRED" }
+      assertThat(auditTypes(actionId)).contains("ACTION_EXPIRED").doesNotContain("ACTION_EXECUTED")
+  }
+</script>
+<p><code>jwtOf</code> opiera się na <code>SecurityMockMvcRequestPostProcessors.jwt()</code> z claimami jak w 1.1. Dopisz test „czytanie działa”: po wyłączeniu akcji czat zwraca 200, a żądanie do WireMocka (2.1) ma w <code>tools</code> tylko narzędzia odczytu.</p>
+<p>Testy nie sprawdzą propagacji między replikami, zachowania pod obciążeniem ani tego, czy dyżurny umie użyć runbooka. Do tego służy <dfn data-t="game-day">game day</dfn>: zaplanowane ćwiczenie awaryjne na stagingu (element chaos engineering, czyli celowego wywoływania awarii w celu sprawdzenia odporności).</p>
+<table>
+  <tr><th>Scenariusz</th><th>Oczekiwanie i pomiar</th></tr>
+  <tr><td>Wyłączenie globalne w teście obciążeniowym (k6, 3 repliki)</td><td>Czas od PUT do ostatniej tury z <code>tools-v3-staff</code>: cel &lt; 2 s, siatka 15 s</td></tr>
+  <tr><td>Zerwanie połączenia LISTEN (kill sesji w Postgresie)</td><td>Listener wraca i unieważnia cache; brak tur z akcjami po TTL</td></tr>
+  <tr><td>Sztuczny alert (<code>amtool</code>, <code>auto_kill: tenant</code>)</td><td>Wyłączony tylko ten tenant, audyt ze źródłem <code>ALERTMANAGER</code></td></tr>
+  <tr><td>Dyżurny bez uprzedzenia dostaje „dziwne propozycje”</td><td>Czas do wyłączenia, niejasne kroki runbooka</td></tr>
+</table>
+<p>Powtarzaj raz na kwartał i po większych zmianach w module <code>assistant</code>.</p>
+<div class="box tip"><span class="label">Co dalej</span><p>Agent w tle, bez człowieka przy ekranie (moduł 5), potrzebuje tych samych limitów, ale zamiast komunikatu oddaje zadanie do kolejki ręcznej, a kill switch wstrzymuje kolejkę. Pełne potwierdzenia z <code>Idempotency-Key</code>: lekcja 3.5.</p></div>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Uruchom zapytanie o rozkład tur na swoich danych (albo na 200 pytaniach ze skryptu). Wyznacz p95 i p99 rund i tokenów i sprawdź, jaki odsetek tur ucięłyby limity z kontraktu.</li>
+  <li>Napisz test, w którym atrapa zwraca <code>proposeStatusChange</code> z tym samym statusem i za każdym razem innym <code>reason</code>. Sprawdź <code>LOOP_DETECTED</code>, potem usuń <code>reason</code> z <code>ignored</code> i zobacz, który limit zadziała zamiast niego.</li>
+  <li>Uruchom dwie instancje lokalnie, wyłącz akcje na pierwszej i zmierz, po jakim czasie druga przestaje wysyłać narzędzia zapisu: z listenerem i bez niego (sam TTL).</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego limit propozycji jest sprawdzany w dekoratorze narzędzia, a nie tylko między rundami?</p>
+  <button>Bo dekorator działa szybciej niż pętla</button>
+  <button>Bo między rundami nie wiadomo, które narzędzia są narzędziami zapisu</button>
+  <button>Bo model może poprosić o kilka propozycji w jednej odpowiedzi (równoległe wywołania), więc limit rund ich nie zatrzyma</button>
+  <button>Bo tak wymaga API dostawcy</button>
+  <p class="explain">Jedna odpowiedź może zawierać wiele <code>tool_calls</code>. Kontrola przy każdym wywołaniu wykona 3 propozycje, a czwartej odpowie <code>LIMIT_EXCEEDED</code>.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Administrator włączył kill switch akcji (<code>ai.actions.enabled = false</code>). Co się dzieje?</p>
+  <button>Narzędzia zapisu znikają z nowych żądań, potwierdzenia zwracają 403, oczekujące propozycje wygasają, a czat dalej odpowiada na pytania</button>
+  <button>Cały asystent przestaje działać, jak przy <code>ai.enabled = false</code></button>
+  <button>Nowe propozycje nie powstają, ale już przygotowane można nadal zatwierdzić</button>
+  <p class="explain">Kill switch jest węższy niż <code>ai.enabled</code>: zatrzymuje tylko akcje zapisu. Wygaszenie propozycji chroni przed zatwierdzeniem zmian z czasu incydentu.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Narzędzia zapisu i tak znikają z toolsetu. Po co endpoint potwierdzenia sprawdza kill switch, i to bez cache?</p>
+  <button>Żeby frontend nie musiał odświeżać statusu</button>
+  <button>Bo cache Caffeine nie działa w transakcjach</button>
+  <button>To nadmiarowe, wystarczy usunięcie narzędzi</button>
+  <button>Bo propozycje mogły powstać tuż przed przełączeniem albo na instancji z nieaktualnym cache; każda warstwa musi bronić się sama</button>
+  <p class="explain">Obrona w głąb: usunięcie narzędzi nie unieważnia istniejących propozycji, a cache innych replik może być nieaktualny.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Jak najrozsądniej ustawić limit rund w turze?</p>
+  <button>Na maksimum zaobserwowanym w danych, żeby nikomu nie przeszkadzał</button>
+  <button>Powyżej p99 ruchu uprawnionego, z zapasem, po sprawdzeniu, jaki odsetek tur zostałby ucięty, najlepiej najpierw w trybie obserwacji</button>
+  <button>Na medianę, żeby wymusić krótkie odpowiedzi</button>
+  <button>W prompcie, prosząc model o maksymalnie 5 rund</button>
+  <p class="explain">Maksimum to zwykle zapętlenie, a mediana ucięłaby połowę uprawnionych zadań. Tryb obserwacji pokazuje skutki, zanim dotkną użytkowników.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Dlaczego automat uruchamiany z alertu może kill switch tylko wyłączać, a nigdy włączać?</p>
+  <button>Bo Alertmanager nie wysyła powiadomień o rozwiązaniu alertu</button>
+  <button>Bo włączenie wymaga restartu aplikacji</button>
+  <button>Bo fałszywe wyłączenie kosztuje mało (ludzie zmieniają zgłoszenia ręcznie), a automatyczne włączenie w trakcie incydentu może kosztować dane klientów; powrót wymaga decyzji człowieka</button>
+  <p class="explain">Decyduje asymetria kosztów błędów. Ustąpienie objawu („resolved”) nie oznacza usunięcia przyczyny.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
