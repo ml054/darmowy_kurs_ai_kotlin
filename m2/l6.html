@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.6 Pomiar kosztu i opóźnień – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="2.6">
+<main>
+<p class="meta">Lekcja 2.6 · ok. 65 min</p>
+<h1>Pomiar kosztu i opóźnień</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Rozłożyć koszt jednego pytania do czatu z narzędziami na składniki i policzyć go na liczbach z HelpDesk.</li>
+  <li>Rozłożyć czas odpowiedzi na etapy na podstawie trace'a i wiedzieć, który z nich warto skracać.</li>
+  <li>Zbierać tokeny i koszt z właściwych źródeł (usage, LiteLLM) i wyjaśniać różnice względem faktury.</li>
+  <li>Zbudować <code>llm_usage</code>, <code>ModelPricing</code> z wersjonowaniem cen i <code>UsageRecorder</code>, który nie spowalnia odpowiedzi.</li>
+  <li>Ustawić metryki, percentyle, dashboardy, SLO, alerty i dzienne budżety per tenant.</li>
+  <li>Oceniać dźwignie optymalizacji liczbowo, zanim cokolwiek zmienisz.</li>
+</ul></div>
+
+<h2>Dlaczego „ile to kosztuje?” wymaga osobnej lekcji</h2>
+<p>W lekcji 1.6 policzyliśmy koszt czatu z góry, na średnich, a w 1.4 dodaliśmy trace'y i prosty licznik kosztu. Po wdrożeniu narzędzi (2.1), pamięci rozmowy (2.5) i streamingu (2.3) pojawiają się pytania, na które średnia nie odpowie:</p>
+<ul>
+  <li>Dlaczego wczoraj koszt czatu wzrósł o 40% przy tej samej liczbie pytań?</li>
+  <li>Ile kosztuje AI dla Acme w tym miesiącu i czy mieści się w planie klienta?</li>
+  <li>Dlaczego część użytkowników czeka 9 s na pierwsze słowo, skoro „model odpowiada w sekundę”?</li>
+  <li>Dlaczego faktura dostawcy jest o 5% wyższa niż suma z naszego dashboardu?</li>
+</ul>
+<p>Każda odpowiedź wymaga pomiaru <strong>per wywołanie modelu</strong>, z kontekstem biznesowym (tenant, funkcja, rozmowa, wersja konfiguracji), zapisanego trwale i przeliczonego według ceny z dnia wywołania.</p>
+<div class="box tip"><span class="label">Zasada lekcji</span><p>Koszt i opóźnienie to cechy funkcji, a nie infrastruktury. Raportujesz je w jednostkach biznesu: koszt na pytanie, na rozmowę, na tenanta, czas do pierwszego słowa widocznego dla użytkownika. <dfn data-t="token">Tokeny</dfn> i milisekundy pojedynczego wywołania to surowiec, z którego te liczby powstają.</p></div>
+
+<h2>Anatomia kosztu jednego pytania</h2>
+<p>Anna z Acme (<code>CUSTOMER</code>) w trzeciej wiadomości rozmowy pyta: „Jaki jest status HD-1042 i czy SLA jest zagrożone?”. Asystent wywołuje <code>getTicket</code> i <code>getSlaStatus</code> z lekcji 2.1 i odpowiada. Dla użytkownika to jedno pytanie, dla rachunku dwa płatne wywołania modelu, bo <dfn data-t="tool-calling">tool calling</dfn> (model prosi aplikację o wywołanie funkcji, a potem dostaje wynik) wymaga rundy na żądanie narzędzi i rundy na odpowiedź. Każde wywołanie wysyła cały <dfn data-t="prompt">prompt</dfn> od nowa, w kolejności z 2.4 (stałe na początku, zmienne na końcu):</p>
+<table>
+  <tr><th>Składnik</th><th>Tokeny</th><th>Uwagi</th></tr>
+  <tr><td>Definicje 4 narzędzi (opisy, schematy JSON)</td><td>900</td><td>W każdym wywołaniu, nawet gdy model nie użyje narzędzia</td></tr>
+  <tr><td><dfn data-t="system-prompt">System prompt</dfn> <code>assistant-chat/v3</code></td><td>1 400</td><td>Instrukcje, reguły, styl</td></tr>
+  <tr><td>Część zmienna: data, rola, organizacja</td><td>80</td><td>Za stałym prefiksem</td></tr>
+  <tr><td>Historia: dwie poprzednie tury (przycięta, 2.5)</td><td>1 500</td><td>Pytania, odpowiedzi, wyniki narzędzi</td></tr>
+  <tr><td>Bieżące pytanie</td><td>40</td><td></td></tr>
+  <tr><td>Żądanie narzędzi (wyjście rundy 1)</td><td>70</td><td>W rundzie 2 wraca jako wejście</td></tr>
+  <tr><td>Wyniki narzędzi</td><td>630</td><td><code>getTicket</code> 450 + <code>getSlaStatus</code> 180</td></tr>
+  <tr><td>Odpowiedź (wyjście rundy 2)</td><td>220</td><td></td></tr>
+</table>
+<p>Ceny ilustracyjne jak w 1.6 (sprawdź aktualny cennik): <code>helpdesk-default</code> 3,00 USD za milion tokenów wejścia (MTok), 0,30 USD za MTok wejścia z cache, 15,00 USD za MTok wyjścia.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="koszt jednego pytania (ceny ilustracyjne)">
+  runda 1: wejście 900 + 1 400 + 80 + 1 500 + 40 = 3 920 tok    wyjście  70 tok
+  runda 2: wejście 3 920 + 70 + 630              = 4 620 tok    wyjście 220 tok
+  razem:   wejście 8 540 tok, wyjście 290 tok
+
+  A) bez cache:            8 540 × 3,00 + 290 × 15                          = 0,02997 USD
+  B) cache stałego prefiksu (narzędzia + system = 2 300 tok w obu rundach):
+                           4 600 × 0,30 + 3 940 × 3,00 + 290 × 15          = 0,01755 USD  (−41%)
+  C) cache wspólnego prefiksu rozmowy (z cache: runda 1 3 880, runda 2 3 920):
+                           7 800 × 0,30 +   740 × 3,00 + 290 × 15          = 0,00891 USD  (−70%)
+  (wszystkie iloczyny dzielone przez 1 000 000)
+</script>
+<p>Wariant C jest możliwy, bo w obrębie rozmowy prompt bieżącego wywołania zaczyna się od całego promptu poprzedniego. Czy dostawca to wykorzysta, zależy od <dfn data-t="prompt-caching">prompt caching</dfn>: jedni cache'ują najdłuższy wspólny prefiks automatycznie, inni wymagają jawnego punktu cache; cache żyje kilka minut. Nie zgaduj, tylko czytaj <code>cached_tokens</code> z odpowiedzi.</p>
+<table>
+  <tr><th>Wariant B: składnik</th><th>Obliczenie</th><th>USD</th><th>Udział</th></tr>
+  <tr><td>Narzędzia + system prompt (z cache)</td><td>2 × 2 300 × 0,30</td><td>0,00138</td><td>8%</td></tr>
+  <tr><td>Historia rozmowy</td><td>2 × 1 500 × 3,00</td><td>0,00900</td><td>51%</td></tr>
+  <tr><td>Część zmienna + pytanie</td><td>2 × 120 × 3,00</td><td>0,00072</td><td>4%</td></tr>
+  <tr><td>Żądanie i wyniki narzędzi jako wejście</td><td>700 × 3,00</td><td>0,00210</td><td>12%</td></tr>
+  <tr><td>Wyjście</td><td>290 × 15,00</td><td>0,00435</td><td>25%</td></tr>
+</table>
+<p>Wniosek nieintuicyjny: w trzeciej turze połowę kosztu stanowi historia, a nie pytanie ani odpowiedź. Historia jedzie w <em>każdej</em> rundzie, więc każda dodatkowa runda narzędzi mnoży jej koszt. Najmocniejsze dźwignie to liczba rund i długość historii, a nie skracanie system promptu.</p>
+<p>Jeśli pod aliasem działa <dfn data-t="reasoning-model">model rozumujący</dfn>, dochodzą niewidoczne tokeny rozumowania rozliczane jak wyjście: 400 na rundę to 800 × 15 / 1e6 = 0,012 USD, czyli wariant B rośnie do 0,0296 USD (+68%). W API zgodnym z OpenAI tokeny rozumowania są <strong>częścią</strong> <code>completion_tokens</code>, a <code>cached_tokens</code> częścią <code>prompt_tokens</code>. Nie dodawaj ich drugi raz.</p>
+<p>W odpowiedzi rundy 2 zobaczysz np. <code>"prompt_tokens": 4620, "completion_tokens": 220, "prompt_tokens_details": {"cached_tokens": 3840}</code>. Jest 3 840 zamiast 3 920, bo dostawcy cache'ują w blokach (np. po 128 tokenów), więc rzeczywistość zawsze trochę odbiega od kartki. Pole <code>model</code> to faktyczny model, a nie <dfn data-t="alias">alias</dfn>, o który prosiliśmy.</p>
+
+<h2>Anatomia opóźnienia: waterfall z trace'a</h2>
+<p>Ten sam przykład jako <dfn data-t="trace">trace</dfn> endpointu <code>POST /api/assistant/chat/stream</code> z 2.3 (wartości ilustracyjne):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="waterfall: „Jaki jest status HD-1042 i czy SLA jest zagrożone?”">
+  0 ms           1 000          2 000          3 000          4 000          5 000
+  |--------------|--------------|--------------|--------------|--------------|---
+  http POST /api/assistant/chat/stream ██████████████████████████████████████ 5 310
+   tenants.get + availability + route  ▏ 9
+   limiter + budżet                    ▏ 2
+   ConversationStore.load              ▏ 14
+   PII redact (2.7)                     █ 48
+   chat helpdesk-default (runda 1)      ███████████▌ 1 760   TTFT 940, 70 tok
+   tool getTicket                                  ▏ 26
+   tool getSlaStatus                               ▏ 31
+   chat helpdesk-default (runda 2)                  ███████████████████████ 3 390
+                                                    TTFT 1 080 → pierwsze słowo u użytkownika ≈ 2 970 ms
+                                                    220 tok / 2,31 s ≈ 95 tok/s
+   ConversationStore.save + UsageRecorder.record (async)                     ▏ 6
+</script>
+<table>
+  <tr><th>Składnik</th><th>Tu</th><th>Od czego zależy</th><th>Jak skrócić</th></tr>
+  <tr><td>Kolejka i limiter</td><td>2 ms</td><td><dfn data-t="bulkhead">Bulkhead</dfn> czatu nie kolejkuje (1.5). Kolejka u dostawcy wychodzi jako dłuższy TTFT</td><td>Obserwuj TTFT w szczycie</td></tr>
+  <tr><td><dfn data-t="ttft">TTFT</dfn> rundy</td><td>0,9–1,1 s</td><td>Sieć, obciążenie dostawcy, długość wejścia</td><td>Krótszy kontekst; cache prefiksu skraca też TTFT</td></tr>
+  <tr><td>Generowanie</td><td>0,8 + 2,3 s</td><td>Tokeny wyjścia ÷ tok/s</td><td>Krótsze odpowiedzi, mniejszy model</td></tr>
+  <tr><td>Rundy narzędzi</td><td>2</td><td>Ile razy model prosi o narzędzia</td><td>Kilka narzędzi w jednej rundzie</td></tr>
+  <tr><td>Sieć i proxy</td><td>12 ms + RTT</td><td>LiteLLM, TLS, odległość do regionu (RTT, czas tam i z powrotem, UE–USA 100–150 ms)</td><td>Keep-alive, proxy w tym samym klastrze</td></tr>
+</table>
+<p>Najważniejsze: <strong>przy narzędziach pierwsze słowo pojawia się dopiero po całej pierwszej rundzie i narzędziach</strong>. TTFT wywołania to ok. 1 s, a użytkownik czeka prawie 3 s. Dlatego mierzymy dwa TTFT: modelu (per runda, kolumna <code>ttft_ms</code>) i użytkownika (od przyjęcia żądania do pierwszego fragmentu tekstu wysłanego przez <dfn data-t="sse">SSE</dfn>, metryka <code>helpdesk.assistant.ttft</code>). Ten drugi jest podstawą SLO. Przygotowanie (73 ms) oraz narzędzia i baza (57 ms), o które martwimy się najbardziej, to razem ok. 2% czasu.</p>
+<div class="box warn"><span class="label">„Równoległe narzędzia” to dwie różne rzeczy</span><p>Pierwsza: model prosi o kilka narzędzi w <em>jednej</em> rundzie (w API OpenAI <code>parallel_tool_calls</code>). To oszczędza całą rundę: ok. 1,5 s i 0,008 USD w przykładzie. Druga: aplikacja wykonuje je współbieżnie. Domyślny <code>ToolCallingManager</code> Spring AI wykonuje je kolejno, ale przy 26 i 31 ms zysk byłby pomijalny. Najpierw licz rundy.</p></div>
+
+<h2>Skąd brać liczby: usage w odpowiedzi</h2>
+<p>Źródłem prawdy o tokenach jest pole <code>usage</code> odpowiedzi. Nie licz tokenów sam: <dfn data-t="tokenizer">tokenizer</dfn> jest inny w każdej rodzinie modeli, a dostawca dolicza tokeny formatowania i definicji narzędzi. Szacunek (ok. 3 znaki polskiego tekstu na token) służy tylko limiterowi i sytuacjom, gdy usage nie przyszło. W <dfn data-t="spring-ai">Spring AI</dfn> 1.x <code>Usage</code> daje <code>promptTokens</code> i <code>completionTokens</code>, a szczegóły (<code>cached_tokens</code>, <code>reasoning_tokens</code> w formacie <dfn data-t="chat-completions">Chat Completions</dfn>) są w „natywnym” usage modułu OpenAI. <code>ChatResponseMetadata</code> ma też <code>model</code> (faktyczny model) i <code>id</code> (do korelacji z logami proxy).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/UsageExtractor.kt">
+  enum class UsageSource { PROVIDER, ESTIMATED }
+
+  data class TokenUsage(
+      val inputTokens: Int,          // prompt_tokens, ZAWIERA cached
+      val cachedInputTokens: Int,
+      val outputTokens: Int,         // completion_tokens, ZAWIERA reasoning
+      val reasoningTokens: Int,      // tylko informacyjnie
+      val source: UsageSource,
+  )
+
+  object UsageExtractor {
+      /** null = brak usage (EmptyUsage, total = 0). */
+      fun from(response: ChatResponse?): TokenUsage? {
+          val usage = response?.metadata?.usage ?: return null
+          if ((usage.totalTokens ?: 0) == 0) return null
+          val native = usage.nativeUsage as? OpenAiApi.Usage      // LiteLLM mówi API OpenAI
+          return TokenUsage(
+              inputTokens = usage.promptTokens ?: 0,
+              cachedInputTokens = native?.promptTokensDetails()?.cachedTokens() ?: 0,
+              outputTokens = usage.completionTokens ?: 0,
+              reasoningTokens = native?.completionTokenDetails()?.reasoningTokens() ?: 0,
+              source = UsageSource.PROVIDER,
+          )
+      }
+
+      fun estimate(promptChars: Int, outputChars: Int) =
+          TokenUsage(promptChars / 3, 0, outputChars / 3, 0, UsageSource.ESTIMATED)
+  }
+</script>
+<h3>Pułapka: usage skumulowane przy wewnętrznej pętli narzędzi</h3>
+<p>Domyślnie Spring AI sam wykonuje narzędzia i woła model ponownie, a aplikacja dostaje jedną końcową <code>ChatResponse</code>. W 1.0.x jej usage jest <strong>sumą</strong> rund (<code>UsageCalculator</code>), przy sumowaniu ginie natywne usage (a z nim <code>cached_tokens</code>), a skumulowane wartości trafiają też do obserwacji kolejnych rund. Sprawdź to w swojej wersji testem z dwiema rundami. Dlatego pętlę prowadzimy sami: <code>internalToolExecutionEnabled(false)</code> i <code>ToolCallingManager</code>. Każda runda to osobna <code>ChatResponse</code> z dokładnym usage, a limit 5 rund z kontraktu egzekwujemy w jednym miejscu:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantChatService.kt (fragment pętli)">
+  private fun runToolLoop(ctx: AssistantToolContext, client: ChatClient, messages: List<Message>,
+                          q: QuestionMeta): ChatResponse {
+      val options = OpenAiChatOptions.builder()
+          .model(ctx.route.alias)
+          .toolCallbacks(ToolCallbacks.from(ticketReadTools).toList())
+          .toolContext(mapOf(AssistantToolContext.KEY to ctx))
+          .internalToolExecutionEnabled(false)          // pętla po naszej stronie → usage per runda
+          .httpHeaders(spendHeaders(ctx, q))            // tagi i metadane LiteLLM jak w 1.3 + question_id
+          .maxTokens(props.maxOutputTokens)
+          .build()
+      var prompt = Prompt(messages, options)
+      var round = 1
+      while (true) {
+          val started = System.nanoTime()
+          val response = client.prompt(prompt).call().chatResponse() ?: error("Pusta odpowiedź modelu")
+          usageRecorder.record(LlmCallRecord(
+              question = q, tenantId = ctx.tenantId, userId = ctx.user.userId, conversationId = ctx.conversationId,
+              modelAlias = ctx.route.alias, providerModel = response.metadata.model ?: "unknown",
+              requestId = response.metadata.id,
+              usage = UsageExtractor.from(response)
+                  ?: UsageExtractor.estimate(prompt.contents.length, response.result?.output?.text.orEmpty().length),
+              latency = Duration.ofNanos(System.nanoTime() - started), ttft = null,
+              round = round, outcome = if (response.hasToolCalls()) "TOOL_CALLS" else "OK",
+          ))
+          if (!response.hasToolCalls()) return response
+          if (round == props.maxToolRounds) throw ToolRoundsExceededException(round)
+          prompt = Prompt(toolCallingManager.executeToolCalls(prompt, response).conversationHistory(), options)
+          round++
+      }
+  }
+</script>
+<p><code>QuestionMeta</code> tworzymy raz na pytanie: <code>questionId</code> (nowy UUID), <code>feature = "assistant-chat"</code> i <code>configVersion</code> z 2.4. Pozwalają zsumować rundy pytania i porównać wersje promptu.</p>
+<h3>Streaming: usage tylko na życzenie</h3>
+<p>Przy <dfn data-t="streaming">streamingu</dfn> API zgodne z OpenAI domyślnie <strong>nie zwraca</strong> usage. Trzeba poprosić parametrem <code>stream_options: {"include_usage": true}</code>; wtedy ostatni fragment ma puste <code>choices</code> i wypełnione <code>usage</code>. W Spring AI 1.x: <code>spring.ai.openai.chat.options.stream-usage: true</code> albo <code>OpenAiChatOptions.builder().streamUsage(true)</code>. LiteLLM przyjmuje ten parametr i dla dostawców o innym formacie strumienia sam składa usage. Konsekwencja: usage przychodzi <em>po</em> ostatnim słowie, więc przy przerwanym strumieniu nie przyjdzie wcale (sekcja o przypadkach brzegowych).</p>
+
+<h2>LiteLLM: nagłówki, spend logs i własne liczenie</h2>
+<p><dfn data-t="proxy">Proxy LLM</dfn> z 1.3 liczy koszt niezależnie od nas. Według dokumentacji LiteLLM odpowiedź ma nagłówki m.in. <code>x-litellm-response-cost</code> (koszt w USD; składowe input/output/cache tylko bez streamingu), <code>x-litellm-call-id</code>, <code>x-litellm-model-group</code> (alias), <code>x-litellm-model-id</code> (wdrożenie), <code>x-litellm-attempted-retries</code>, <code>x-litellm-attempted-fallbacks</code> oraz <code>x-litellm-overhead-duration-ms</code> (narzut proxy). Spring AI nie wystawia ich w <code>ChatResponse</code> (można je zliczać interceptorem w <code>RestClientCustomizer</code>), a przy streamingu kosztu w nagłówkach nie ma, bo wychodzą przed generowaniem.</p>
+<p>Ważniejsze są <strong>spend logs</strong>: tabela <code>"LiteLLM_SpendLogs"</code> w bazie proxy z wierszem na wywołanie (m.in. <code>request_id</code>, <code>spend</code>, <code>prompt_tokens</code>, <code>completion_tokens</code>, <code>"startTime"</code>, <code>"completionStartTime"</code>, <code>model_group</code>, <code>end_user</code>, <code>metadata</code>, <code>request_tags</code>, <code>status</code>) oraz dzienne agregaty, np. <code>"LiteLLM_DailyEndUserSpend"</code>. W 1.3 wysyłamy jako <code>user</code> ID tenanta, więc <code>end_user</code> to tenant, a w metadanych dokładamy <code>question_id</code>, co pozwala dopasować rundy pytania po obu stronach.</p>
+<table>
+  <tr><th>Kryterium</th><th>Własne (<code>llm_usage</code>)</th><th>LiteLLM spend logs</th></tr>
+  <tr><td>Kontekst biznesowy</td><td>Pełny: tenant, użytkownik, rozmowa, pytanie, runda, wersja</td><td>Tylko to, co wyślesz w <code>user</code>, tagach, metadanych</td></tr>
+  <tr><td>Wywołania spoza aplikacji</td><td>Niewidoczne (<dfn data-t="eval">evale</dfn>, skrypty, inne zespoły)</td><td>Widoczne, jeśli idą przez proxy</td></tr>
+  <tr><td>Ponowienia i fallbacki w proxy</td><td>Tylko wynik końcowy</td><td>Każda próba</td></tr>
+  <tr><td>Cennik</td><td>Własny, wersjonowany, przez review</td><td>Mapa cen LiteLLM (zmienia się z wersją) lub własne ceny w <code>model_info</code></td></tr>
+  <tr><td>Zapis do cache (droższy od wejścia u części dostawców)</td><td>Pole niedostępne przez moduł OpenAI Spring AI</td><td>Liczony</td></tr>
+</table>
+<p>Potrzebujesz obu: własne liczenie odpowiada na „dlaczego” i „dla kogo”, LiteLLM daje niezależną kontrolę, a faktura dostawcy jest ostateczną prawdą.</p>
+
+<h2>Tabela llm_usage</h2>
+<p>Kontrakt modułu definiuje kolumny podstawowe. Dokładamy pola, bez których nie odpowiesz na pytania ze wstępu: ID pytania i runda, wersja konfiguracji, wersja ceny, źródło usage, ID odpowiedzi.</p>
+<script type="text/x-code" data-lang="sql" data-title="V21__llm_usage.sql">
+  CREATE TABLE llm_usage (
+      id                   uuid PRIMARY KEY,
+      occurred_at          timestamptz NOT NULL,
+      tenant_id            uuid NOT NULL,
+      user_id              uuid,                       -- null dla zadań w tle
+      feature              text NOT NULL,              -- assistant-chat, assistant-chat-summary, triage
+      conversation_id      uuid,                       -- bez FK: rozmowa znika po 30 dniach, koszt zostaje
+      model_alias          text NOT NULL,
+      provider_model       text NOT NULL,              -- pole model z odpowiedzi (fallback widać tutaj)
+      input_tokens         int  NOT NULL,              -- zawiera cached_input_tokens
+      cached_input_tokens  int  NOT NULL DEFAULT 0,
+      output_tokens        int  NOT NULL,              -- zawiera reasoning_tokens
+      cost_usd             numeric(12,6) NOT NULL,     -- zamrożony w chwili wywołania
+      latency_ms           int  NOT NULL,
+      ttft_ms              int,
+      outcome              text NOT NULL,              -- OK, TOOL_CALLS, LENGTH, CANCELLED, ERROR
+      -- rozszerzenia 2.6
+      question_id          uuid,
+      round                smallint NOT NULL DEFAULT 1,
+      reasoning_tokens     int  NOT NULL DEFAULT 0,
+      usage_source         text NOT NULL DEFAULT 'PROVIDER',   -- PROVIDER | ESTIMATED
+      config_version       text,                               -- z 2.4
+      price_version        text NOT NULL,                      -- helpdesk-default@2026-10-01
+      request_id           text
+  );
+  CREATE INDEX ix_llm_usage_tenant_time ON llm_usage (tenant_id, occurred_at);
+  CREATE INDEX ix_llm_usage_question    ON llm_usage (question_id);
+
+  CREATE TABLE tenant_ai_budgets (
+      tenant_id          uuid PRIMARY KEY REFERENCES tenants(id),
+      daily_limit_usd    numeric(10,2) NOT NULL,
+      soft_limit_pct     smallint NOT NULL DEFAULT 80 CHECK (soft_limit_pct BETWEEN 1 AND 100),
+      monthly_limit_usd  numeric(10,2),
+      updated_at         timestamptz NOT NULL DEFAULT now(),
+      updated_by         uuid NOT NULL
+  );
+</script>
+<ul>
+  <li><strong>Brak treści.</strong> Tabela nie ma promptów ani odpowiedzi, więc może żyć dłużej niż rozmowy (np. 13 miesięcy na rozliczenia, rozmowy 30 dni). <code>user_id</code> to wciąż pseudonim <dfn data-t="pii">danych osobowych</dfn>: przy usuwaniu konta ustaw go na <code>null</code>.</li>
+  <li><strong>Wolumen.</strong> 3 200 pytań dziennie po średnio 2,1 rundy to ok. 6 700 wierszy dziennie, 2,5 mln rocznie. Przy kilku funkcjach AI partycjonuj miesięcznie, żeby retencja była zwykłym <code>DROP</code> partycji.</li>
+</ul>
+
+<h2>ModelPricing: ceny z konfiguracji i wersjonowanie</h2>
+<p>Cenniki się zmieniają. Koszt historycznego wywołania musi wynikać z ceny <strong>obowiązującej w dniu wywołania</strong>: inaczej po obniżce wykres kosztów „cofnie się w czasie”, a rozliczenie klienta za poprzedni miesiąc zmieni się po fakcie. Dlatego ceny mają datę obowiązywania i historię, koszt jest liczony w chwili wywołania i zamrażany w <code>cost_usd</code>, a <code>price_version</code> mówi, której ceny użyto. Ceny poniżej są ilustracyjne.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  helpdesk:
+    ai:
+      pricing:
+        helpdesk-default:
+          effective-from: 2026-10-01
+          input-per-mtok: 3.00
+          cached-input-per-mtok: 0.30
+          output-per-mtok: 15.00
+          provider-models: ["claude-sonnet-"]        # prefiksy pola model z odpowiedzi (przykład)
+          history:
+            - { effective-from: 2026-01-01, input-per-mtok: 3.50, cached-input-per-mtok: 0.35, output-per-mtok: 17.50 }
+        helpdesk-default-backup: { effective-from: 2026-06-01, input-per-mtok: 2.50, cached-input-per-mtok: 1.25,
+                                   output-per-mtok: 10.00, provider-models: ["gpt-"] }
+        helpdesk-fast:   { effective-from: 2026-06-01, input-per-mtok: 0.40, cached-input-per-mtok: 0.04, output-per-mtok: 1.60 }
+        helpdesk-local:  { effective-from: 2026-11-01, input-per-mtok: 0.50, cached-input-per-mtok: 0.50, output-per-mtok: 2.00 }  # stawka wewnętrzna GPU
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/ModelPricing.kt">
+  data class PriceVersion(
+      @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) val effectiveFrom: LocalDate,
+      val inputPerMtok: BigDecimal, val cachedInputPerMtok: BigDecimal, val outputPerMtok: BigDecimal,
+  )
+
+  data class AliasPricing(
+      @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) val effectiveFrom: LocalDate,
+      val inputPerMtok: BigDecimal, val cachedInputPerMtok: BigDecimal, val outputPerMtok: BigDecimal,
+      val providerModels: List<String> = emptyList(),
+      val history: List<PriceVersion> = emptyList(),
+  ) {
+      fun versions() = (history + PriceVersion(effectiveFrom, inputPerMtok, cachedInputPerMtok, outputPerMtok))
+          .sortedByDescending { it.effectiveFrom }
+  }
+
+  @ConfigurationProperties("helpdesk.ai")
+  data class AiPricingProperties(val pricing: Map<String, AliasPricing> = emptyMap())
+
+  data class AppliedPrice(val alias: String, val v: PriceVersion) {
+      val label get() = "$alias@${v.effectiveFrom}"
+      fun cost(u: TokenUsage): BigDecimal =
+          ((u.inputTokens - u.cachedInputTokens).toBigDecimal() * v.inputPerMtok +
+           u.cachedInputTokens.toBigDecimal() * v.cachedInputPerMtok +
+           u.outputTokens.toBigDecimal() * v.outputPerMtok)                 // reasoning już w output
+              .divide(BigDecimal(1_000_000), 6, RoundingMode.HALF_UP)
+  }
+
+  @Component
+  class ModelPricing(private val props: AiPricingProperties) {
+      private val zone = ZoneId.of("Europe/Warsaw")
+
+      /** Cena wg FAKTYCZNEGO modelu (fallback ma inną cenę). Nieznany model → najdroższa cena + alert. */
+      fun priceFor(requestedAlias: String, providerModel: String, at: Instant): AppliedPrice {
+          val alias = props.pricing.entries.firstOrNull { (_, p) -> p.providerModels.any { providerModel.startsWith(it) } }?.key
+              ?: requestedAlias.takeIf { it in props.pricing }
+              ?: return props.pricing.keys.map { priceFor(it, "", at) }.maxBy { it.v.outputPerMtok }.copy(alias = "unknown")
+          val day = at.atZone(zone).toLocalDate()
+          val v = props.pricing.getValue(alias).versions().firstOrNull { !it.effectiveFrom.isAfter(day) }
+              ?: error("Brak ceny $alias na dzień $day")
+          return AppliedPrice(alias, v)
+      }
+  }
+</script>
+<ul>
+  <li><strong>Fail fast.</strong> Test sprawdza, że każdy alias z <code>helpdesk.ai.routing</code> (1.6) i z <code>litellm.yaml</code> ma cenę. Nowy alias bez ceny nie przejdzie CI.</li>
+  <li><strong>Zmiana ceny to pull request</strong>: bieżąca cena idzie do <code>history</code>, nowa dostaje datę.</li>
+  <li><strong>Strefa czasowa.</strong> Dostawcy fakturują zwykle w UTC, budżety liczymy w czasie polskim. Wybierz jedną konwencję dla raportów finansowych, bo dzienne sumy będą się różnić.</li>
+</ul>
+
+<h2>UsageRecorder: zapis, który nie blokuje odpowiedzi</h2>
+<p>Pomiar nie może spowalniać odpowiedzi ani jej psuć. Synchroniczny <code>INSERT</code> w każdej rundzie dodaje czas i nowy powód błędu czatu. Alternatywą o pełnej gwarancji jest <dfn data-t="outbox">transactional outbox</dfn>: zapis trafia do tabeli w tej samej transakcji co zmiana biznesowa (u nas zapis odpowiedzi do <code>assistant_messages</code> z 2.5), więc nic nie ginie. Ma jednak lukę: rundy zakończone błędem lub przerwane nie zapisują wiadomości, a też kosztowały. Wybieramy więc kolejkę w pamięci z zapisem wsadowym co sekundę. Przy awarii instancji tracimy najwyżej ok. sekundy danych, a tę lukę wyłapie rekoncyliacja z LiteLLM. Outbox rozważ, gdy <code>llm_usage</code> staje się podstawą faktur dla klientów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/UsageRecorder.kt">
+  data class QuestionMeta(val questionId: UUID, val feature: String, val configVersion: String)
+
+  data class LlmCallRecord(
+      val question: QuestionMeta, val tenantId: UUID, val userId: UUID?, val conversationId: UUID?,
+      val modelAlias: String, val providerModel: String, val requestId: String?,
+      val usage: TokenUsage, val latency: Duration, val ttft: Duration?, val round: Int, val outcome: String,
+  )
+
+  @Component
+  class UsageRecorder(
+      private val jdbc: JdbcTemplate, private val pricing: ModelPricing, private val metrics: AssistantMetrics,
+      private val budgets: TenantBudgetGuard, private val clock: Clock,
+  ) {
+      private val log = LoggerFactory.getLogger(javaClass)
+      private val queue = ArrayBlockingQueue<Array<Any?>>(20_000)
+
+      /** Wątek żądania: koszt, metryki i budżet w pamięci, wiersz do kolejki. Bez I/O. */
+      fun record(c: LlmCallRecord): BigDecimal {
+          val now = clock.instant()
+          val price = pricing.priceFor(c.modelAlias, c.providerModel, now)
+          val cost = price.cost(c.usage)
+          metrics.onLlmCall(c, price.alias, cost)
+          budgets.onSpent(c.tenantId, cost)
+          val row = arrayOf<Any?>(UUID.randomUUID(), now.atOffset(ZoneOffset.UTC), c.tenantId, c.userId,
+              c.question.feature, c.conversationId, c.modelAlias, c.providerModel, c.usage.inputTokens,
+              c.usage.cachedInputTokens, c.usage.outputTokens, cost, c.latency.toMillis(), c.ttft?.toMillis(),
+              c.outcome, c.question.questionId, c.round, c.usage.reasoningTokens, c.usage.source.name,
+              c.question.configVersion, price.label, c.requestId)
+          if (!queue.offer(row)) metrics.usageDropped()
+          return cost
+      }
+
+      @Scheduled(fixedDelay = 1_000)               // wymaga @EnableScheduling
+      fun flush() {
+          val batch = ArrayList<Array<Any?>>(1_000)
+          while (queue.drainTo(batch, 1_000) > 0) {
+              try {
+                  jdbc.batchUpdate(INSERT, batch)
+              } catch (e: DataAccessException) {
+                  log.error("Nie zapisano {} wierszy llm_usage", batch.size, e)   // zostają metryki i LiteLLM
+                  metrics.usageDropped(batch.size)
+              }
+              batch.clear()
+          }
+      }
+
+      @PreDestroy fun shutdown() = flush()
+
+      private companion object {
+          const val INSERT = """insert into llm_usage (id, occurred_at, tenant_id, user_id, feature, conversation_id,
+              model_alias, provider_model, input_tokens, cached_input_tokens, output_tokens, cost_usd, latency_ms,
+              ttft_ms, outcome, question_id, round, reasoning_tokens, usage_source, config_version, price_version,
+              request_id) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+      }
+  }
+</script>
+<ul>
+  <li><strong>Metryki i budżet aktualizujemy synchronicznie</strong> (operacje w pamięci). <strong>Kolejka jest ograniczona:</strong> gdy baza leży dłużej, wiersze są odrzucane i liczone w <code>helpdesk.llm.usage.dropped</code>, zamiast zjeść pamięć. Alert na tę metrykę jest obowiązkowy.</li>
+  <li>Błąd wywołania (np. 503) to wiersz z zerowymi tokenami i <code>outcome = ERROR</code>: bez kosztu, ale potrzebny w statystykach.</li>
+</ul>
+
+<h2>Przypadki brzegowe rozliczeń</h2>
+<h3>Przerwany strumień: płacisz za wygenerowane</h3>
+<p>Anna zamyka panel po 120 z 220 tokenów. Jeśli anulowanie dociera do dostawcy (1.5, 2.3), płacisz za całe wejście i ok. 120 tokenów wyjścia. Jeśli nie dociera (blokujący klient, proxy nieprzerywające połączenia), płacisz za wszystkie 220. W obu przypadkach fragment z usage nie przyjdzie. Zero w tabeli zaniżałoby koszt po cichu, więc zapisujemy szacunek z <code>usage_source = ESTIMATED</code> i <code>outcome = CANCELLED</code>. Technicznie: operator na <code>Flux&lt;ChatResponse&gt;</code> zlicza znaki wysłanego tekstu, zapamiętuje usage, jeśli przyjdzie, i w <code>doOnComplete</code>, <code>doOnError</code> oraz <code>doOnCancel</code> zapisuje wiersz dokładnie raz (flaga <code>AtomicBoolean</code>), z usage albo z <code>UsageExtractor.estimate</code>.</p>
+<p>Jak LiteLLM loguje strumień przerwany przez klienta (koszt części czy zero), zależy od wersji i dostawcy. Sprawdź testem: przerwij długie żądanie po sekundzie i porównaj spend log z danymi dostawcy.</p>
+<h3>Retry i fallback liczą się podwójnie</h3>
+<ul>
+  <li><strong>Ponowienie w LiteLLM po 429/503</strong> zwykle nic nie kosztuje (odrzucenie przed generowaniem). U nas jeden wiersz, w spend logs mogą być dwa.</li>
+  <li><strong>Timeout po 25 s i <dfn data-t="fallback">fallback</dfn></strong> to najdroższy scenariusz: dostawca mógł naliczyć pierwszą, nieodebraną odpowiedź, a potem płacisz za drugą na modelu zapasowym. Pierwszą zobaczysz dopiero na fakturze.</li>
+  <li><strong>Fallback zmienia cenę.</strong> Koszt liczymy według <code>provider_model</code> (stąd <code>provider-models</code> w cenniku), inaczej odpowiedzi z <code>helpdesk-default-backup</code> dostaną cenę modelu głównego.</li>
+  <li><strong>Ponowienie przez użytkownika</strong> to nowe pytanie z nowym <code>question_id</code>. Koszt udanej odpowiedzi to suma obu prób (pełna metryka „koszt na poprawne zadanie” w 5.7).</li>
+</ul>
+<h3>Brak usage w odpowiedzi</h3>
+<p>Usage bywa puste: serwery modeli lokalnych, streaming bez <code>include_usage</code>, błąd w połowie, stara wersja proxy. Spring AI zwraca wtedy <code>EmptyUsage</code> z zerami. Szacujemy, oznaczamy <code>ESTIMATED</code> i liczymy odsetek takich wywołań w metryce z alertem. Nagły wzrost zwykle oznacza, że ktoś wyłączył <code>stream-usage</code> albo podbił wersję biblioteki.</p>
+<h3>Zmiana cennika</h3>
+<p>Wcześniejsze wiersze zachowują zamrożony koszt. Gdy dostawca koryguje ceny wstecz, przeliczasz historię skryptem z tokenów, a <code>price_version</code> wskazuje wiersze do zmiany. Dlatego trzymamy tokeny, a nie tylko koszt.</p>
+<h3>Model lokalny: koszt GPU</h3>
+<p><code>helpdesk-local</code> (Globex: <code>TRIAGE</code>, <code>SUMMARY</code>) nie ma ceny za token; płacisz za GPU, czy pracuje, czy nie. Przykład ilustracyjny: maszyna z GPU za 2,80 USD/h × 730 h = 2 044 USD, z obsługą i monitoringiem ok. 2 350 USD miesięcznie. Liczymy <strong>stawkę wewnętrzną</strong>: koszt ÷ planowany wolumen tokenów ważonych (wyjście waży np. 4× wejście, bo generowanie dłużej zajmuje GPU). Przy ok. 4 700 M tokenów ważonych to 0,50 USD za M wejścia i 2,00 USD za M wyjścia, stąd wpis w cenniku. Koszt jest widoczny od razu i budżety działają, a raport miesięczny wyrównuje różnicę do faktycznego kosztu proporcjonalnie do tokenów. Niewykorzystaną moc (GPU stoi w nocy) pokazuje się zwykle jako koszt platformy.</p>
+
+<h2>Metryki Micrometer i kardynalność</h2>
+<p>Tabela jest asynchroniczna i służy analizie, a do alertów w czasie rzeczywistym są metryki. Kontrakt ustala: <code>gen_ai.client.token.usage</code> i <code>gen_ai.client.operation.duration</code> (instrumentacja Spring AI wg <dfn data-t="semconv">konwencji OTel</dfn>, 1.4), <code>helpdesk.assistant.ttft</code> (Timer) i <code>helpdesk.llm.cost</code> (Counter z tagami <code>tenant</code>, <code>feature</code>, <code>model</code>). Dokładamy trzy: tokeny z podziałem na typy (Spring AI nie rozróżnia cache), licznik pytań i rozkład liczby rund.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/AssistantMetrics.kt">
+  @Component
+  class AssistantMetrics(private val registry: MeterRegistry) {
+
+      fun onLlmCall(c: LlmCallRecord, pricedAlias: String, cost: BigDecimal) {
+          val f = c.question.feature
+          Counter.builder("helpdesk.llm.cost").baseUnit("usd")
+              .tags("tenant", c.tenantId.toString(), "feature", f, "model", pricedAlias)
+              .register(registry).increment(cost.toDouble())
+          tokens(f, pricedAlias, "input", c.usage.inputTokens - c.usage.cachedInputTokens)
+          tokens(f, pricedAlias, "cached_input", c.usage.cachedInputTokens)
+          tokens(f, pricedAlias, "output", c.usage.outputTokens)
+          if (c.usage.source == UsageSource.ESTIMATED) registry.counter("helpdesk.llm.usage.estimated", "feature", f).increment()
+      }
+
+      /** Raz na pytanie, także zakończone błędem. */
+      fun onQuestion(feature: String, configVersion: String, outcome: String, rounds: Int) {
+          registry.counter("helpdesk.assistant.questions",
+              "feature", feature, "config_version", configVersion, "outcome", outcome).increment()
+          DistributionSummary.builder("helpdesk.assistant.tool.rounds").tag("feature", feature)
+              .register(registry).record(rounds.toDouble())
+      }
+
+      fun ttft(feature: String): Timer = Timer.builder("helpdesk.assistant.ttft")
+          .publishPercentileHistogram()
+          .serviceLevelObjectives(Duration.ofSeconds(2), Duration.ofSeconds(4), Duration.ofSeconds(8))
+          .maximumExpectedValue(Duration.ofSeconds(60))
+          .tag("feature", feature).register(registry)
+
+      fun usageDropped(n: Int = 1) = registry.counter("helpdesk.llm.usage.dropped").increment(n.toDouble())
+
+      private fun tokens(feature: String, model: String, type: String, n: Int) {
+          if (n > 0) registry.counter("helpdesk.llm.tokens", "feature", feature, "model", model, "type", type).increment(n.toDouble())
+      }
+  }
+</script>
+<p>Licznik z jednostką <code>usd</code> pojawi się w Prometheusie jako <code>helpdesk_llm_cost_usd_total</code>, pod tą samą nazwą co licznik z 1.4. Tamten <code>LlmCostObservationHandler</code> usuwamy, żeby nie liczyć kosztu dwa razy. Nazwę po eksporcie sprawdź w <code>/actuator/prometheus</code>, bo konwencje zależą od wersji Micrometera.</p>
+<p><dfn data-t="cardinality">Kardynalność</dfn> to liczba różnych wartości tagu; każda kombinacja tagów to osobny szereg czasowy. <code>helpdesk_llm_cost_usd_total</code> przy 150 tenantach, 4 funkcjach i 4 aliasach to 2 400 serii, czyli nic. Ten sam licznik z tagiem <code>user</code> (12 000 aktywnych) to 28,8 mln serii i awaria Prometheusa.</p>
+<ul>
+  <li><strong><code>tenant</code> tak</strong>, dopóki tenantów są dziesiątki lub setki. Przy tysiącach zamień go na <code>plan</code>, a koszt per tenant licz z tabeli.</li>
+  <li><strong><code>user</code>, <code>conversation</code>, <code>question</code> nigdy</strong>; te wymiary są w tabeli i w spanach.</li>
+  <li><strong><code>config_version</code> ostrożnie</strong> (1–3 aktywne wersje) i nigdy w histogramie. <code>model</code> to alias z cennika, nie surowa nazwa modelu dostawcy.</li>
+</ul>
+
+<h2>Histogramy i percentyle zamiast średniej</h2>
+<p>Czasy LLM mają długi ogon. <dfn data-t="percentile">Percentyl</dfn> pN to wartość, poniżej której mieści się N% pomiarów: p50 opisuje typowego użytkownika, p95 co dwudziestego, p99 najgorszy realny przypadek, z którego wynikają timeouty (1.5). Średnia miesza różne światy: gdy pytania bez narzędzi mają p50 1,1 s, a pytania z 3+ rundami 7,4 s, całość może mieć średnią 3,0 s i p95 7,9 s. Średnia wygląda dobrze, a co dwudziesty użytkownik czeka prawie 8 s na pierwsze słowo.</p>
+<p>Przy kilku replikach liczy się sposób publikacji. <code>publishPercentiles(0.95)</code> liczy p95 w instancji i publikuje gotową liczbę, a średnia z p95 trzech replik nie jest p95 całości. <code>publishPercentileHistogram()</code> publikuje <dfn data-t="histogram">histogram</dfn>, czyli liczniki „ile pomiarów było ≤ X” dla stałych progów (kubełków, etykieta <code>le</code>); kubełki z replik się sumuje, a percentyl liczy Prometheus funkcją <code>histogram_quantile</code>. Interpoluje ona liniowo wewnątrz kubełka, więc progi ważne dla SLO (np. 4 s) dodajemy jawnie przez <code>serviceLevelObjectives</code>: odsetek „≤ 4 s” jest wtedy dokładny. Dla metryk bibliotek (timer <code>gen_ai.client.operation</code> Spring AI) włączasz to właściwościami <code>management.metrics.distribution.percentiles-histogram.*</code> i <code>management.metrics.distribution.slo.*</code>.</p>
+<p>TTFT użytkownika mierzymy w <code>stream()</code> z 2.3: <code>System.nanoTime()</code> na samym początku metody (przed limiterem i historią), a w <code>doOnNext</code> strumienia zdarzeń, przy pierwszym zdarzeniu z tekstem odpowiedzi, jednorazowo <code>metrics.ttft("assistant-chat").record(...)</code> (flaga <code>AtomicBoolean</code> tworzona w <code>Flux.defer</code>, żeby stan był per subskrypcja). Pytania zakończone błędem przed pierwszym słowem do timera nie trafią, dlatego SLO liczymy względem licznika pytań.</p>
+
+<h2>Raporty SQL i dashboardy</h2>
+<p>Metryki służą bieżącemu obrazowi i alertom, <code>llm_usage</code> pytaniom per rozmowa, użytkownik i wersja.</p>
+<script type="text/x-code" data-lang="sql" data-title="koszt per tenant, funkcja i dzień">
+  SELECT (u.occurred_at AT TIME ZONE 'Europe/Warsaw')::date AS day, t.name AS tenant, u.feature,
+         count(DISTINCT u.question_id) AS questions,
+         sum(u.cost_usd) AS cost_usd,
+         round(sum(u.cost_usd) / nullif(count(DISTINCT u.question_id), 0), 4) AS usd_per_question,
+         round(100.0 * sum(u.cached_input_tokens) / nullif(sum(u.input_tokens), 0), 1) AS cache_pct
+  FROM llm_usage u JOIN tenants t ON t.id = u.tenant_id
+  WHERE u.occurred_at >= now() - interval '30 days'
+  GROUP BY 1, 2, 3
+  ORDER BY 1 DESC, cost_usd DESC;
+</script>
+<p>Koszt na pytanie i na rozmowę pokazuj jako rozkład, nie średnią: zsumuj <code>cost_usd</code> per <code>question_id</code> (albo <code>conversation_id</code>) i policz <code>percentile_cont(0.5)</code> oraz <code>percentile_cont(0.95) WITHIN GROUP (ORDER BY cost)</code>.</p>
+<p>Codziennie przeglądaj też 20 najdroższych rozmów (grupowanie po <code>conversation_id</code>, sortowanie po koszcie, do tego <code>max(round)</code> i <code>max(input_tokens)</code>) i otwieraj ich trace'y. Przyczyny są prawie zawsze trzy: bardzo długa historia, wiele rund narzędzi (model szuka po omacku przez <code>searchTickets</code>) albo ogromny wynik narzędzia (zgłoszenie z 200 komentarzami). Każda ma inną dźwignię.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="PromQL: panele dashboardu „Asystent: koszt i czas”">
+  # 1. Koszt dzienny per tenant (top 10)
+  topk(10, sum by (tenant) (increase(helpdesk_llm_cost_usd_total[1d])))
+
+  # 2. Koszt na pytanie (czat)
+  sum(increase(helpdesk_llm_cost_usd_total{feature="assistant-chat"}[1h]))
+    / sum(increase(helpdesk_assistant_questions_total{feature="assistant-chat"}[1h]))
+
+  # 3. TTFT użytkownika p95 (analogicznie 0.5 i 0.99)
+  histogram_quantile(0.95, sum by (le) (rate(helpdesk_assistant_ttft_seconds_bucket{feature="assistant-chat"}[5m])))
+
+  # 4. Średnia liczba rund (wywołań modelu) na pytanie
+  sum(rate(helpdesk_assistant_tool_rounds_sum[1h])) / sum(rate(helpdesk_assistant_tool_rounds_count[1h]))
+
+  # 5. Odsetek wejścia z cache (spadek = zmienna treść w prefiksie, 2.4)
+  sum(rate(helpdesk_llm_tokens_total{type="cached_input"}[1h]))
+    / sum(rate(helpdesk_llm_tokens_total{type=~"input|cached_input"}[1h]))
+</script>
+
+<h2>SLO dla asystenta</h2>
+<p><dfn data-t="slo">SLO</dfn> (Service Level Objective) to mierzalny cel jakości usługi uzgodniony z biznesem, np. „95% pytań dostaje pierwsze słowo w ciągu 4 s, w oknie 28 dni”. Różnica względem 100% to <dfn data-t="error-budget">budżet błędów</dfn>: dopuszczalna liczba złych zdarzeń w oknie. Gdy się kończy, zespół wstrzymuje ryzykowne zmiany (model, prompt) i zajmuje się niezawodnością.</p>
+<table>
+  <tr><th>SLO</th><th>Cel (28 dni)</th><th>Dobre zdarzenie</th><th>Uzasadnienie</th></tr>
+  <tr><td>Dostępność czatu</td><td>99%</td><td>Pytanie zakończone odpowiedzią, nie błędem</td><td>Asystent to dodatek (1.5); 99,9% wymagałoby kilku dostawców</td></tr>
+  <tr><td>TTFT użytkownika</td><td>95% &lt; 4 s</td><td>Pierwszy tekst w ≤ 4 s</td><td>Pytanie z jedną rundą narzędzi to ok. 3 s</td></tr>
+  <tr><td>Pełna odpowiedź</td><td>99% &lt; 30 s</td><td>Zdarzenie <code>done</code> w ≤ 30 s</td><td>Spójne z budżetem czasu z 1.5</td></tr>
+  <tr><td>Koszt (cel, nie SLO)</td><td>p95 pytania &lt; 0,05 USD</td><td>—</td><td>Przekroczenie = zmiana ruchu lub regresja</td></tr>
+</table>
+<p>Budżet błędów TTFT: 3 200 pytań × 28 dni = 89 600 pytań, 5% to 4 480 pytań, które mogą czekać dłużej niż 4 s. Pytania z błędem przed pierwszym słowem są złe, więc mianownikiem jest licznik pytań.</p>
+<p>W PromQL odsetek złych pytań to <code>1 - sum(increase(helpdesk_assistant_ttft_seconds_bucket{le="4.0"}[1h])) / sum(increase(helpdesk_assistant_questions_total[1h]))</code> (wartość etykiety <code>le</code> sprawdź w eksporcie), a tempo spalania budżetu (burn rate) to ten odsetek podzielony przez 0,05.</p>
+<p>Alerty na burn rate zamiast surowych progów to praktyka z Google SRE Workbook: nie budzą przy krótkim skoku, a łapią i nagłą awarię, i powolną degradację. Typowy start: alert natychmiastowy przy burn rate 14,4 przez 1 h (spala 2% budżetu 28-dniowego) i w godzinach pracy przy 6 przez 6 h.</p>
+
+<h2>Alerty: anomalie kosztu i regresje po zmianie konfiguracji</h2>
+<p>Alert z 1.4 „koszt &gt; 15 USD/h” łapie katastrofy, ale nie to, co kosztuje najwięcej w skali miesiąca: cichy wzrost kosztu jednostkowego po zmianie. Nowa wersja promptu (2.4) dodaje przykład, nowy opis narzędzia skłania model do dodatkowej rundy, ktoś przenosi datę na początek promptu i cache przestaje trafiać. Każda z tych zmian przejdzie evale jakości (2.8) i podniesie koszt pytania o 30–100%.</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts-ai-cost.yml (Prometheus)">
+  groups:
+    - name: helpdesk-ai-cost
+      rules:
+        - alert: AiCostAnomaly                 # godzina 3× droższa niż tydzień temu, przy istotnej kwocie
+          expr: |
+            sum(increase(helpdesk_llm_cost_usd_total[1h])) > 3 * sum(increase(helpdesk_llm_cost_usd_total[1h] offset 1w))
+            and sum(increase(helpdesk_llm_cost_usd_total[1h])) > 2
+          for: 30m
+        - alert: AiTokensPerQuestionUp         # tokeny na pytanie +30% względem tej samej pory tydzień temu
+          expr: |
+            (sum(increase(helpdesk_llm_tokens_total{feature="assistant-chat"}[3h]))
+               / sum(increase(helpdesk_assistant_questions_total{feature="assistant-chat"}[3h])))
+            > 1.3 * (sum(increase(helpdesk_llm_tokens_total{feature="assistant-chat"}[3h] offset 1w))
+               / sum(increase(helpdesk_assistant_questions_total{feature="assistant-chat"}[3h] offset 1w)))
+          for: 1h
+  # dodatkowo: odsetek cache < 30% przez 1 h; helpdesk_llm_usage_dropped_total > 0; ESTIMATED > 5% wywołań
+</script>
+<p>Alert mówi „coś zdrożało”, a tabela mówi „co”. Raport per wersja uruchamiasz po każdym wdrożeniu <code>config_version</code>. Przy <dfn data-t="canary">wdrożeniu kanarkowym</dfn> to jedyny sposób, żeby zobaczyć różnicę, bo w metrykach globalnych rozmywa się ona proporcjonalnie do udziału nowej wersji.</p>
+<script type="text/x-code" data-lang="sql" data-title="koszt i tokeny na pytanie per config_version">
+  WITH q AS (
+      SELECT question_id, config_version, sum(input_tokens) AS input_tokens, sum(cached_input_tokens) AS cached,
+             sum(output_tokens) AS output_tokens, count(*) AS rounds, sum(cost_usd) AS cost
+      FROM llm_usage
+      WHERE feature = 'assistant-chat' AND occurred_at >= now() - interval '3 days'
+      GROUP BY question_id, config_version
+  )
+  SELECT config_version, count(*) AS questions, round(avg(input_tokens)) AS avg_input,
+         round(100.0 * sum(cached) / nullif(sum(input_tokens), 0), 1) AS cache_pct,
+         round(avg(output_tokens)) AS avg_output, round(avg(rounds), 2) AS avg_rounds,
+         round(avg(cost), 5) AS avg_cost
+  FROM q GROUP BY config_version
+  HAVING count(*) >= 200                      -- mniej to szum
+  ORDER BY config_version;
+
+  -- config_version                questions  avg_input  cache_pct  avg_output  avg_rounds  avg_cost
+  -- chat-v3|default|tools-v2|a1      7 412      8 610       53,8         285        2,06   0,01790
+  -- chat-v4|default|tools-v2|c7      1 088     11 940       31,2         301        2,71   0,03110
+</script>
+<p>Widać dwie przyczyny: v4 rzadziej trafia w cache (zmienna treść w prefiksie) i częściej robi dodatkową rundę. Koszt pytania wzrósł o 74%, a evale jakości mogły tego nie zauważyć. Dlatego w 2.8 i 3.7 koszt i liczba rund na przypadek testowy będą częścią raportu evali.</p>
+
+<h2>Budżety per tenant</h2>
+<p>Budżety kluczy i klientów w LiteLLM (1.3) to ostatnia linia obrony, ale reagują późno i błędem. Aplikacja zna tenanta, plan i rolę, więc może ostrzec wcześniej i powiedzieć po ludzku, co się stało. Dzienny limit kosztu z <code>tenant_ai_budgets</code> sprawdzamy w limiterze z 1.5, <strong>przed</strong> pobraniem żetonów z wiader, żeby odrzucone pytanie nie zużywało limitów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/TenantBudgetGuard.kt">
+  enum class BudgetState { OK, SOFT_LIMIT, EXCEEDED, UNLIMITED }
+  data class BudgetStatus(val state: BudgetState, val spentUsd: BigDecimal, val limitUsd: BigDecimal?, val resetAt: Instant)
+  class TenantBudgetExceededException(val tenantId: UUID, val resetAt: Instant) : RuntimeException()
+
+  @Component
+  class TenantBudgetGuard(private val jdbc: JdbcTemplate, private val clock: Clock) {
+      private val zone = ZoneId.of("Europe/Warsaw")
+      private data class Budget(val dailyLimit: BigDecimal, val softPct: Int)
+
+      private val budgets = Caffeine.newBuilder().expireAfterWrite(Duration.ofMinutes(1)).build<UUID, Optional<Budget>> { id ->
+          Optional.ofNullable(jdbc.query("select daily_limit_usd, soft_limit_pct from tenant_ai_budgets where tenant_id = ?",
+              RowMapper { rs, _ -> Budget(rs.getBigDecimal(1), rs.getInt(2)) }, id).firstOrNull())
+      }
+
+      /** Z bazy co 30 s (inne repliki), w międzyczasie powiększane lokalnie przez onSpent. */
+      private val spentToday = Caffeine.newBuilder().expireAfterWrite(Duration.ofSeconds(30)).build<UUID, BigDecimal> { id ->
+          jdbc.queryForObject("select coalesce(sum(cost_usd), 0) from llm_usage where tenant_id = ? and occurred_at >= ?",
+              BigDecimal::class.java, id, startOfDay().atOffset(ZoneOffset.UTC))
+      }
+
+      fun status(tenantId: UUID): BudgetStatus {
+          val reset = startOfDay().plus(Duration.ofDays(1))
+          val b = budgets.get(tenantId).orElse(null) ?: return BudgetStatus(BudgetState.UNLIMITED, BigDecimal.ZERO, null, reset)
+          val spent = spentToday.get(tenantId)
+          val state = when {
+              spent >= b.dailyLimit -> BudgetState.EXCEEDED
+              spent * BigDecimal(100) >= b.dailyLimit * b.softPct.toBigDecimal() -> BudgetState.SOFT_LIMIT
+              else -> BudgetState.OK
+          }
+          return BudgetStatus(state, spent, b.dailyLimit, reset)
+      }
+
+      fun require(tenantId: UUID) {
+          val s = status(tenantId)
+          if (s.state == BudgetState.EXCEEDED) throw TenantBudgetExceededException(tenantId, s.resetAt)
+      }
+
+      fun onSpent(tenantId: UUID, cost: BigDecimal) {
+          spentToday.asMap().computeIfPresent(tenantId) { _, v -> v + cost }
+      }
+
+      private fun startOfDay(): Instant = LocalDate.now(clock.withZone(zone)).atStartOfDay(zone).toInstant()
+  }
+
+  // AssistantRateLimiter.acquire(...) z 1.5 – nowa pierwsza linia: budgetGuard.require(tenantId)
+</script>
+<p>Ten limit jest „miękko twardy”: zapis jest asynchroniczny, a repliki synchronizują się co 30 s, więc tenant może go przekroczyć o koszt pytań w toku. Górna granica to liczba równoczesnych pytań × najdroższe pytanie, np. 15 × 0,08 USD = 1,20 USD; przy limicie 50 USD to bez znaczenia. Przy przedpłaconych pakietach, gdzie liczy się każdy cent, rezerwuj szacowany koszt przed wywołaniem atomowym <code>UPDATE … WHERE spent + :estimate &lt;= limit</code> i rozliczaj różnicę po odpowiedzi.</p>
+<table>
+  <tr><th>Stan</th><th>Zachowanie</th><th>Co widzi użytkownik</th></tr>
+  <tr><td><code>SOFT_LIMIT</code> (≥ 80%)</td><td>Czat działa; jednorazowe powiadomienie administratora tenanta; stan w <code>GET /api/assistant/status</code> (nowe pole <code>budget</code>)</td><td>Personel: „Wykorzystano 84% dziennego limitu asystenta”. Klient: nic, to szczegół rozliczeń</td></tr>
+  <tr><td><code>EXCEEDED</code></td><td>429 <dfn data-t="problem-detail">ProblemDetail</dfn> typu <code>assistant-budget-exceeded</code> z <code>Retry-After</code> do północy i polem <code>resetAt</code>; UI wyłącza przycisk asystenta na podstawie statusu</td><td>„Dzienny limit asystenta dla Twojej organizacji został wykorzystany. Asystent wróci o 00:00. Zgłoszenia możesz obsługiwać normalnie.”</td></tr>
+</table>
+<p>Wartość limitu wynika z planu i zużycia: Acme ma średnio 900 pytań dziennie po 0,018 USD, czyli ok. 16 USD. Limit ok. 3× średnia (50 USD) nie przeszkadza w pracy, a zatrzyma skrypt, który w pętli zadaje pytania kluczem pracownika. Limitery RPM z 1.5 chronią przed nagłym ruchem, budżet przed powolnym wyciekiem pieniędzy.</p>
+
+<h2>Dźwignie optymalizacji: najpierw licz, potem zmieniaj</h2>
+<p>Punkt odniesienia: pytanie z przykładu w wariancie B, 0,01755 USD i ok. 3 s do pierwszego słowa; przy 3 200 pytaniach dziennie ok. 1 685 USD miesięcznie.</p>
+<table>
+  <tr><th>Dźwignia</th><th>Zmiana</th><th>Koszt pytania</th><th>Czas</th><th>Ryzyko i warunek</th></tr>
+  <tr><td>Cache całej rozmowy (2.4)</td><td>Stały prefiks, zmienne na końcu, punkt cache za historią</td><td>0,00891 (−49%)</td><td>Krótszy TTFT</td><td>Niskie; zapis do cache bywa droższy od wejścia</td></tr>
+  <tr><td>Przycinanie historii (2.5)</td><td>1 500 → 800 tok (streszczenie, obcięte stare wyniki narzędzi)</td><td>−0,0042 (−24%)</td><td>Trochę krótszy TTFT</td><td>Model „zapomina” szczegóły; evale wieloturowe</td></tr>
+  <tr><td>Kilka narzędzi w jednej rundzie</td><td>3 rundy → 2</td><td>−0,0085 (−33% względem 3 rund)</td><td>−1,5 s</td><td>Opisy narzędzi zachęcające do łączenia</td></tr>
+  <tr><td>Krótsze wyniki narzędzi</td><td><code>getTicket</code> bez zbędnych pól: 630 → 300 tok</td><td>−0,001 teraz i −0,002 w każdej kolejnej turze (wyniki zostają w historii)</td><td>Pomijalny</td><td>Model nie odpowie o pole, którego nie dostał</td></tr>
+  <tr><td>Limit i styl wyjścia</td><td>„Odpowiadaj zwięźle”: 220 → 150 tok</td><td>−0,00105 (−6%)</td><td>−0,7 s</td><td>Zbyt niski <dfn data-t="max-tokens"><code>max_tokens</code></dfn> ucina odpowiedź (<dfn data-t="finish-reason"><code>finish_reason</code></dfn> = <code>length</code>)</td></tr>
+  <tr><td>Mniejszy model</td><td><code>helpdesk-fast</code> (0,40 / 0,04 / 1,60) przy tych samych tokenach</td><td>0,00222 (−87%)</td><td>Zwykle szybciej</td><td>Tool calling po polsku tylko po evalach (2.8); dobre dla streszczeń historii, nie całego czatu</td></tr>
+</table>
+<p>Dźwignie nie sumują się liniowo: po przycięciu historii cache ma mniej do zaoszczędzenia, a mniejszy model obniża wszystkie pozycje. Kolejność wynika z relacji zysku do ryzyka: najpierw cache i kształt promptu, potem historia i wyniki narzędzi (z evalami), na końcu zmiana modelu (pełny benchmark z 1.6). Każdą zmianę wdrażasz jako nową <code>config_version</code> i potwierdzasz raportem per wersja, a nie wrażeniem.</p>
+<div class="box warn"><span class="label">Optymalizacja, która podnosi koszt</span><p>Skrócenie system promptu z 1 400 do 700 tokenów wygląda na oszczędność, ale jeśli prefiks z narzędziami spadnie poniżej minimalnej długości cache (często ok. 1 024 tokenów), cache przestanie działać i koszt pytania <em>wzrośnie</em>. Gorsze instrukcje mogą też dodać rundę. Mierz efekt na całym pytaniu, a nie na jednym składniku.</p></div>
+
+<h2>Rekoncyliacja z fakturą i chargeback</h2>
+<p>Raz w miesiącu porównujesz fakturę dostawcy, sumę z LiteLLM i sumę z <code>llm_usage</code>. Nie będą równe, ale różnice muszą być wyjaśnione i stabilne. Przykład ilustracyjny: faktura 1 742,18 USD, LiteLLM 1 731,40 (−0,6%), <code>llm_usage</code> 1 652,07 (−5,2%). Typowe przyczyny, od największej: wywołania spoza aplikacji (evale, skrypty, inne zespoły na tym samym koncie), zapis do cache niewidoczny dla nas, timeouty naliczone przez dostawcę, a niezarejestrowane w proxy, różnice cenników, granica miesiąca w UTC, zaokrąglenia, podatki i kredyty. Procedura:</p>
+<ol>
+  <li>Porównaj dzienne sumy per model między <code>llm_usage</code> a spend logs. Dni z odchyleniem powyżej 3% badaj osobno.</li>
+  <li>Dla tych dni dopasuj wiersze po <code>question_id</code> z metadanych spend logs i znajdź braki po każdej stronie (zgubione zapisy z kolejki, wywołania omijające <code>UsageRecorder</code>).</li>
+  <li>Porównaj spend logs z fakturą per model; tu wychodzą timeouty i zapisy cache. Wyjaśnioną resztę księguj jako koszt platformy.</li>
+  </ol>
+<p>Po stronie LiteLLM to <code>sum(spend)</code>, <code>sum(prompt_tokens)</code> i <code>count(*)</code> z <code>"LiteLLM_SpendLogs"</code> grupowane po dniu z <code>"startTime"</code> i <code>model_group</code> (nazwy kolumn sprawdź w schemacie swojej wersji). Bazy aplikacji i proxy są osobne, więc porównanie robi mały job raportowy czytający obie. <code>postgres_fdw</code> (rozszerzenie do zapytań do innej bazy) też zadziała, ale uzależni bazę aplikacji od schematu proxy, który zmienia się z wersjami LiteLLM.</p>
+<p><dfn data-t="chargeback">Chargeback</dfn> to obciążanie kosztami usługi tych, którzy je generują; <strong>showback</strong> to samo przypisanie, ale tylko pokazane. Zacznij od 2–3 miesięcy showbacku: klienci i sprzedaż zobaczą koszty, a Ty sprawdzisz stabilność liczb, zanim staną się podstawą faktury.</p>
+<p>Raport miesięczny per tenant to koszt bezpośredni z <code>llm_usage</code> plus proporcjonalny udział w koszcie platformy (faktura minus suma kosztów bezpośrednich): <code>udział = koszt_tenanta / suma_bezpośrednich × koszt_platformy</code>.</p>
+<p>Klientom rzadko przenosi się koszt 1:1: plan zawiera pakiet (np. 30 USD AI w STANDARD, jak w 1.3), a nadwyżka jest rozliczana z marżą pokrywającą ryzyko kursowe (dostawca fakturuje w USD) i koszt platformy. Na pytanie „dlaczego tyle?” odpowiadasz liczbą pytań, kosztem na pytanie i podziałem na funkcje.</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Policz koszt pytania z przykładu, gdy model robi trzy rundy (osobno <code>getTicket</code> i <code>getSlaStatus</code>, każde żądanie narzędzia 40 tokenów wyjścia), w wariantach A i B. O ile procent drożej i ile sekund dłużej (TTFT 1 s, 60 tok/s)?</li>
+  <li>Napisz test z WireMockiem udającym LiteLLM: dwie rundy (pierwsza z <code>tool_calls</code>, druga z odpowiedzią), każda z innym <code>usage</code> i <code>cached_tokens</code>. Sprawdź dwa wiersze <code>llm_usage</code> z poprawnym <code>round</code>, kosztem i wspólnym <code>question_id</code>.</li>
+  <li>Dodaj cenę <code>helpdesk-default</code> obowiązującą od jutra i test, że wywołania z dziś i z jutra dostają różne <code>price_version</code>. Dodaj test blokujący start aplikacji z aliasem bez ceny.</li>
+  <li>Ustaw Acme limit 0,05 USD, zadawaj pytania i sprawdź <code>SOFT_LIMIT</code>, potem 429. O ile koszt przekroczył limit?</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Odpowiedź ma <code>prompt_tokens = 4620</code>, <code>cached_tokens = 3840</code>, <code>completion_tokens = 220</code>, <code>reasoning_tokens = 40</code>. Jak liczysz koszt?</p>
+  <button>4620 × cena wejścia + 3840 × cena cache + (220 + 40) × cena wyjścia</button>
+  <button>(4620 + 3840) × cena wejścia + 220 × cena wyjścia</button>
+  <button>780 × cena wejścia + 3840 × cena cache + 220 × cena wyjścia</button>
+  <button>4620 × cena cache + 220 × cena wyjścia, bo prompt był w cache</button>
+  <p class="explain">W formacie zgodnym z OpenAI <code>cached_tokens</code> jest częścią <code>prompt_tokens</code>, a <code>reasoning_tokens</code> częścią <code>completion_tokens</code>. Wejście bez cache to 4620 − 3840 = 780, a rozumowania nie dodajesz drugi raz.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego p95 TTFT liczysz z histogramu (<code>publishPercentileHistogram</code>), a nie z percentyli liczonych w aplikacji?</p>
+  <button>Bo kubełki z wielu instancji można zsumować i policzyć poprawny percentyl całości, a gotowych percentyli z instancji nie da się poprawnie uśrednić</button>
+  <button>Bo percentyle liczone w aplikacji są zawsze zawyżone</button>
+  <button>Bo histogram zajmuje mniej serii w Prometheusie</button>
+  <p class="explain">Średnia z p95 trzech replik nie jest p95 całego ruchu. Histogram publikuje liczniki w kubełkach, które Prometheus sumuje i dopiero z nich liczy percentyl. Kosztem jest więcej serii, nie mniej.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Użytkownik zamyka panel w połowie strumieniowanej odpowiedzi. Co jest prawdą?</p>
+  <button>Nie płacisz nic, bo odpowiedź nie została dokończona</button>
+  <button>Płacisz za wejście i wygenerowane tokeny (lub całość, jeśli anulowanie nie dotarło do dostawcy), a usage zwykle nie przychodzi, więc trzeba je oszacować i oznaczyć</button>
+  <button>Płacisz za całą odpowiedź, a usage przychodzi normalnie w ostatnim fragmencie</button>
+  <p class="explain">Usage przy streamingu jest w ostatnim fragmencie, którego przy przerwaniu nie ma. Koszt jest realny, więc zapisujesz szacunek z <code>usage_source = ESTIMATED</code> i <code>outcome = CANCELLED</code>, a nie zero.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Który tag jest akceptowalny na liczniku <code>helpdesk.llm.cost</code> przy 150 tenantach i 12 000 użytkowników?</p>
+  <button><code>user</code>, bo koszt per użytkownik jest najciekawszy</button>
+  <button><code>conversation</code>, żeby szybko znaleźć drogie rozmowy</button>
+  <button><code>tenant</code>; koszt per użytkownik i rozmowę liczysz z tabeli <code>llm_usage</code></button>
+  <button>Surowe pole <code>model</code> z odpowiedzi dostawcy</button>
+  <p class="explain">Każda kombinacja tagów to osobny szereg czasowy: 150 tenantów to setki serii, 12 000 użytkowników to miliony. Surowa nazwa modelu zmienia się z każdą wersją, dlatego tagujemy alias z cennika.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Po wdrożeniu nowej wersji promptu evale jakości przechodzą, ale odpala się <code>AiTokensPerQuestionUp</code>. Od czego zaczynasz?</p>
+  <button>Od wyłączenia asystenta flagą <code>ai.enabled</code></button>
+  <button>Od raportu SQL per <code>config_version</code>: tokeny wejścia, odsetek cache i średnia liczba rund dla starej i nowej wersji</button>
+  <button>Od podniesienia budżetów tenantów, żeby nikt nie dostał 429</button>
+  <p class="explain">Alert mówi, że coś zdrożało, a raport per wersja pokazuje co: zwykle zmienną treść w prefiksie (spadek cache) albo dodatkową rundę narzędzi. Wyłączanie asystenta to reakcja na incydent, a nie na wzrost kosztu jednostkowego.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

