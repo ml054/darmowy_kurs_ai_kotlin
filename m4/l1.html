@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.1 Architektura RAG, embeddingi, pgvector – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="4.1">
+<main>
+<p class="meta">Lekcja 4.1 · ok. 60 min</p>
+<h1>Architektura RAG, embeddingi, pgvector</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Rozstrzygać, kiedy potrzebny jest RAG, a kiedy wystarczy długi kontekst, narzędzie albo fine-tuning, na podstawie liczb.</li>
+  <li>Rozumieć embeddingi: przestrzeń wektorów, miary podobieństwa, wymiary i koszt pamięci.</li>
+  <li>Uruchomić lokalny model embeddingów (TEI + bge-m3) za aliasem <code>helpdesk-embed</code> i wołać go ze Spring AI.</li>
+  <li>Zaprojektować tabele <code>kb_documents</code> i <code>kb_chunks</code> w Postgresie z pgvector, indeksem HNSW i RLS.</li>
+  <li>Napisać i przetestować minimalne wyszukiwanie top-k z filtrem tenanta oraz sprawdzić w <code>EXPLAIN</code>, że indeks działa.</li>
+</ul></div>
+
+<h2>Asystent, który nie zna procedur</h2>
+<p>Po modułach 2 i 3 asystent zna zgłoszenia, ale nie odpowie na najczęstsze pytania: Anna z Acme pyta „Jak wyeksportować faktury do PDF?” (odpowiedź jest w instrukcji produktu), Piotr przy HD-1042 „Czy znamy obejście pustego PDF-a przy dużych fakturach?” (rozwiązanie sprzed miesiąca, notatka zespołu Acme), a przy HD-2077 „Jaka jest procedura eskalacji SSO?” (wewnętrzny dokument Globexu, niewidoczny dla innych tenantów i klientów).</p>
+<p>Model tego nie wie, bo instrukcje powstały po dacie jego wiedzy (<dfn data-t="knowledge-cutoff">knowledge cutoff</dfn>) albo nigdy nie były publiczne. Zapytany „na ślepo” wymyśli wiarygodną procedurę (<dfn data-t="hallucination">halucynacja</dfn>). Potrzebujemy bazy wiedzy (KB), z której asystent pobiera właściwe fragmenty w chwili pytania. Ta technika to <dfn data-t="rag">RAG</dfn> (Retrieval-Augmented Generation): najpierw wyszukaj, potem odpowiedz na podstawie znalezionych fragmentów, z cytatem źródła.</p>
+<p>W HelpDesk baza wiedzy ma dwa zastosowania:</p>
+<table>
+  <tr><th>Zastosowanie</th><th>Kto</th><th>Jak działa</th><th>Model</th></tr>
+  <tr><td>Narzędzie czatu <code>searchKnowledgeBase</code></td><td>agent, klient Acme</td><td>Model decyduje, kiedy szukać (<dfn data-t="tool-calling">tool calling</dfn>, 2.1)</td><td>trasa CHAT: tylko zewnętrzny</td></tr>
+  <tr><td><code>AiTask.KB_ANSWER</code>: sugerowana odpowiedź w panelu zgłoszenia</td><td>agent</td><td>Zawsze wyszukaj, potem jedno wywołanie bez narzędzi</td><td><code>helpdesk-default</code> / <code>helpdesk-local</code></td></tr>
+</table>
+<p>Druga ścieżka nie wymaga tool callingu, więc działa na modelu lokalnym i Globex, który nie ma czatu (M2), dostaje przynajmniej podpowiedzi z bazy wiedzy.</p>
+
+<h2>RAG, długi kontekst, narzędzie czy fine-tuning</h2>
+<p>RAG bywa przerostem formy. Alternatywy: <strong>długi kontekst</strong> (cały materiał w prompcie; limit wyznacza <dfn data-t="context">okno kontekstu</dfn> z 1.6, a jakość obniża <dfn data-t="lost-in-the-middle">lost in the middle</dfn>, czyli gorsze wykorzystanie środka promptu), <strong>narzędzie</strong> (API z dokładnymi danymi, jak <code>getTicket</code> z 2.1) i <strong><dfn data-t="fine-tuning">fine-tuning</dfn></strong> (dotrenowanie wag modelu na Twoich przykładach: zmienia styl i zachowanie, ale słabo i nieprzewidywalnie „wgrywa” fakty).</p>
+<p>Liczby dla HelpDesk (ceny ilustracyjne, 3 USD za milion tokenów wejściowych, sprawdź aktualny cennik): baza wiedzy Acme razem z dokumentacją globalną to ok. 400 dokumentów po 3 000 tokenów, czyli 1,2 mln tokenów.</p>
+<table>
+  <tr><th>Kryterium</th><th>Długi kontekst</th><th>Narzędzie (API)</th><th>RAG</th><th>Fine-tuning</th></tr>
+  <tr><td>Rozmiar wiedzy</td><td>do kilkudziesięciu tys. tokenów; 1,2 mln się nie mieści albo działa źle</td><td>dowolny, jeśli dane są ustrukturyzowane</td><td>od tysięcy do milionów fragmentów</td><td>dowolny, ale fakty „przeciekają” niedokładnie</td></tr>
+  <tr><td>Koszt wejścia na pytanie</td><td>1,2 mln × 3 USD/M = 3,60 USD; z <dfn data-t="prompt-caching">prompt cachingiem</dfn> (odczyt ok. 0,1×) nadal ok. 0,36 USD</td><td>setki tokenów wyniku</td><td>5 fragmentów × 450 tokenów ≈ 2 300 tokenów ≈ 0,007 USD</td><td>0 na pytanie, ale trening i hosting własnego wariantu</td></tr>
+  <tr><td>Aktualność</td><td>natychmiast</td><td>natychmiast</td><td>minuty (reindeks dokumentu, 4.3)</td><td>tygodnie (nowy trening, nowe evale)</td></tr>
+  <tr><td>Uprawnienia per tenant i rola</td><td>osobny prompt dla każdej kombinacji</td><td>w API</td><td>filtr w zapytaniu i RLS (4.4)</td><td>brak: wiedza w wagach widzi każdy użytkownik modelu</td></tr>
+  <tr><td>Usunięcie danych (RODO)</td><td>usuń z promptu</td><td>usuń w bazie</td><td>usuń chunki (4.3)</td><td>dopiero nowym treningiem</td></tr>
+</table>
+<p>Reguły: <strong>długi kontekst</strong>, gdy materiał jest mały (do ok. 30–50 tys. tokenów), wspólny dla wszystkich i stabilny, np. regulamin wsparcia w stałej, cachowanej części promptu (2.4). <strong>Narzędzie</strong>, gdy dane mają strukturę i API z uprawnieniami (status, SLA). <strong>RAG</strong>, gdy wiedza jest tekstowa, duża, zmienna i podzielona uprawnieniami, czyli w naszym przypadku. <strong>Fine-tuning</strong> tylko dla formy (ton, format, klasyfikacja), nigdy jako baza faktów w systemie multi-tenant: wiedzy Globexu „wtrenowanej” w model nie da się ukryć przed Acme.</p>
+<div class="box tip"><span class="label">RAG to też narzędzie</span><p><code>searchKnowledgeBase</code> to narzędzie z 2.1, które w środku robi RAG. Różnica: <em>kto decyduje o wyszukaniu</em>. W czacie model (może nie szukać albo szukać kilka razy), w <code>KB_ANSWER</code> kod (zawsze raz).</p></div>
+
+<h2>Potok RAG: indeksowanie i zapytanie</h2>
+<p>RAG składa się z dwóch niezależnych przepływów. Indeksowanie działa asynchronicznie przy każdej zmianie dokumentu, zapytanie synchronicznie w turze czatu. Łączy je baza i <em>ten sam model embeddingów</em> po obu stronach.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="potok RAG w HelpDesk">
+  INDEKSOWANIE (worker w tle)                                      lekcja
+  źródło: upload, Confluence, zaakceptowane rozwiązanie zgłoszenia
+    ▼ parsowanie: PDF/DOCX/HTML → tekst + nagłówki                  4.2
+    ▼ chunking: 300–600 tokenów, heading_path, nakładka 10–15%      4.2
+    ▼ embedding: helpdesk-embed (bge-m3 w TEI), paczki po 32        4.1, 4.3
+    ▼ zapis: kb_chunks (wektor + tsvector + tenant/visibility)      4.1, 4.3
+
+  ZAPYTANIE (tura czatu albo KB_ANSWER)
+  pytanie + CurrentUser + tenantId
+    ▼ (opcjonalnie) przepisanie pytania: QUERY_REWRITE              4.6
+    ▼ embedding pytania – TEN SAM model co dokumenty                4.1
+    ▼ filtr uprawnień → wektor + pełnotekstowe → fuzja RRF          4.4
+    ▼ rerank: helpdesk-rerank, 40 kandydatów → 5                    4.4
+    ▼ próg trafności, sprzeczności, nieaktualne źródła              4.5
+    ▼ generowanie z cytowaniami [KB-1], [KB-2]                      4.4, 4.5
+    ▼ evale: osobno wyszukiwanie, osobno odpowiedź                  4.7
+</script>
+<p><dfn data-t="chunking">Chunking</dfn> to dzielenie dokumentu na fragmenty (chunki). <dfn data-t="embedding">Embedding</dfn> zamienia tekst na wektor liczb tak, by teksty o podobnym znaczeniu miały bliskie wektory. <dfn data-t="hybrid-search">Wyszukiwanie hybrydowe</dfn> łączy wyniki wektorowe z wyszukiwaniem po słowach, które łapie kody błędów i nazwy własne. <dfn data-t="reranker">Reranker</dfn> to mały model (cross-encoder), który ocenia parę „pytanie + fragment” razem i porządkuje kandydatów dokładniej niż podobieństwo wektorów; nie jest generatywnym LLM. Ta lekcja buduje fundament: model embeddingów, schemat i najprostsze wyszukiwanie. Żaden prompt nie naprawi złego retrievalu, dlatego 4.7 mierzy oba etapy osobno.</p>
+
+<h2>Embeddingi: wektory i podobieństwo</h2>
+<p>Model embeddingów to sieć neuronowa, która zamienia tekst na wektor o stałej długości, np. 1024 liczb. Nie generuje tekstu, tylko „współrzędne znaczenia”. Trenowany na milionach par tekstów podobnych i niepodobnych, umieszcza pytanie i odpowiadający mu fragment blisko siebie, nawet bez wspólnych słów. Intuicja w trzech wymiarach (prawdziwe mają ich ponad tysiąc):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="zabawkowy przykład 3D">
+  a = "eksport faktury do PDF"     → [0.80, 0.55, 0.10]
+  b = "zapis rachunku jako PDF"    → [0.75, 0.60, 0.15]
+  c = "błąd logowania SSO"         → [0.05, 0.20, 0.97]
+
+  cos(a, b) = a·b / (|a|·|b|) = 0.945 / (0.976 · 0.972) ≈ 0.996   bardzo podobne
+  cos(a, c) = 0.247 / (0.976 · 0.992)                   ≈ 0.255   niepowiązane
+</script>
+<p>„Faktura” i „rachunek” to różne słowa, a wektory są prawie równoległe: to przewaga nad słowami kluczowymi. Ceną jest brak precyzji: „błąd 4012” i „błąd 4021” to dla modelu prawie to samo.</p>
+<h3>Trzy miary odległości</h3>
+<p><dfn data-t="cosine-similarity">Podobieństwo cosinusowe</dfn> mierzy kąt między wektorami i ignoruje ich długość. Obok niego stosuje się iloczyn skalarny i odległość euklidesową (L2):</p>
+<table>
+  <tr><th>Miara</th><th>Wzór</th><th>Operator pgvector</th><th>Co zwraca operator</th></tr>
+  <tr><td>Cosinus</td><td>a·b / (|a|·|b|), od −1 do 1</td><td><code>&lt;=&gt;</code></td><td><em>odległość</em> cosinusową = 1 − cos (0 = identyczne)</td></tr>
+  <tr><td>Iloczyn skalarny</td><td>a·b</td><td><code>&lt;#&gt;</code></td><td><em>ujemny</em> iloczyn skalarny (żeby sortować rosnąco)</td></tr>
+  <tr><td>L2</td><td>√Σ(aᵢ − bᵢ)²</td><td><code>&lt;-&gt;</code></td><td>odległość euklidesową</td></tr>
+</table>
+<p>Dla wektorów <em>znormalizowanych</em> (długość 1) wszystkie trzy dają tę samą kolejność wyników, bo wtedy |a − b|² = 2 − 2·cos(a, b), a iloczyn skalarny równa się cosinusowi. Różnice pojawiają się przy wektorach nieznormalizowanych: iloczyn skalarny faworyzuje „długie” wektory, cosinus nie. Zasady praktyczne:</p>
+<ul>
+  <li>Używaj miary, z którą model był trenowany (karta modelu); dla bge-m3 to cosinus albo iloczyn skalarny na wektorach znormalizowanych.</li>
+  <li>TEI domyślnie normalizuje wektory (parametr <code>normalize</code>, sprawdź w swojej wersji). My i tak indeksujemy po cosinusie, który działa też bez normalizacji; <code>&lt;#&gt;</code> byłby minimalnie szybszy, ale ryzykowny po zmianie modelu.</li>
+  <li>Wartości podobieństwa nie są porównywalne między modelami („dobre trafienie” to raz 0,85, raz 0,55). Progi kalibrujesz na evalach (4.5, 4.7).</li>
+</ul>
+
+<h2>Wymiary i pamięć: policz przed wdrożeniem</h2>
+<p>Liczba wymiarów to długość wektora. Więcej wymiarów to zwykle więcej „pojemności” na niuanse, ale też więcej pamięci, wolniejsze porównania i większy indeks. Policzmy dla docelowej skali HelpDesk: 300 tenantów i dokumentacja globalna, razem ok. 200 tys. chunków po średnio 450 tokenów (ok. 90 mln tokenów treści).</p>
+<script type="text/x-code" data-lang="plaintext" data-title="szacunek pamięci (orientacyjny)">
+  wektor vector(1024), float4:  1024 × 4 B + 8 B nagłówka  = 4 104 B
+  200 000 chunków × 4 104 B                                 ≈ 821 MB surowych wektorów
+
+  indeks HNSW (m = 16): element = wektor (~4,1 kB) + sąsiedzi warstwy 0 (2·m × 6 B ≈ 0,2 kB)
+    teoretycznie 200 000 × ~4,3 kB ≈ 0,86 GB, ale strona 8 kB mieści 1 element, nie 2
+    w praktyce ~8 kB na element                             ≈ 1,6 GB
+  halfvec(1024): 2 056 B → surowe ≈ 411 MB, 3 elementy na stronę → indeks ≈ 0,55 GB
+  treść (~2 kB/chunk) ≈ 0,4 GB;  content_tsv + GIN ≈ 0,3–0,6 GB
+
+  RAZEM (float4): ~3,5 GB na dysku; indeks HNSW (~1,6 GB) powinien mieścić się w RAM
+</script>
+<p>To szacunek. Rzeczywisty rozmiar zmierzysz po załadowaniu danych: <code>SELECT pg_size_pretty(pg_relation_size('ix_kb_chunks_embedding_hnsw'))</code>. Wnioski dla architektury:</p>
+<ul>
+  <li><strong>Indeks musi być w pamięci.</strong> HNSW skacze po grafie losowo; strona spoza buforów to odczyt z dysku i latencja rośnie z milisekund do setek milisekund. 8 GB RAM obsłuży tę skalę z zapasem.</li>
+  <li><strong>Budowa indeksu potrzebuje <code>maintenance_work_mem</code></strong>. Gdy graf się nie mieści, Postgres wypisuje „hnsw graph no longer fits into maintenance_work_mem after N tuples” i budowa mocno zwalnia.</li>
+  <li><strong>3072 wymiary to inna liga.</strong> <code>vector</code> można indeksować do 2 000 wymiarów, <code>halfvec</code> do 4 000, więc model 3072D wymusza <code>halfvec</code> albo skrócenie wektorów.</li>
+  <li><strong>Nie wybieraj kolumny <code>embedding</code> w SELECT</strong> bez potrzeby: wektor 4 kB zwykle leży poza stroną wiersza (TOAST), więc to dodatkowy odczyt.</li>
+</ul>
+<p>Skracać wolno tylko modele trenowane tak, że pierwsze N wymiarów samo jest dobrym embeddingiem (<dfn data-t="matryoshka-embedding">embedding Matryoshka</dfn>, np. OpenAI text-embedding-3 z parametrem <code>dimensions</code>). Karta bge-m3 tej własności nie deklaruje.</p>
+
+<h2>Wybór modelu embeddingów</h2>
+<p>Model embeddingów wybierasz na lata, bo każda zmiana to przeliczenie całej bazy (4.3). Kryteria: jakość dla polskiego i dla wyszukiwania, długość wejścia, wymiary, licencja, przepływ danych, koszt. Nazwy, wymiary i ceny to przykłady; sprawdź aktualne karty modeli i cenniki.</p>
+<table>
+  <tr><th>Model (przykład)</th><th>Hosting</th><th>Wymiary</th><th>Maks. wejście</th><th>Polski</th><th>Licencja / cena (ilustracyjna)</th><th>Asymetria</th></tr>
+  <tr><td>BAAI bge-m3</td><td>self-hosted (TEI, Ollama)</td><td>1024</td><td>8 192 tokenów</td><td>dobry (100+ języków)</td><td>MIT; koszt serwera</td><td>bez prefiksów</td></tr>
+  <tr><td>intfloat multilingual-e5-large</td><td>self-hosted</td><td>1024</td><td>512</td><td>dobry</td><td>MIT; koszt serwera</td><td>wymaga „query: ” / „passage: ”</td></tr>
+  <tr><td>OpenAI text-embedding-3-small / -large</td><td>zewnętrzny</td><td>1536 / 3072 (skracalne)</td><td>8 191</td><td>dobry</td><td>ok. 0,02 / 0,13 USD za mln tokenów</td><td>symetryczny</td></tr>
+  <tr><td>Cohere embed-multilingual-v3 / embed-v4</td><td>zewnętrzny</td><td>1024 / do 1536</td><td>512 / dłuższe</td><td>dobry</td><td>ok. 0,10 USD za mln tokenów</td><td><code>input_type</code>: search_query / search_document</td></tr>
+  <tr><td>Voyage voyage-3.5 / voyage-multilingual-2</td><td>zewnętrzny</td><td>1024 (skracalne)</td><td>32 tys.</td><td>dobry</td><td>ok. 0,06–0,12 USD za mln tokenów</td><td><code>input_type</code>: query / document</td></tr>
+</table>
+<h3>Decyzja HelpDesk: jeden lokalny <code>helpdesk-embed</code></h3>
+<p>Embeddingi dla <em>wszystkich</em> tenantów liczy jeden model self-hosted: <code>helpdesk-embed</code> → bge-m3 w TEI. Koszt <em>nie</em> jest głównym argumentem: zaindeksowanie 90 mln tokenów w text-embedding-3-small to ok. 1,80 USD, w -large ok. 12 USD. Argumenty są inne:</p>
+<ol>
+  <li><strong>Jedna przestrzeń wektorów.</strong> Wektorów różnych modeli nie da się porównywać, nawet przy tej samej liczbie wymiarów. Przy modelu zewnętrznym dla Acme i lokalnym dla Globexu dokumentację globalną trzeba by indeksować dwa razy (dwie kolumny, dwa indeksy, dwa zestawy evali).</li>
+  <li><strong>Globex.</strong> Indeksowanie wysyła do modelu <em>pełną treść</em> dokumentów, także wewnętrznych. Przy <code>external_llm_allowed = false</code> to niedopuszczalne, a model lokalny rozwiązuje to dla wszystkich.</li>
+  <li><strong>Stały koszt, brak wycofań, niska latencja.</strong> Dostawca może wycofać model i wymusić reindeks w swoim terminie. Lokalny model z przypiętą rewizją działa, dopóki sam go nie zmienisz, a embedding pytania w tej samej sieci to milisekundy, nie setki milisekund.</li>
+</ol>
+<p>Cena: utrzymujesz serwer. Na CPU bge-m3 (ok. 570 mln parametrów) jest wolny przy masowym indeksowaniu: przy np. 1 500 tokenów/s pełny reindeks 90 mln tokenów trwa ok. 17 godzin, na GPU poniżej godziny (liczby orientacyjne, zmierz u siebie). Bieżące aktualizacje i embeddingi pytań CPU obsłuży bez trudu.</p>
+<h3>Asymetria: pytanie to nie dokument</h3>
+<p>Pytanie ma pięć słów, dokument pięćset. Część modeli obsługuje tę asymetrię prefiksami albo typem wejścia: e5 wymaga „query: ” i „passage: ”, Cohere i Voyage mają <code>input_type</code>, Qwen3-Embedding oczekuje instrukcji przed pytaniem. Pominięty prefiks nie daje błędu, tylko po cichu obniża trafność. Karta bge-m3 mówi, że model „no longer requires adding instructions to the queries”, więc u nas prefiksy są puste. Interfejs aplikacji i tak rozróżnia <code>embedQuery</code> i <code>embedDocuments</code>, żeby zmiana modelu była zmianą konfiguracji.</p>
+
+<h2>TEI i alias helpdesk-embed w LiteLLM</h2>
+<p><dfn data-t="tei">Text Embeddings Inference (TEI)</dfn> to serwer Hugging Face dla modeli embeddingów i rerankerów. Sam łączy żądania w paczki i wystawia m.in. <code>/embed</code>, <code>/rerank</code> oraz zgodny z OpenAI <code>/v1/embeddings</code>. Ollama z 1.6 też by zadziałała, ale TEI ma większą przepustowość i obsługuje rerankery.</p>
+<script type="text/x-code" data-lang="yaml" data-title="docker-compose.yml (dopisane usługi)">
+  services:
+    tei-embed:
+      image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9   # GPU: cuda-1.9; przypnij wersję
+      command:
+        - --model-id=BAAI/bge-m3
+        - --revision=${BGE_M3_REVISION:-main}     # na produkcji: hash commita z Hugging Face
+        - --max-client-batch-size=64              # maks. liczba tekstów w jednym żądaniu
+        - --max-batch-tokens=16384                # budżet tokenów paczki po stronie serwera
+      volumes: ["tei-models:/data"]               # cache pobranych wag (~2,3 GB), bez tego pobiera przy starcie
+      expose: ["80"]                              # tylko sieć wewnętrzna; dostęp przez LiteLLM
+
+    tei-rerank:                                   # alias helpdesk-rerank – konfiguracja w 4.4
+      image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+      command: ["--model-id=BAAI/bge-reranker-v2-m3"]
+      volumes: ["tei-models:/data"]
+      expose: ["80"]
+
+  volumes:
+    tei-models:
+</script>
+<p><code>--revision</code> to odpowiednik <code>model_info.id</code> z 1.3: bez niego nowy commit w repozytorium modelu może po restarcie zmienić wektory. Sprawdź też w swojej wersji <code>--auto-truncate</code>: włączone po cichu przycina tekst dłuższy niż limit modelu. Długość chunków pilnuje <code>KbChunker</code> (4.2).</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml – model_list (dopisane)">
+  model_list:
+    - model_name: helpdesk-embed
+      litellm_params:
+        model: openai/BAAI/bge-m3          # prefiks openai/ = dowolny serwer zgodny z API OpenAI
+        api_base: http://tei-embed:80/v1   # LiteLLM dopisze /embeddings
+        api_key: "unused"                  # TEI w sieci wewnętrznej bez klucza
+      model_info:
+        id: embed-tei-bge-m3-v1            # zmiana modelu = nowe id + reindeks (4.3)
+        mode: embedding                    # health check wywołuje embeddings, nie czat
+</script>
+<p>LiteLLM ma też dostawcę <code>huggingface/</code> dla TEI; sprawdź oba warianty w dokumentacji swojej wersji. Klucz „local-only” z 1.6 (<dfn data-t="virtual-key">klucz wirtualny</dfn> ograniczony do wskazanych aliasów) dostaje aliasy lokalne bazy wiedzy, żeby pomyłka w konfiguracji nie wysłała treści dokumentów na zewnątrz:</p>
+<script type="text/x-code" data-lang="bash" data-title="aktualizacja klucza local-only i test">
+  curl -sS -X POST http://localhost:4000/key/update \
+    -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+    -d '{"key": "'"$LLM_LOCAL_ONLY_API_KEY"'",
+         "models": ["helpdesk-local", "helpdesk-embed", "helpdesk-rerank"]}'
+
+  curl -sS http://localhost:4000/v1/embeddings \
+    -H "Authorization: Bearer $LLM_LOCAL_ONLY_API_KEY" -H "Content-Type: application/json" \
+    -d '{"model": "helpdesk-embed", "input": ["Jak wyeksportować fakturę do PDF?"]}' \
+    | jq '.data[0].embedding | length, (map(. * .) | add | sqrt)'
+  # 1024
+  # 1.0000…  ← długość wektora: TEI normalizuje
+</script>
+
+<h2>Spring AI: EmbeddingModel przez LiteLLM</h2>
+<p><dfn data-t="spring-ai">Spring AI</dfn> ma interfejs <code>EmbeddingModel</code> z metodami <code>embed(String): float[]</code>, <code>embed(List&lt;String&gt;): List&lt;float[]&gt;</code> i <code>call(EmbeddingRequest)</code>. Implementacja OpenAI wysyła żądania na <code>/v1/embeddings</code>, więc działa z LiteLLM bez zmian. Konfiguracja w Spring AI 1.x (nazwy właściwości zmieniały się między wersjami, sprawdź dokumentację wersji z BOM):</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  spring:
+    ai:
+      model:
+        embedding: openai                       # wybór autokonfiguracji EmbeddingModel
+      openai:
+        base-url: ${LLM_BASE_URL:http://localhost:4000}
+        embedding:
+          api-key: ${LLM_LOCAL_ONLY_API_KEY}    # embeddingi zawsze kluczem local-only
+          options:
+            model: helpdesk-embed
+            encoding-format: float
+            # dimensions: NIE ustawiaj – bge-m3 ma stałe 1024 wymiary
+  helpdesk:
+    ai:
+      self-hosted-aliases: [helpdesk-local, helpdesk-embed, helpdesk-rerank]
+      routing:
+        tasks:                    # dotychczasowe zadania z 1.6 bez zmian
+          EMBEDDING:     { external: helpdesk-embed,   local: helpdesk-embed }
+          KB_ANSWER:     { external: helpdesk-default, local: helpdesk-local }
+          QUERY_REWRITE: { external: helpdesk-fast,    local: helpdesk-local }
+    kb:
+      embedding:
+        model-id: bge-m3          # trafia do kb_chunks.embedding_model
+        dimensions: 1024
+        batch-size: 32
+        query-prefix: ""          # bge-m3: bez prefiksów; dla e5 byłoby "query: "
+        document-prefix: ""
+</script>
+<p><code>AiTask</code> z 1.6 dostaje wartości <code>EMBEDDING, KB_ANSWER, QUERY_REWRITE</code>. Haczyk: router z 1.6 ustawiał <code>external = true</code> każdemu tenantowi ze zgodą na zewnętrzne LLM, więc Acme dostałoby <code>Use("helpdesk-embed", external = true)</code>, co jest nieprawdą. Flaga <code>external</code> opisuje <em>alias</em> (czy dane opuszczają infrastrukturę), więc liczymy ją z listy aliasów self-hosted:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/ModelRouter.kt (zmiany)">
+  enum class AiTask { TRIAGE, CHAT, SUMMARY, EXTRACTION, EMBEDDING, KB_ANSWER, QUERY_REWRITE }
+
+  @ConfigurationProperties("helpdesk.ai")
+  data class AiRoutingConfig(
+      val routing: RoutingProperties = RoutingProperties(),
+      val selfHostedAliases: Set<String> = setOf("helpdesk-local"),
+  )
+
+  // w ModelRouter: when { s.externalLlmAllowed -> use(r.external); r.local != null -> use(r.local); else -> Disabled(...) }
+  private fun use(alias: String) = ModelRoute.Use(alias, external = alias !in cfg.selfHostedAliases)
+  // EMBEDDING → Use("helpdesk-embed", external = false) dla każdego tenanta
+</script>
+<p>Dokument globalny nie ma tenanta, o którego mógłby pytać router, dlatego komponent embeddingów sprawdza przy starcie, że trasa EMBEDDING w <em>obu</em> gałęziach prowadzi do aliasu self-hosted; inaczej aplikacja nie wstanie (<dfn data-t="fail-closed">fail closed</dfn>):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/embedding/KbEmbedder.kt">
+  interface KbEmbedder {
+      val modelId: String
+      fun embedQuery(text: String): FloatArray
+      fun embedDocuments(texts: List<String>): List<FloatArray>
+  }
+
+  @ConfigurationProperties("helpdesk.kb.embedding")
+  data class KbEmbeddingProperties(
+      val modelId: String = "bge-m3",
+      val dimensions: Int = 1024,
+      val batchSize: Int = 32,
+      val queryPrefix: String = "",
+      val documentPrefix: String = "",
+  )
+
+  @Component
+  class SpringAiKbEmbedder(
+      private val model: EmbeddingModel,          // autokonfiguracja: helpdesk-embed, klucz local-only
+      private val props: KbEmbeddingProperties,
+      cfg: AiRoutingConfig,
+  ) : KbEmbedder {
+      init {
+          val r = cfg.routing.tasks[AiTask.EMBEDDING] ?: error("Brak trasy EMBEDDING")
+          val aliases = listOfNotNull(r.external, r.local)
+          check(aliases.all { it in cfg.selfHostedAliases }) {
+              "EMBEDDING musi używać wyłącznie modeli self-hosted, jest: $aliases"
+          }
+      }
+
+      override val modelId get() = props.modelId
+
+      override fun embedQuery(text: String): FloatArray =
+          embedBatch(listOf(props.queryPrefix + text.trim())).single()
+
+      override fun embedDocuments(texts: List<String>): List<FloatArray> =
+          texts.map { props.documentPrefix + it }
+              .chunked(props.batchSize)          // jedno żądanie HTTP na paczkę
+              .flatMap(::embedBatch)
+
+      private fun embedBatch(batch: List<String>): List<FloatArray> {
+          val vectors = model.embed(batch)       // List<float[]> = List<FloatArray>
+          check(vectors.size == batch.size) { "Model zwrócił ${vectors.size} wektorów dla ${batch.size} tekstów" }
+          vectors.forEach { v ->
+              check(v.size == props.dimensions) { "Wektor ma ${v.size} wymiarów, oczekiwano ${props.dimensions}" }
+          }
+          return vectors
+      }
+  }
+</script>
+<p>Własny interfejs trzyma prefiksy, paczkowanie i walidację w jednym miejscu, pozwala testom użyć deterministycznej atrapy, a w 4.3 dostanie cache embeddingów. Uwagi produkcyjne:</p>
+<ul>
+  <li><strong>Paczka 32</strong>: mniej żądań HTTP; większe paczki nie przyspieszą CPU, tylko wydłużą żądanie i ryzyko timeoutu.</li>
+  <li><strong>Współbieżność</strong> do TEI ogranicza worker (4.2), bo inaczej embeddingi pytań z czatu czekają w kolejce za tysiącami chunków. Błędy sieciowe ponawia retry Spring AI (<code>spring.ai.retry.*</code>).</li>
+  <li><strong>Kolejność</strong> wektorów względem wejścia sprawdza test z prawdziwym TEI; wywołania trafiają do <code>llm_usage</code> z <code>feature = kb-embed</code> (4.6).</li>
+</ul>
+
+<h2>pgvector: typ, operatory, indeksy</h2>
+<p><dfn data-t="pgvector">pgvector</dfn> to rozszerzenie Postgresa dodające typy wektorowe i indeksy do wyszukiwania najbliższych sąsiadów. Obraz <code>pgvector/pgvector:pg16</code> z lekcji 1.1 ma je wbudowane (tagi typu <code>0.8.x-pg16</code> przypinają wersję rozszerzenia). Na Azure Database for PostgreSQL Flexible Server rozszerzenie <code>vector</code> trzeba dopuścić w parametrze serwera <code>azure.extensions</code>.</p>
+<script type="text/x-code" data-lang="sql" data-title="pierwsze kroki">
+  CREATE EXTENSION IF NOT EXISTS vector;
+  SELECT extversion FROM pg_extension WHERE extname = 'vector';   -- np. 0.8.1
+
+  SELECT '[1,2,3]'::vector <-> '[2,3,4]'::vector;   -- L2:        1.732
+  SELECT '[1,2,3]'::vector <=> '[2,3,4]'::vector;   -- cosinus:   0.0074 (odległość, 1 − cos)
+  SELECT '[1,2,3]'::vector <#> '[2,3,4]'::vector;   -- iloczyn:  -20 (ujemny!)
+  SELECT '[1,2]'::vector <-> '[1,2,3]'::vector;     -- ERROR: different vector dimensions 2 and 3
+</script>
+<p>Typy: <code>vector(n)</code> (float4), <code>halfvec(n)</code> (float2), <code>sparsevec</code> i <code>bit</code>. Bez indeksu <code>ORDER BY embedding &lt;=&gt; :q LIMIT 5</code> porównuje pytanie z każdym wierszem: dokładnie, ale liniowo (200 tys. × 1024 to ok. 200 mln mnożeń, dziesiątki milisekund; przy milionach sekundy).</p>
+<p>Indeksy wektorowe realizują <dfn data-t="ann">przybliżone wyszukiwanie najbliższych sąsiadów (ANN)</dfn>: szybko, ale czasem pomijają któryś z prawdziwych najbliższych wektorów. Jakość mierzy się jako recall (z <dfn data-t="precision-recall">precision/recall</dfn>): jaka część prawdziwych top-k znalazła się w wyniku indeksu. pgvector ma dwa typy indeksów:</p>
+<table>
+  <tr><th>Cecha</th><th><dfn data-t="hnsw">HNSW</dfn></th><th><dfn data-t="ivfflat">IVFFlat</dfn></th></tr>
+  <tr><td>Idea</td><td>Wielowarstwowy graf „sąsiedztwa”; wyszukiwanie schodzi od rzadkiej warstwy górnej do gęstej dolnej</td><td>Wektory podzielone na listy (klastry k-means); szuka się tylko w kilku najbliższych listach</td></tr>
+  <tr><td>Budowa</td><td>Wolniejsza, pamięciożerna; można utworzyć na pustej tabeli</td><td>Szybka, ale wymaga danych: klastry liczone są przy <code>CREATE INDEX</code></td></tr>
+  <tr><td>Pamięć</td><td>Większa (graf)</td><td>Mniejsza</td></tr>
+  <tr><td>Recall a szybkość</td><td>Lepszy kompromis</td><td>Gorszy; zależy od <code>ivfflat.probes</code> (domyślnie 1)</td></tr>
+  <tr><td>Zmiany danych</td><td>Wstawienia bez utraty jakości; VACUUM po masowym usuwaniu wolny (szybszy <code>REINDEX ... CONCURRENTLY</code>)</td><td>Nowe wektory w starych klastrach; przy zmianie rozkładu recall spada, trzeba przebudować</td></tr>
+  <tr><td>Parametry</td><td><code>m</code>, <code>ef_construction</code>, <code>hnsw.ef_search</code></td><td><code>lists</code> (ok. wiersze/1000 do 1 mln), <code>ivfflat.probes</code></td></tr>
+</table>
+<p>Baza wiedzy zmienia się codziennie i zaczyna pusta, więc wybieramy HNSW. IVFFlat ma sens przy dużych, rzadko zmienianych zbiorach, gdy liczy się czas budowy i pamięć.</p>
+
+<h2>Parametry HNSW: recall kontra latencja</h2>
+<table>
+  <tr><th>Parametr</th><th>Domyślnie</th><th>Kiedy</th><th>Efekt zwiększenia</th></tr>
+  <tr><td><code>m</code></td><td>16</td><td>przy budowie (<code>WITH</code>)</td><td>więcej połączeń w grafie: lepszy recall, większy indeks, wolniejsza budowa</td></tr>
+  <tr><td><code>ef_construction</code></td><td>64</td><td>przy budowie</td><td>dokładniejszy graf: lepszy recall, wolniejsza budowa; musi być ≥ 2·m</td></tr>
+  <tr><td><code>hnsw.ef_search</code></td><td>40</td><td>przy zapytaniu (<code>SET LOCAL</code>)</td><td>więcej kandydatów przeglądanych w grafie: lepszy recall, większa latencja</td></tr>
+</table>
+<p>Przykładowy pomiar dla 200 tys. wektorów 1024D, <code>m = 16</code> (liczby ilustracyjne, zmierz ćwiczeniem 4): <code>ef_search</code> 10 → recall@10 ok. 0,85 i ~1 ms; 40 → ok. 0,95 i ~2 ms; 100 → ok. 0,99 i ~4 ms; pełny skan → 1,00 i ~60 ms.</p>
+<p>Domyślne parametry budowy wystarczą dla setek tysięcy wektorów, a <code>ef_search</code> stroisz per zapytanie. Przy wywołaniu LLM trwającym sekundy różnica 2 ms a 4 ms jest pomijalna, więc ustawiamy 100.</p>
+<div class="box warn"><span class="label">Pułapka: ef_search ogranicza liczbę wyników</span><p>Skan HNSW zwraca najwyżej <code>ef_search</code> kandydatów, a <code>WHERE</code> filtruje <em>po</em> nich. <code>LIMIT 50</code> przy domyślnym 40 da najwyżej 40 wierszy, a filtr tenanta przepuszczający 5% wierszy zostawi z 40 kandydatów średnio 2, bez błędu. Rozwiązania (<code>hnsw.iterative_scan</code> z pgvector 0.8+, indeksy częściowe, partycje) w 4.4; zapamiętaj objaw: „za mało wyników przy selektywnym filtrze”.</p></div>
+<h3><dfn data-t="halfvec">halfvec</dfn>: połowa pamięci</h3>
+<p><code>halfvec</code> (od pgvector 0.7) zapisuje liczbę na 2 bajtach; dla embeddingów recall zwykle praktycznie się nie zmienia, a indeks maleje z ok. 1,6 do 0,55 GB. Można mieć kolumnę <code>halfvec(1024)</code> albo zostawić <code>vector(1024)</code> i zbudować indeks na wyrażeniu:</p>
+<script type="text/x-code" data-lang="sql" data-title="indeks halfvec na wyrażeniu (opcja na później)">
+  CREATE INDEX CONCURRENTLY ix_kb_chunks_embedding_half ON kb_chunks
+      USING hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops);
+
+  -- zapytanie MUSI używać identycznego wyrażenia, inaczej planer nie użyje indeksu
+  SELECT id FROM kb_chunks
+  ORDER BY embedding::halfvec(1024) <=> CAST(:q AS halfvec(1024))
+  LIMIT 5;
+</script>
+<p>Kontrakt M4 zostaje przy <code>vector(1024)</code>: przy 200 tys. chunków oszczędność 1 GB nie uzasadnia złożoności, ale przy milionach to pierwsza dźwignia przed osobną bazą.</p>
+
+<h2>Schemat: migracja V40</h2>
+<p>Migracja tworzy dwie główne tabele; <code>kb_ingestion_jobs</code>, <code>kb_embedding_cache</code> i <code>kb_feedback</code> dołożą lekcje 4.2, 4.3 i 4.5. Konfiguracja pełnotekstowa idzie pierwsza, bo używa jej kolumna generowana (następna sekcja).</p>
+<script type="text/x-code" data-lang="sql" data-title="V40__knowledge_base.sql">
+  CREATE EXTENSION IF NOT EXISTS vector;
+  CREATE EXTENSION IF NOT EXISTS unaccent;
+
+  CREATE TEXT SEARCH CONFIGURATION kb_pl (COPY = simple);
+  ALTER TEXT SEARCH CONFIGURATION kb_pl
+      ALTER MAPPING FOR hword, hword_part, word WITH unaccent, simple;
+
+  CREATE TABLE kb_documents (
+      id               uuid PRIMARY KEY,
+      tenant_id        uuid REFERENCES tenants(id),       -- NULL = globalny (dokumentacja produktu)
+      source_type      text NOT NULL CHECK (source_type IN ('UPLOAD','CONFLUENCE','URL','TICKET_SOLUTION')),
+      source_uri       text,
+      external_id      text,
+      title            text NOT NULL,
+      language         text NOT NULL DEFAULT 'pl',
+      visibility       text NOT NULL CHECK (visibility IN ('PUBLIC','INTERNAL')),
+      authority        text NOT NULL DEFAULT 'TEAM' CHECK (authority IN ('OFFICIAL','TEAM','DRAFT')),
+      status           text NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','ARCHIVED','DELETED')),
+      current_version  int  NOT NULL DEFAULT 1,
+      content_hash     text,
+      valid_from       timestamptz,
+      valid_until      timestamptz,
+      review_due_at    timestamptz,
+      owner_id         uuid NOT NULL,
+      created_at       timestamptz NOT NULL DEFAULT now(),
+      updated_at       timestamptz NOT NULL DEFAULT now(),
+      deleted_at       timestamptz
+  );
+
+  CREATE TABLE kb_chunks (
+      id                uuid PRIMARY KEY,
+      document_id       uuid NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+      document_version  int  NOT NULL,
+      tenant_id         uuid,                              -- zdenormalizowane z dokumentu
+      visibility        text NOT NULL CHECK (visibility IN ('PUBLIC','INTERNAL')),
+      chunk_index       int  NOT NULL,
+      heading_path      text,                              -- "Faktury > Eksport > PDF"
+      content           text NOT NULL,
+      token_count       int  NOT NULL,
+      embedding         vector(1024) NOT NULL,
+      embedding_model   text NOT NULL,
+      content_tsv       tsvector GENERATED ALWAYS AS (
+                            setweight(to_tsvector('kb_pl', coalesce(heading_path, '')), 'A') ||
+                            setweight(to_tsvector('kb_pl', content), 'B')) STORED,
+      created_at        timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT uq_kb_chunks_position UNIQUE (document_id, document_version, chunk_index)
+  );
+
+  SET maintenance_work_mem = '1GB';                          -- tylko ta sesja migracji
+  CREATE INDEX ix_kb_chunks_embedding_hnsw ON kb_chunks
+      USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+  CREATE INDEX ix_kb_chunks_tsv ON kb_chunks USING gin (content_tsv);
+  CREATE INDEX ix_kb_chunks_tenant_vis ON kb_chunks (tenant_id, visibility);   -- (document_id, version): unikalny wyżej
+
+  -- RLS: odczyt dokumentów globalnych + własnych tenantów
+  ALTER TABLE kb_documents ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE kb_documents FORCE ROW LEVEL SECURITY;
+  CREATE POLICY kb_read ON kb_documents FOR SELECT USING (
+      current_setting('app.bypass_rls', true) = 'on'
+      OR current_setting('app.system_job', true) = 'on'
+      OR tenant_id IS NULL
+      OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+  -- zapis: bez "tenant_id IS NULL" – dokument globalny wstawi tylko ADMIN albo worker systemowy
+  CREATE POLICY kb_write ON kb_documents FOR ALL
+      USING (
+          current_setting('app.bypass_rls', true) = 'on'
+          OR current_setting('app.system_job', true) = 'on'
+          OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]))
+      WITH CHECK (
+          current_setting('app.bypass_rls', true) = 'on'
+          OR current_setting('app.system_job', true) = 'on'
+          OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+  -- kb_chunks: identyczne polityki kb_read i kb_write (pominięte dla zwięzłości)
+
+  GRANT SELECT, INSERT, UPDATE, DELETE ON kb_documents, kb_chunks TO helpdesk_app;
+</script>
+<p>Decyzje warte komentarza:</p>
+<ul>
+  <li><strong><code>tenant_id</code> i <code>visibility</code> w chunkach</strong> (denormalizacja jak w <code>comments</code> z 1.1): filtr i <dfn data-t="rls">RLS</dfn> działają bez joina. Ceną jest synchronizacja przy zmianie widoczności dokumentu (4.3).</li>
+  <li><strong>Dwie polityki.</strong> <code>tenant_id IS NULL</code> w <code>USING</code> bez <code>WITH CHECK</code> pozwoliłoby każdemu agentowi wstawić dokument globalny, widoczny u wszystkich tenantów: idealny kanał pośredniego prompt injection (3.4). Polityki <code>PERMISSIVE</code> łączą się przez OR, więc odczyt widzi dokumenty globalne, a zapis nie. Worker indeksujący włącza <code>app.system_job</code> z 2.5.</li>
+  <li><strong><code>embedding vector(1024) NOT NULL</code></strong> odrzuca wektor o innej liczbie wymiarów, a <strong><code>embedding_model</code></strong> mówi, z której przestrzeni jest wektor (zmiana modelu, 4.3).</li>
+  <li>Migrację wykonuje <dfn data-t="flyway">Flyway</dfn> jako właściciel schematu. Przebudowy indeksu na pełnej tabeli rób przez <code>CREATE INDEX CONCURRENTLY</code> w osobnej migracji bez transakcji.</li>
+</ul>
+
+<h2>Wyszukiwanie pełnotekstowe po polsku</h2>
+<p><code>content_tsv</code> obsługuje „słownikową” część hybrydy (4.4). <dfn data-t="tsvector">tsvector</dfn> to postgresowa reprezentacja tekstu jako listy znormalizowanych słów (leksemów) z pozycjami, indeksowana przez GIN i odpytywana <code>tsquery</code>; normalizację wyznacza <em>konfiguracja</em> wyszukiwania. PostgreSQL nie ma wbudowanego stemmera polskiego (Snowball ma m.in. angielski, niemiecki, rosyjski).</p>
+<table>
+  <tr><th>Opcja</th><th>Co daje</th><th>Ograniczenia</th></tr>
+  <tr><td><code>simple</code> + <code>unaccent</code> (wybrane)</td><td>małe litery, usunięte znaki diakrytyczne: „załącznik” = „zalacznik”, „Łódź” = „lodz”</td><td>brak odmiany: „faktura”, „faktury”, „fakturze” to trzy różne leksemy; brak listy słów pomijanych („jak”, „się”, „do” trafiają do indeksu)</td></tr>
+  <tr><td>Słownik ispell/hunspell pl</td><td>sprowadzanie do formy podstawowej</td><td>wymaga plików słownika w katalogu serwera (<code>tsearch_data</code>); na usługach zarządzanych, np. Azure Flexible Server, zwykle niedostępne (sprawdź); duży słownik spowalnia pierwsze użycie w sesji</td></tr>
+</table>
+<p>Wybieramy <code>simple + unaccent</code> (konfiguracja <code>kb_pl</code>), bo działa wszędzie i jest przewidywalne. Brak odmiany łagodzą: wektor, który odmianę rozumie; zapytania prefiksowe (<code>faktur:*</code> pasuje do „faktura”, „fakturze”), które buduje 4.4; oraz to, że część pełnotekstowa ma łapać głównie kody i nazwy własne, a te się nie odmieniają.</p>
+<script type="text/x-code" data-lang="sql" data-title="jak to działa">
+  SELECT to_tsvector('kb_pl', 'Eksport faktur do PDF – błąd w Łodzi');
+  -- 'blad':5 'do':3 'eksport':1 'faktur':2 'lodzi':7 'pdf':4 'w':6
+  -- kody typu ERR-4012 parser dzieli na części – sprawdź: ts_debug('kb_pl', 'ERR-4012')
+
+  SELECT id, ts_rank(content_tsv, q) AS rank
+  FROM kb_chunks, websearch_to_tsquery('kb_pl', 'ERR-4012 eksport') q
+  WHERE content_tsv @@ q
+  ORDER BY rank DESC LIMIT 10;
+</script>
+<p><code>to_tsvector</code> z nazwą konfiguracji jest oznaczona jako IMMUTABLE, więc może tworzyć kolumnę generowaną. Skutek uboczny: zmiana <code>kb_pl</code> nie przelicza zapisanych wartości, trzeba je przeliczyć partiami (<code>UPDATE kb_chunks SET content = content</code>). Nagłówki mają wagę A, treść B, więc trafienie w <code>heading_path</code> waży więcej w <code>ts_rank</code>.</p>
+
+<h2>Własne tabele, PgVectorStore i bazy wektorowe</h2>
+<p>Spring AI ma gotowy <code>PgVectorStore</code>, który tworzy tabelę i robi wyszukiwanie. Dla kontrastu (nazwy według Spring AI 1.x, sprawdź w swojej wersji):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="dla porównania: PgVectorStore">
+  @Bean
+  fun vectorStore(jdbc: JdbcTemplate, embeddingModel: EmbeddingModel): VectorStore =
+      PgVectorStore.builder(jdbc, embeddingModel)
+          .dimensions(1024)
+          .distanceType(PgVectorStore.PgDistanceType.COSINE_DISTANCE)
+          .indexType(PgVectorStore.PgIndexType.HNSW)
+          .initializeSchema(true)       // tabela vector_store(id, content, metadata json, embedding)
+          .build()
+
+  // zapis i wyszukiwanie
+  vectorStore.add(listOf(Document("Aby wyeksportować faktury do PDF…",
+      mapOf("tenantId" to "GLOBAL", "visibility" to "PUBLIC"))))
+
+  val b = FilterExpressionBuilder()
+  val hits = vectorStore.similaritySearch(SearchRequest.builder()
+      .query("eksport faktury pdf").topK(5)
+      .filterExpression(b.and(
+          b.`in`("tenantId", "GLOBAL", acmeId.toString()),
+          b.eq("visibility", "PUBLIC")).build())
+      .build())
+</script>
+<p>Na prototyp wystarcza. Dla HelpDesk (argumenty jak przy <code>ConversationStore</code> w 2.5):</p>
+<table>
+  <tr><th>Wymaganie</th><th><code>PgVectorStore</code></th><th><code>kb_documents</code> + <code>kb_chunks</code></th></tr>
+  <tr><td>Izolacja tenantów</td><td>Filtr na JSON <code>metadata</code>; zapomniany filtr = wyciek; RLS na JSON możliwe, ale niewygodne</td><td>Kolumny <code>tenant_id</code>, <code>visibility</code>, RLS jak w całym systemie</td></tr>
+  <tr><td>Dokumenty globalne</td><td>Umowna wartość <code>"GLOBAL"</code> w metadanych</td><td><code>tenant_id IS NULL</code> z osobną polityką zapisu</td></tr>
+  <tr><td>Wersje i przełączanie</td><td>Brak; usuń i wstaw</td><td><code>document_version</code>, <code>current_version</code>, przełączenie w transakcji (4.3)</td></tr>
+  <tr><td>Usuwanie i spójność</td><td>Po ID albo filtrze; brak relacji z dokumentem</td><td>Klucz obcy, status, job spójności</td></tr>
+  <tr><td>Hybryda</td><td>Tylko wektor</td><td><code>content_tsv</code> + GIN w tej samej tabeli</td></tr>
+</table>
+<p>Źródłem prawdy są więc nasze tabele, a Spring AI zostaje do embeddingów i wywołań modelu. <code>PgVectorStore</code> przyda się do eksperymentu na kopii danych, np. porównania dwóch modeli przed reindeksem.</p>
+<h3>Postgres czy dedykowana baza wektorowa</h3>
+<p><dfn data-t="vector-database">Bazy wektorowe</dfn> (Qdrant, Weaviate, Pinecone, Milvus) to systemy zbudowane wokół wyszukiwania ANN, z własnym API, filtrowaniem po metadanych i skalowaniem poziomym. W HelpDesk świadomie zostajemy przy Postgresie:</p>
+<table>
+  <tr><th>Kryterium</th><th>Postgres + pgvector</th><th>Dedykowana baza</th></tr>
+  <tr><td>Spójność</td><td>Dokument, chunki i status w jednej transakcji</td><td>Dwa systemy, synchronizacja, okno niespójności</td></tr>
+  <tr><td>Uprawnienia i usuwanie (RODO)</td><td>RLS; <code>DELETE</code> razem z dokumentem</td><td>Filtry tenantów powielone w kodzie; usuwanie ponawiane i monitorowane osobno</td></tr>
+  <tr><td>Funkcje ANN</td><td>HNSW/IVFFlat, halfvec, iterative scan, tsvector</td><td>Często bogatsze: wektory rzadkie i wielokrotne, kwantyzacja, sharding</td></tr>
+  <tr><td>Skala i operacje</td><td>Kilka–kilkanaście mln wektorów na węzeł, gdy indeks mieści się w RAM; istniejące backupy i dyżury</td><td>Setki milionów; nowy komponent krytyczny</td></tr>
+</table>
+<p>Zmiana ma sens, gdy indeks nie mieści się w pamięci serwera nawet z <code>halfvec</code>, ruch wektorowy obciąża główną bazę (najpierw replika do odczytu), potrzebujesz funkcji, których pgvector nie ma, albo zespół już utrzymuje taką bazę. Przy 200 tys. chunków mamy zapas dwóch rzędów wielkości.</p>
+
+<h2>Minimalne wyszukiwanie end-to-end</h2>
+<p>Najprostsza wersja: embedding pytania, top-k po cosinusie, filtr tenanta i widoczności, tylko aktywne dokumenty w bieżącej wersji. Pełną wersję z hybrydą, rerankiem i <code>KnowledgeApi.search</code> buduje lekcja 4.4; ta posłuży do testów i ewaluacji samego embeddingu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/search/KbVectorSearch.kt">
+  data class KbVectorHit(
+      val chunkId: UUID, val documentId: UUID, val title: String,
+      val headingPath: String?, val content: String, val score: Double,   // score = cos, im więcej, tym lepiej
+  )
+
+  @Repository
+  class KbVectorSearch(private val jdbc: JdbcClient, private val embedder: KbEmbedder) {
+
+      /** Wymaga transakcji z TenantSession.bind(user) – RLS jako druga warstwa. */
+      fun nearest(tenantId: UUID, visibilities: Set<String>, query: String, limit: Int = 5): List<KbVectorHit> {
+          require(limit in 1..50) { "limit poza zakresem" }
+          check(TransactionSynchronizationManager.isActualTransactionActive()) { "wymaga transakcji" }
+          val q = PgVector.literal(embedder.embedQuery(query))
+          jdbc.sql("SET LOCAL hnsw.ef_search = 100").update()       // tylko ta transakcja
+          return jdbc.sql(
+              """
+              SELECT c.id, c.document_id, d.title, c.heading_path, c.content,
+                     1 - (c.embedding <=> CAST(:q AS vector)) AS score
+              FROM kb_chunks c
+              JOIN kb_documents d ON d.id = c.document_id
+              WHERE (c.tenant_id IS NULL OR c.tenant_id = :tenantId)
+                AND c.visibility IN (:vis)
+                AND c.embedding_model = :model
+                AND d.status = 'ACTIVE'
+                AND c.document_version = d.current_version
+              ORDER BY c.embedding <=> CAST(:q AS vector)
+              LIMIT :limit
+              """.trimIndent())
+              .param("q", q).param("tenantId", tenantId).param("vis", visibilities)
+              .param("model", embedder.modelId).param("limit", limit)
+              .query { rs, _ ->
+                  KbVectorHit(rs.getObject("id", UUID::class.java), rs.getObject("document_id", UUID::class.java),
+                      rs.getString("title"), rs.getString("heading_path"), rs.getString("content"), rs.getDouble("score"))
+              }.list()
+      }
+  }
+
+  object PgVector {
+      /** Format tekstowy pgvector: [0.1,0.2,…]. Alternatywa: klasa PGvector z biblioteki com.pgvector:pgvector. */
+      fun literal(v: FloatArray): String = v.joinToString(",", "[", "]")
+  }
+</script>
+<ul>
+  <li><strong><code>ORDER BY</code> po samym operatorze, rosnąco, z <code>LIMIT</code></strong>. <code>ORDER BY score DESC</code> daje ten sam wynik, ale planer nie rozpozna wzorca i zrobi pełny skan z sortowaniem.</li>
+  <li><strong>Operator zgodny z klasą operatorów</strong>: <code>vector_cosine_ops</code> obsługuje tylko <code>&lt;=&gt;</code>; zapytanie z <code>&lt;-&gt;</code> pominie indeks bez ostrzeżenia.</li>
+  <li><strong><code>CAST(:q AS vector)</code></strong> zamiast <code>:q::vector</code>: dwukropki łatwo pomylić z parametrem nazwanym.</li>
+  <li><strong>Filtr tenanta jawnie w SQL</strong>, mimo RLS, i <strong><code>embedding_model = :model</code></strong> przeciw wektorom innego modelu w trakcie reindeksu.</li>
+</ul>
+<p>Wywołujący serwis robi to, co każde miejsce dostępu do danych w HelpDesk: <code>tenants.get(user, tenantId)</code> (404), <code>TenantSession.bind(user)</code> w transakcji, a widoczność wg roli (<code>user.isStaff</code> → PUBLIC + INTERNAL, klient → PUBLIC).</p>
+
+<h2>EXPLAIN: czy indeks naprawdę działa</h2>
+<p>Najczęstszy błąd w pgvector to indeks, którego planer nie używa: wszystko działa, tylko wolno, a w testach na 50 wierszach nikt tego nie zauważa. Sprawdzaj plan na danych zbliżonych do produkcyjnych:</p>
+<script type="text/x-code" data-lang="sql" data-title="EXPLAIN (ANALYZE, BUFFERS) – oczekiwany plan">
+  Limit  (actual time=2.1..2.4 rows=5 loops=1)
+    ->  Nested Loop  (rows=5)
+          ->  Index Scan using ix_kb_chunks_embedding_hnsw on kb_chunks c  (rows=5)
+                Order By: (embedding <=> '[0.0132,-0.0411,...]'::vector)
+                Filter: (((tenant_id IS NULL) OR (tenant_id = '0b8f…'::uuid))
+                         AND (visibility = ANY ('{PUBLIC}'::text[])) AND (embedding_model = 'bge-m3'::text))
+                Rows Removed by Filter: 23
+                Buffers: shared hit=412
+          ->  Index Scan using kb_documents_pkey on kb_documents d
+                Index Cond: (id = c.document_id)
+                Filter: ((status = 'ACTIVE') AND (c.document_version = current_version))
+  Execution Time: 2.6 ms
+</script>
+<ul>
+  <li><strong><code>Index Scan using ix_kb_chunks_embedding_hnsw</code> z <code>Order By</code></strong>: indeks działa. <code>Seq Scan</code> + <code>Sort</code> to pełny skan.</li>
+  <li><strong><code>Rows Removed by Filter</code></strong> zbliżone do <code>ef_search</code>: zapytanie zaczyna zwracać mniej niż <code>LIMIT</code>.</li>
+  <li><strong><code>Buffers: shared read</code></strong> przy każdym zapytaniu: indeks nie mieści się w pamięci.</li>
+</ul>
+<p>Typowe przyczyny pełnego skanu: brak <code>LIMIT</code> albo <code>ORDER BY score DESC</code>; operator spoza klasy indeksu; inne wyrażenie niż w indeksie (indeks na <code>embedding::halfvec(1024)</code>, zapytanie po <code>embedding</code>); mała tabela, dla której skan jest naprawdę tańszy (w teście <code>SET LOCAL enable_seqscan = off</code>); bardzo selektywny filtr, przy którym planer woli B-tree <code>(tenant_id, visibility)</code> i dokładne sortowanie, co dla małego tenanta bywa dobrą decyzją (4.4).</p>
+
+<h2>Test integracyjny: Testcontainers i atrapa embeddingów</h2>
+<p>Test sprawdza SQL, RLS i indeks, nie jakość modelu, więc zamiast TEI używa deterministycznej atrapy, która haszuje słowa do 1024 wymiarów. Teksty z tymi samymi słowami są „podobne”, co wystarcza do sprawdzenia filtrów. Testcontainers (z 1.1) uruchamia prawdziwy Postgres z pgvector.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="HashingKbEmbedder.kt (test)">
+  class HashingKbEmbedder(private val dims: Int = 1024) : KbEmbedder {
+      override val modelId = "bge-m3"     // udajemy bieżący model, żeby przejść filtr embedding_model
+      override fun embedQuery(text: String) = embed(text)
+      override fun embedDocuments(texts: List<String>) = texts.map(::embed)
+
+      private fun embed(text: String): FloatArray {
+          val v = FloatArray(dims)
+          Regex("\\p{L}+|\\d+").findAll(text.lowercase()).forEach { v[Math.floorMod(it.value.hashCode(), dims)] += 1f }
+          val norm = sqrt(v.sumOf { (it * it).toDouble() }).toFloat().takeIf { it > 0 } ?: 1f
+          return FloatArray(dims) { v[it] / norm }
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="KbVectorSearchIT.kt">
+  @SpringBootTest
+  @Testcontainers
+  @Import(KbVectorSearchIT.FakeEmbedding::class)
+  class KbVectorSearchIT(
+      @Autowired private val search: KbVectorSearch,
+      @Autowired private val tx: TransactionTemplate,
+      @Autowired private val jdbc: JdbcTemplate,
+      @Autowired private val session: TenantSession,
+      @Autowired private val seed: KbTestSeed,          // wstawia dokumenty jako app.system_job
+  ) {
+      @TestConfiguration
+      class FakeEmbedding { @Bean @Primary fun kbEmbedder(): KbEmbedder = HashingKbEmbedder() }
+
+      companion object {
+          @Container @ServiceConnection @JvmStatic
+          val postgres = PostgreSQLContainer(
+              DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres"))
+              .withInitScript("db/init/01-users.sql")   // tworzy helpdesk_app (nie-superuser)
+      }
+
+      @BeforeEach fun data() = seed.standardDocuments()   // instrukcja PDF (globalna), SSO (Globex), premium (Acme)
+
+      /** Superuser kontenera omija RLS nawet z FORCE – dlatego przełączamy się na rolę aplikacji. */
+      private fun <T> asApp(user: CurrentUser, block: () -> T): T = tx.execute {
+          jdbc.execute("SET LOCAL ROLE helpdesk_app")
+          session.bind(user)
+          block()
+      }!!
+
+      @Test
+      fun `klient Acme dostaje instrukcje globalna i nic z Globexu ani INTERNAL`() {
+          val hits = asApp(ANNA_ACME) { search.nearest(ACME, setOf("PUBLIC"), "eksport faktur PDF") }
+          assertThat(hits).isNotEmpty
+          assertThat(hits.first().title).isEqualTo("Eksport faktur do PDF – instrukcja")
+          assertThat(hits.map { it.title }).noneMatch { it.contains("SSO") || it.contains("premium") }
+      }
+
+      @Test
+      fun `zapytanie top-k uzywa indeksu HNSW`() {
+          val plan = asApp(ANNA_ACME) {
+              jdbc.execute("SET LOCAL enable_seqscan = off")    // mała tabela: wymuś decyzję planera
+              val q = PgVector.literal(HashingKbEmbedder().embedQuery("pdf"))
+              jdbc.queryForList("EXPLAIN SELECT id FROM kb_chunks ORDER BY embedding <=> CAST(? AS vector) LIMIT 5",
+                  String::class.java, q).joinToString("\n")
+          }
+          assertThat(plan).contains("ix_kb_chunks_embedding_hnsw")
+      }
+      // także: PIOTR_AGENT wstawia dokument z tenant_id = null → naruszenie polityki RLS (kb_write)
+      //        wektor 1536D przy INSERT → DataAccessException (expected 1024 dimensions)
+  }
+</script>
+<p>Jakość prawdziwego modelu sprawdza osobny test z TEI w kontenerze (pobiera ok. 2,3 GB wag: <code>@Tag("slow")</code> i cache na CI). Asercje dotyczą <em>kolejności</em>, nie wartości zależnych od modelu:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="BgeM3SemanticsIT.kt">
+  @Tag("slow")
+  @Testcontainers
+  class BgeM3SemanticsIT {
+      companion object {
+          @Container @JvmStatic
+          val tei = GenericContainer(DockerImageName.parse("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9"))
+              .withCommand("--model-id=BAAI/bge-m3")
+              .withExposedPorts(80)
+              .waitingFor(Wait.forHttp("/health").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(15)))
+      }
+
+      private val model by lazy {      // bezpośrednio do TEI, z pominięciem LiteLLM
+          val api = OpenAiApi.builder().baseUrl("http://${tei.host}:${tei.getMappedPort(80)}").apiKey("unused").build()
+          OpenAiEmbeddingModel(api, MetadataMode.EMBED,
+              OpenAiEmbeddingOptions.builder().model("bge-m3").build(), RetryUtils.DEFAULT_RETRY_TEMPLATE)
+      }
+
+      @Test
+      fun `pytanie po polsku i angielsku trafia w instrukcje PDF`() {
+          val docs = model.embed(listOf(
+              "Eksport faktur do PDF: wybierz faktury, kliknij Eksportuj i wybierz format PDF.",
+              "Procedura eskalacji problemów z logowaniem SSO.", "Zmiana hasła użytkownika w panelu."))
+          for (question in listOf("Jak zapisać rachunek jako PDF?", "How do I export invoices to PDF?")) {
+              val q = model.embed(question)
+              val scores = docs.map { d -> q.indices.sumOf { (q[it] * d[it]).toDouble() } }   // wektory znormalizowane
+              assertThat(scores.indexOf(scores.max())).describedAs(question).isEqualTo(0)
+          }
+      }
+  }
+</script>
+<p>Ten test łapie zły prefiks, inny model pod aliasem i utratę normalizacji. Pełną miarę jakości (recall@k na <code>cases.yaml</code>) dadzą evale wyszukiwania z 4.7.</p>
+
+<h2>Przypadki brzegowe i pułapki</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Co się dzieje</th><th>Co robimy</th></tr>
+  <tr><td>Bardzo krótkie zapytanie: „PDF”</td><td>Wektor jednego słowa jest „rozmyty”: blisko wszystkiego o PDF-ach (eksport, druk, limit rozmiaru), z podobnymi wynikami</td><td>W <code>KB_ANSWER</code> pytanie budujemy z tytułu i opisu zgłoszenia; opcjonalnie <code>QUERY_REWRITE</code> (4.6) i hybryda (4.4). Dla 1–2 słów bez kontekstu lepsza prośba o doprecyzowanie niż pięć przypadkowych trafień</td></tr>
+  <tr><td>Kody i numery: „ERR-4012”, „HD-1042”</td><td>Tokenizer tnie kod na kawałki, a model zna znaczenie, nie identyfikatory: „ERR-4012” i „ERR-4021” mają prawie ten sam wektor</td><td><code>content_tsv</code> dopasowuje kod dokładnie, RRF w 4.4 łączy rankingi. To główny powód hybrydy</td></tr>
+  <tr><td>Mieszanie języków</td><td>bge-m3 znajduje dokument angielski dla pytania po polsku (zaleta), ale <code>kb_pl</code> nie stemmuje angielskiego, a odpowiedź może przejść na język źródła</td><td>Prompt <code>kb-answer/v1</code> wymaga języka pytania; evale 4.7 w obu językach</td></tr>
+  <tr><td>Wektory z dwóch modeli w jednej kolumnie (też cicha podmiana modelu pod aliasem)</td><td>Przy tej samej liczbie wymiarów INSERT przechodzi, a odległości między przestrzeniami są przypadkowe: śmieci z wiarygodnymi wynikami, bez błędu</td><td>Kolumna i filtr <code>embedding_model</code>, przypięta <code>--revision</code>, nowe <code>model_info.id</code>, test <code>BgeM3SemanticsIT</code>, reindeks blue/green (4.3)</td></tr>
+</table>
+<div class="box bug"><span class="label">Pułapka produkcyjna: „działa, tylko gorzej”</span><p>Błędy RAG rzadko kończą się wyjątkiem. Zły prefiks, dwa modele w kolumnie, przycięte chunki czy za mało kandydatów z indeksu dają odpowiedzi nieco gorsze. Obroną są liczby: evale wyszukiwania (4.7) przy każdej zmianie modelu, chunkingu i indeksu oraz produkcyjny odsetek pytań bez trafienia powyżej progu.</p></div>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Uruchom <code>tei-embed</code> i alias <code>helpdesk-embed</code>. Przez LiteLLM policz embeddingi pięciu par: pytanie po polsku i po angielsku, synonimy („faktura”/„rachunek”), dwa kody błędów różniące się jedną cyfrą. Wypisz cosinusy i sprawdź, gdzie model „widzi” podobieństwo, a gdzie zawodzi.</li>
+  <li>Zastosuj migrację V40, wstaw trzy dokumenty z kontraktu i uruchom <code>EXPLAIN ANALYZE</code> dla zapytania z <code>KbVectorSearch</code>, potem bez <code>LIMIT</code>, z <code>ORDER BY score DESC</code> i z operatorem <code>&lt;-&gt;</code>. Zanotuj, kiedy pojawia się <code>Seq Scan</code>.</li>
+  <li>Policz pamięć dla własnej bazy (dokumenty × średnia długość / 450 tokenów = chunki), dla <code>vector</code> i <code>halfvec</code>. Załaduj 100 tys. losowych wektorów i porównaj szacunek z <code>pg_relation_size</code> indeksu.</li>
+  <li>Zmierz recall HNSW: dla 50 zapytań porównaj dokładne top-10 (<code>SET LOCAL enable_indexscan = off</code>) z top-10 z indeksu przy <code>hnsw.ef_search</code> = 10, 40, 100, razem z latencją p50.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="1">
+  <p class="q">Baza wiedzy Acme ma 1,2 mln tokenów, część dokumentów jest INTERNAL, a procedury zmieniają się co tydzień. Co wybrać?</p>
+  <button>Fine-tuning modelu na dokumentach Acme, bo wtedy koszt zapytania jest zerowy</button>
+  <button>RAG: wyszukanie kilku fragmentów z filtrem tenanta i widoczności, z cytatem źródła</button>
+  <button>Cały materiał w prompcie z prompt cachingiem</button>
+  <p class="explain">1,2 mln tokenów nie mieści się w typowym oknie, a z cache kosztuje ok. 0,36 USD na pytanie. Fine-tuning nie respektuje uprawnień i nie nadąża za zmianami. RAG to ok. 2 300 tokenów, filtr uprawnień i aktualizacja w minutach.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="2">
+  <p class="q">Dlaczego HelpDesk liczy embeddingi wszystkich tenantów jednym lokalnym modelem, choć zewnętrzne API byłoby tańsze w przeliczeniu na tokeny?</p>
+  <button>Bo modele zewnętrzne nie obsługują języka polskiego</button>
+  <button>Bo pgvector nie przyjmuje wektorów z modeli zewnętrznych</button>
+  <button>Bo wektory różnych modeli są nieporównywalne, a treść Globexu nie może opuścić infrastruktury przy indeksowaniu</button>
+  <p class="explain">Jedna przestrzeń pozwala indeksować dokumenty globalne raz i szukać w nich z każdego tenanta. Indeksowanie wysyła pełną treść, więc dla Globexu model musi być lokalny, a wtedy najprościej użyć go dla wszystkich.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="0">
+  <p class="q">Masz indeks <code>USING hnsw (embedding vector_cosine_ops)</code>. Które zapytanie go użyje?</p>
+  <button><code>ORDER BY embedding &lt;=&gt; :q LIMIT 5</code></button>
+  <button><code>ORDER BY 1 - (embedding &lt;=&gt; :q) DESC LIMIT 5</code></button>
+  <button><code>ORDER BY embedding &lt;-&gt; :q LIMIT 5</code></button>
+  <p class="explain">Planer rozpoznaje tylko sortowanie rosnące po operatorze z klasy operatorów indeksu, z <code>LIMIT</code>. Wyrażenie <code>1 − odległość</code> malejąco daje ten sam wynik, ale wymusza pełny skan; <code>&lt;-&gt;</code> to L2, a indeks jest cosinusowy.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="2">
+  <p class="q">Zapytanie z filtrem na mały tenant i <code>LIMIT 10</code> zwraca czasem 3 wyniki, choć pasujących chunków jest kilkadziesiąt. Najbardziej prawdopodobna przyczyna?</p>
+  <button>RLS ukrywa część wierszy tenanta</button>
+  <button>Indeks HNSW jest uszkodzony i wymaga REINDEX</button>
+  <button>Skan HNSW zwraca najwyżej <code>ef_search</code> kandydatów, a filtr tenanta odrzuca większość z nich po wyszukiwaniu</button>
+  <p class="explain">To klasyczny problem filtrowania po wyszukiwaniu przybliżonym: przy domyślnym <code>ef_search = 40</code> i filtrze przepuszczającym kilka procent wierszy zostają pojedyncze wyniki. Rozwiązania (iterative scan, indeksy częściowe) omawia 4.4.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Ktoś podmienił w LiteLLM model pod <code>helpdesk-embed</code> na inny, też 1024-wymiarowy. Nowe chunki zapisują się bez błędów. Co się dzieje?</p>
+  <button>Nic złego: ta sama liczba wymiarów oznacza tę samą przestrzeń</button>
+  <button>Nowe i stare wektory są w różnych przestrzeniach; wyszukiwanie po cichu zwraca słabe wyniki z wiarygodnymi wartościami podobieństwa</button>
+  <button>pgvector odrzuci zapytanie z błędem „different vector dimensions”</button>
+  <p class="explain">Liczba wymiarów to jedyne, co sprawdza baza. Znaczenie współrzędnych jest inne w każdym modelu, więc porównania tracą sens. Obrona: kolumna i filtr <code>embedding_model</code>, przypięta rewizja modelu, test semantyczny i reindeks blue/green (4.3).</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

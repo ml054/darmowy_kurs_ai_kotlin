@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.6 Model dobrany do zadania, koszty – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="4.6">
+<main>
+<p class="meta">Lekcja 4.6 · ok. 60 min</p>
+<h1>Model dobrany do zadania, koszty (błąd produkcyjny #6)</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Rozłożyć koszt jednego pytania do bazy wiedzy na kroki i policzyć go z tokenów, zanim przyjdzie faktura.</li>
+  <li>Dobrać model do każdego kroku potoku RAG: przepisanie zapytania, embedding, rerank, odpowiedź, kontekst przy imporcie.</li>
+  <li>Obniżyć koszt bez utraty jakości: mniej kontekstu, prompt caching, kaskada modeli, cache i inkrementalny reindeks.</li>
+  <li>Policzyć próg opłacalności self-hostingu (TEI na GPU) wobec API płatnego za tokeny.</li>
+  <li>Zbudować atrybucję kosztu per krok, alerty i budżety per funkcja oraz test, który nie wpuści tego błędu ponownie.</li>
+</ul></div>
+
+<h2>Incydent: rachunek ×6 po uruchomieniu bazy wiedzy</h2>
+<div class="box bug"><span class="label">Błąd produkcyjny #6: drogi model w każdym kroku</span>
+<p>Zespół uruchomił „sugerowaną odpowiedź z bazy wiedzy” (<code>AiTask.KB_ANSWER</code>, 4.1) w panelu zgłoszenia. <dfn data-t="eval">Evale</dfn> jakości (automatyczne testy jakości AI na zbiorze przypadków, 2.8) przeszły, agenci byli zadowoleni. Po trzech tygodniach przyszła faktura: rachunek za AI wzrósł z ok. 1 700 do ok. 10 800 USD miesięcznie. Co się okazało:</p>
+<ul>
+  <li>Każde pytanie szło przez <code>helpdesk-default</code> w <strong>trzech krokach</strong>: przepisanie zapytania, „reranking” 40 kandydatów przez LLM (cały tekst kandydatów w prompcie) i odpowiedź z <strong>20 <dfn data-t="chunking">chunkami</dfn></strong> (fragmentami dokumentów) w kontekście.</li>
+  <li>Nocny job przeliczał <dfn data-t="embedding">embeddingi</dfn> (wektory liczb opisujące znaczenie tekstu) <strong>całej</strong> bazy (ok. 90 mln tokenów) bez <code>kb_embedding_cache</code>. <dfn data-t="tei">TEI</dfn> (serwer embeddingów z 4.1) na CPU nie zdążał do rana, wyszukiwania odbijały się od <dfn data-t="bulkhead">bulkheadu</dfn> (limitu równoczesnych wywołań) <code>kb-embed-query</code>, więc dołożono dwa węzły GPU.</li>
+  <li>Nikt nie liczył kosztu per krok: <code>llm_usage</code> z 2.6 znało tylko <code>assistant-chat</code>, a wszystkie wywołania KB trafiały pod jedną etykietę albo nigdzie.</li>
+</ul>
+<p>Żaden krok nie rzucał wyjątku. Każdy działał, tylko kosztował wielokrotnie więcej, niż musiał, dlatego ten błąd przechodzi przez code review i evale jakości.</p></div>
+<p>Lekcja 1.6 wybierała model per zadanie, a 2.6 liczyła koszt czatu. Potok <dfn data-t="rag">RAG</dfn> (Retrieval-Augmented Generation: najpierw wyszukujemy fragmenty dokumentów, potem model odpowiada na ich podstawie) wprowadza nowy problem: <strong>jedno pytanie użytkownika to kilka wywołań różnych modeli</strong>, a każde ma inne wymagania.</p>
+
+<h2>Koszt jednego pytania RAG krok po kroku</h2>
+<p>Ceny ilustracyjne z 1.6 (sprawdź aktualny cennik): <code>helpdesk-default</code> 3,00 USD za milion <dfn data-t="token">tokenów</dfn> (fragmentów tekstu, za które płacisz) wejścia, 0,30 za wejście z cache, 15,00 za wyjście; <code>helpdesk-fast</code> 0,40 / 0,04 / 1,60. Chunk ma średnio 450 tokenów (<code>targetTokens</code> z 4.2); tokeny bierzesz z <code>llm_usage</code>, nie z liczby znaków.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="PRZED: jedno pytanie KB_ANSWER (HD-1042, Acme)">
+  krok 1 – przepisanie zapytania (helpdesk-default)
+    wejście: instrukcja 500 + zgłoszenie 450 + pytanie 50       = 1 000 tok
+    wyjście: 60 tok
+    1 000 × 3,00 / 1e6 + 60 × 15 / 1e6 = 0,0030 + 0,0009         = 0,0039 USD
+
+  krok 2 – embedding pytania (helpdesk-embed, TEI)               ≈ 0 USD (40 tok)
+           wyszukiwanie hybrydowe → 40 kandydatów (4.4)
+
+  krok 3 – „rerank” LLM-em (helpdesk-default)
+    wejście: 40 × 450 + instrukcja i pytanie 600                = 18 600 tok
+    wyjście: JSON z ocenami 40 kandydatów                        = 400 tok
+    18 600 × 3,00 / 1e6 + 400 × 15 / 1e6 = 0,0558 + 0,0060       = 0,0618 USD
+
+  krok 4 – odpowiedź z 20 chunkami (helpdesk-default, bez cache)
+    wejście: 20 × 450 + system prompt 1 200 + zgłoszenie 800 + pytanie 50 = 11 050 tok
+    wyjście: 450 tok
+    11 050 × 3,00 / 1e6 + 450 × 15 / 1e6 = 0,03315 + 0,00675     = 0,0399 USD
+
+  RAZEM: 0,1056 USD na pytanie   (pytanie czatu z 2.6: ok. 0,018 USD)
+  2 500 pytań dziennie × 30 dni = 75 000 → 7 920 USD / mies.
+  czas: 1,6 s + ok. 9,7 s + ok. 9,5 s ≈ 21 s (trzy wywołania po kolei)
+</script>
+<p>Trzy obserwacje. <strong>58% kosztu to krok, którego nie powinno być</strong>: rerank LLM-em wysyła 18 600 tokenów, żeby dostać listę liczb. Dominuje <strong>wejście</strong> (30 650 tokenów wobec 910 wyjścia), więc optymalizacja zaczyna się od pytania „co wysyłam?”. A 21 sekund to więcej, niż agent poczeka: koszt i latencja mają wspólną przyczynę.</p>
+<p>Do tego dochodzą koszty poza tokenami: dwa węzły GPU dla TEI (ilustracyjnie 2 × 0,80 USD/h × 730 h = 1 168 USD miesięcznie). Razem 1 700 (dotychczasowy czat i triage) + 7 920 + 1 168 ≈ 10 800 USD, czyli ok. 6,3 raza więcej.</p>
+
+<h2>Dlaczego „najlepszy model wszędzie” to błąd</h2>
+<p>Intuicja zespołu brzmiała: „jakość jest najważniejsza, więc wszędzie najlepszy model”. Tymczasem każdy krok potoku ma inne wymagania i dla większości z nich duży model generatywny nie jest najlepszy nawet jakościowo:</p>
+<table>
+  <tr><th>Krok</th><th>Czego wymaga</th><th>Czego NIE wymaga</th><th>Właściwe narzędzie</th></tr>
+  <tr><td>Przepisanie zapytania</td><td>Wyciągnięcie 5–15 słów kluczowych z opisu, rozumienie polskiego</td><td>Wiedzy o świecie, rozumowania, długiej odpowiedzi</td><td>Mały model albo brak kroku</td></tr>
+  <tr><td>Embedding</td><td>Stabilna przestrzeń wektorów, wielojęzyczność</td><td>Generowania tekstu</td><td>Model embeddingów (<code>helpdesk-embed</code>)</td></tr>
+  <tr><td>Rerank</td><td>Precyzyjna ocena par „pytanie + fragment”, wynik liczbowy, szybkość</td><td>Generowania, wyjaśnień</td><td><dfn data-t="reranker">Cross-encoder</dfn> (<code>helpdesk-rerank</code>)</td></tr>
+  <tr><td>Odpowiedź z cytowaniami</td><td>Wierność źródłom, cytowania <code>[KB-n]</code>, odmowa przy braku danych, dobry polski</td><td>20 fragmentów „na wszelki wypadek”</td><td>Duży model (Acme), lokalny (Globex), z krótkim kontekstem</td></tr>
+  <tr><td>Kontekst chunka przy imporcie</td><td>Krótkie streszczenie położenia chunka w dokumencie</td><td>Najwyższej jakości języka</td><td>Mały model z prompt caching albo wcale</td></tr>
+</table>
+<p>LLM jako reranker ma też wady poza ceną: niedeterministyczną kolejność, pomijanie kandydatów, niepoprawny JSON, a prompt z 40 fragmentami podlega efektowi <dfn data-t="lost-in-the-middle">lost in the middle</dfn> (model gorzej wykorzystuje informacje ze środka długiego kontekstu). Cross-encoder ocenia każdą parę osobno, zawsze tak samo i w setkach milisekund.</p>
+<div class="box tip"><span class="label">Zasada</span><p>Najpierw pytasz, <em>jakiego rodzaju</em> modelu wymaga krok (generatywny, embedding, klasyfikator, cross-encoder, kod deterministyczny), dopiero potem, <em>jak dużego</em>. Najtańsze wywołanie LLM to takie, którego nie ma.</p></div>
+
+<h2>Macierz zadanie → model i routing</h2>
+<table>
+  <tr><th>Krok (feature w <code>llm_usage</code>)</th><th>Acme (zewnętrzne dozwolone)</th><th>Globex (tylko lokalnie)</th><th>Uwagi</th></tr>
+  <tr><td><code>QUERY_REWRITE</code> (<code>kb-rewrite</code>)</td><td><code>helpdesk-fast</code>, tylko dla długich zgłoszeń</td><td><code>helpdesk-local</code> albo wyłączone</td><td>Na czacie zbędne: model sam pisze argument <code>query</code></td></tr>
+  <tr><td><code>EMBEDDING</code> (<code>kb-embed</code>)</td><td colspan="2"><code>helpdesk-embed</code> (bge-m3 w TEI), zawsze lokalnie</td><td>Jedna przestrzeń wektorów (4.1)</td></tr>
+  <tr><td>Rerank (<code>kb-rerank</code>)</td><td colspan="2"><code>helpdesk-rerank</code> (bge-reranker-v2-m3 w TEI)</td><td>Nie jest <code>AiTask</code>: to nie LLM generatywny</td></tr>
+  <tr><td><code>KB_ANSWER</code> (<code>kb-answer</code>)</td><td><code>helpdesk-default</code>; opcjonalnie kaskada z <code>helpdesk-fast</code></td><td><code>helpdesk-local</code></td><td>Kontekst 4–6 chunków, prompt caching</td></tr>
+  <tr><td>Kontekst chunka przy imporcie (<code>kb-contextualize</code>)</td><td><code>helpdesk-fast</code> + prompt caching albo wyłączone</td><td>Wyłączone (koszt GPU)</td><td>Tylko jeśli evale 4.7 pokażą zysk</td></tr>
+</table>
+<p>Routing zostaje w <code>ModelRouter</code> z 1.6 (z poprawką z 4.1: flaga <code>external</code> liczona z listy <code>self-hosted-aliases</code>). Dokładamy jedno opcjonalne pole <code>external-cheap</code> dla kaskady i konfigurację kroków KB:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  helpdesk:
+    ai:
+      self-hosted-aliases: [helpdesk-local, helpdesk-embed, helpdesk-rerank]
+      routing:
+        tasks:
+          EMBEDDING:     { external: helpdesk-embed,   local: helpdesk-embed }
+          KB_ANSWER:     { external: helpdesk-default, local: helpdesk-local, external-cheap: helpdesk-fast }
+          QUERY_REWRITE: { external: helpdesk-fast,    local: helpdesk-local }
+    kb:
+      answer:
+        candidates: 40               # = KbSearchOptions.candidates (4.4)
+        limit: 5                     # chunki w kontekście po reranku
+        context-token-budget: 2500   # tokeny fragmentów KB w prompcie
+        max-output-tokens: 450
+        rewrite: LONG_INPUT_ONLY     # OFF | LONG_INPUT_ONLY | ALWAYS
+        rewrite-min-tokens: 150
+        cascade:
+          enabled: false             # włączamy dopiero po evalach (4.7)
+          min-top-score: 0.55
+          min-margin: 0.10
+          escalation-rate-alert: 0.5
+      rerank: { max-chars-per-doc: 2000 }   # ok. 500 tokenów na parę
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/ModelRouter.kt (rozszerzenie)">
+  data class TaskRouting(val external: String, val local: String? = null, val externalCheap: String? = null)
+
+  /** Kolejne trasy do spróbowania: tania, potem docelowa. Dla Globexu zawsze jedna (lokalna). */
+  fun cascade(dataTenantId: UUID, task: AiTask): List<ModelRoute.Use> {
+      val main = route(dataTenantId, task) as? ModelRoute.Use ?: return emptyList()
+      val cheap = cfg.routing.tasks[task]?.externalCheap
+      return if (main.external && cheap != null) listOf(use(cheap), main) else listOf(main)
+  }
+</script>
+<p>Kaskada dotyczy tylko trasy zewnętrznej, dlatego <code>cascade</code> buduje się na wyniku <code>route</code>: tenant lokalny nigdy nie dostanie zewnętrznego taniego aliasu. Kroki potoku oznacza jeden enum, z którego biorą się etykiety w <code>llm_usage</code> i metrykach:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/cost/KbStep.kt">
+  enum class KbStep(val feature: String) {
+      REWRITE("kb-rewrite"), EMBED("kb-embed"), RERANK("kb-rerank"),
+      ANSWER("kb-answer"), CONTEXTUALIZE("kb-contextualize"),
+  }
+</script>
+
+<h2>Przepisanie zapytania: kiedy w ogóle pomaga</h2>
+<p><dfn data-t="query-rewriting">Przepisanie zapytania</dfn> (query rewriting) to zamiana tekstu użytkownika na zapytanie lepiej pasujące do wyszukiwarki, np. „no i dalej nie działa, a w PDF?” na „eksport faktur PDF błąd”. Pomaga w trzech sytuacjach: pytanie zależy od wcześniejszej rozmowy, wejście jest długie i zawiera kilka wątków, albo pytanie jest w innym języku niż dokumenty i wyszukiwanie pełnotekstowe nie trafia. Nie pomaga, gdy pytanie jest krótkie i konkretne, a <dfn data-t="hybrid-search">wyszukiwanie hybrydowe</dfn> (wektor plus pełnotekstowe, 4.4) i tak dobrze je obsługuje.</p>
+<ul>
+  <li><strong>Czat z narzędziem <code>searchKnowledgeBase</code></strong>: model czatu sam formułuje argument <code>query</code> z kontekstu rozmowy. Dodatkowe przepisanie to podwójna praca i dodatkowa sekunda. Wyłączone.</li>
+  <li><strong>Panel <code>KB_ANSWER</code></strong>: zapytaniem jest zgłoszenie. Krótkie (tytuł i 2–3 zdania) idzie wprost; długie (log błędu, stopka e-mailowa, trzy pytania naraz) przepisuje <code>helpdesk-fast</code>.</li>
+  <li><strong>Warianty droższe</strong>: kilka przeformułowań (multi-query) albo HyDE (wyszukiwanie po embeddingu hipotetycznej odpowiedzi modelu) mnożą wywołania; tylko przy wyraźnym zysku w evalu.</li>
+</ul>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/answer/KbQueryBuilder.kt">
+  enum class RewriteMode { OFF, LONG_INPUT_ONLY, ALWAYS }
+
+  @Component
+  class KbQueryBuilder(
+      private val router: ModelRouter, private val clients: AiClients, private val prompts: PromptRegistry,
+      private val tokens: TokenCounter, private val steps: KbStepRecorder, private val props: KbAnswerProperties,
+  ) {
+      fun build(ticket: TicketView, q: QuestionMeta): String {
+          val raw = "${ticket.title}\n${ticket.description}"
+          val needsRewrite = when (props.rewrite) {
+              RewriteMode.OFF -> false
+              RewriteMode.ALWAYS -> true
+              RewriteMode.LONG_INPUT_ONLY -> tokens.count(raw) > props.rewriteMinTokens
+          }
+          if (!needsRewrite) return raw.take(MAX_QUERY_CHARS)
+          val route = router.route(ticket.tenantId, AiTask.QUERY_REWRITE) as? ModelRoute.Use
+              ?: return raw.take(MAX_QUERY_CHARS)             // brak trasy: degradacja, nie błąd
+          val started = System.nanoTime()
+          val response = clients.forRoute(route).prompt()
+              .system(prompts.get("kb-rewrite").template)     // stały, krótki prompt
+              .user(raw.take(4_000))
+              .options(OpenAiChatOptions.builder().model(route.alias).maxTokens(60).temperature(0.0).build())
+              .call().chatResponse()
+          steps.llm(KbStep.REWRITE, q, ticket.tenantId, route, response, started)
+          return response?.result?.output?.text?.trim()?.takeIf { it.isNotBlank() } ?: raw.take(MAX_QUERY_CHARS)
+      }
+
+      private companion object { const val MAX_QUERY_CHARS = 1_000 }
+  }
+</script>
+<p>Decyzję „czy przepisywać” podejmuje pomiar, nie intuicja. W evalach z 4.7 uruchamiasz ten sam zbiór w trzech trybach i porównujesz metryki wyszukiwania (recall@5, czyli odsetek pytań, dla których właściwy dokument jest w pierwszej piątce, oraz MRR):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="DANE ILUSTRACYJNE – 120 pytań z cases.yaml (4.7)">
+  tryb              recall@5  MRR    wywołań LLM/pytanie  USD/pytanie (krok rewrite)
+  OFF               0,84      0,71   0                    0
+  LONG_INPUT_ONLY   0,88      0,74   0,3                  0,00014
+  ALWAYS (fast)     0,87      0,73   1,0                  0,00046
+  ALWAYS (default)  0,88      0,74   1,0                  0,00390
+</script>
+<p>Tu duży model nie przepisuje lepiej od małego, a przepisywanie krótkich zgłoszeń lekko szkodzi (model „poprawia” nazwy własne i kody błędów). Twoje liczby mogą być inne, dlatego to przełącznik w konfiguracji.</p>
+
+<h2>Reranking: cross-encoder zamiast LLM</h2>
+<p>W incydencie „rerank” wyglądał tak: prompt „Oceń trafność każdego z 40 fragmentów w skali 0–10, zwróć JSON” i 40 pełnych fragmentów pod spodem. Reranker typu cross-encoder robi to samo zadanie lepiej: czyta pytanie i fragment razem i zwraca liczbę, bez generowania tekstu. Działa na tym samym TEI co embeddingi. Wywołanie idzie przez LiteLLM, który dla wszystkich dostawców rerankingu stosuje format API Cohere (<code>/rerank</code>: pola <code>query</code>, <code>documents</code>, <code>top_n</code>; odpowiedź <code>results[].index</code> i <code>relevance_score</code>). Konfigurację aliasu <code>helpdesk-rerank</code> pokazuje 4.4; dostawcę dla TEI (np. <code>huggingface/</code> z własnym <code>api_base</code>) sprawdź w dokumentacji swojej wersji LiteLLM.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/search/LiteLlmReranker.kt (fragment istotny dla kosztu)">
+  data class RerankRequest(val model: String, val query: String, val documents: List<String>,
+                           @JsonProperty("top_n") val topN: Int)
+  data class RerankResponse(val results: List<Item>) {
+      data class Item(val index: Int, @JsonProperty("relevance_score") val relevanceScore: Double)
+  }
+
+  fun rerank(tenantId: UUID, q: QuestionMeta, query: String, hits: List<KbHit>, topN: Int): List<Pair<KbHit, Double>> {
+      val docs = hits.map { it.content.take(props.maxCharsPerDoc) }        // ok. 500 tokenów na parę
+      val started = System.nanoTime()
+      val resp = localOnlyClient.post().uri("/rerank")                     // klucz local-only (1.6, 4.1)
+          .body(RerankRequest("helpdesk-rerank", query, docs, topN))
+          .retrieve().body<RerankResponse>()!!
+      // TEI nie zwraca usage: liczymy tokeny sami (tokenizer bge-m3 z 4.2), źródło ESTIMATED
+      val inputTokens = docs.sumOf { tokens.count(it) } + tokens.count(query) * docs.size
+      steps.selfHosted(KbStep.RERANK, q, tenantId, "helpdesk-rerank", inputTokens, units = docs.size, started)
+      return resp.results.map { hits[it.index] to it.relevanceScore }
+  }
+</script>
+<ul>
+  <li><strong>Koszt.</strong> 40 par po ok. 480 tokenów to ok. 19 200 tokenów przetworzonych na GPU, czyli ułamek sekundy pracy karty. Rachunek per pytanie wynika z amortyzacji węzła: 584 USD miesięcznie / 75 000 pytań ≈ 0,0078 USD (rerank zużywa ponad 99% tokenów tego węzła, więc przypisujemy mu całość).</li>
+  <li><strong>CPU nie wystarczy.</strong> Przy ok. 1 500 tokenów/s z 4.1 te same 19 200 tokenów to ok. 13 s na pytanie. Na CPU musiałbyś zejść do 10–15 kandydatów przyciętych do 256 tokenów, co obniża recall. To jest właściwy powód GPU w tej architekturze, a nie embeddingi.</li>
+  <li><strong>Wynik jest liczbą</strong>, więc przyda się w kaskadzie i jako <code>minScore</code> z 4.5. Skala zależy od modelu i ustawień TEI (surowe logity czy po sigmoidzie); progi kalibrujesz na danych z 4.7.</li>
+</ul>
+<div class="box warn"><span class="label">Gdy reranker leży</span><p>Wyszukiwanie wraca do kolejności z RRF (4.4), ale nigdy po cichu do „reranku LLM-em”. Degradację oznaczasz w <code>config_version</code> (np. <code>rr-off</code>), żeby nie mieszać konfiguracji w raportach jakości.</p></div>
+
+<h2>Ograniczenie kontekstu: top-k, budżet tokenów, lost in the middle</h2>
+<p>Dwadzieścia chunków w kontekście wynikało z rozumowania „model sam wybierze, co ważne”. To prawie zawsze błąd. Po dobrym reranku informacja potrzebna do odpowiedzi jest zwykle w pierwszych 3–5 wynikach, a każdy kolejny fragment to koszt, dłuższy czas do pierwszego tokenu, więcej okazji do pomieszania podobnych dokumentów (dwie wersje limitu eksportu z 4.5) i słabsze wykorzystanie środka kontekstu. W HelpDesk przyjmujemy <strong>top-k po reranku 4–6</strong> i twardy <dfn data-t="context-token-budget">budżet tokenów kontekstu</dfn>, czyli górną granicę liczby tokenów fragmentów KB w jednym prompcie, niezależną od liczby wyników.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/answer/KbContextPacker.kt">
+  data class PackedContext(val hits: List<KbHit>, val tokens: Int, val dropped: Int, val truncated: Int)
+
+  @Component
+  class KbContextPacker(private val tokens: TokenCounter, private val props: KbAnswerProperties) {
+
+      /** hits: już po reranku, posortowane malejąco. Kolejność zostaje – od niej zależą numery [KB-n]. */
+      fun pack(hits: List<KbHit>): PackedContext {
+          val budget = props.contextTokenBudget
+          val chosen = mutableListOf<KbHit>()
+          var used = 0; var truncated = 0
+          for (h in hits.take(props.limit)) {
+              val cost = tokens.count(h.content) + HEADER_TOKENS     // nagłówek: [KB-n] tytuł, sekcja, data
+              when {
+                  used + cost <= budget -> { chosen += h; used += cost }
+                  chosen.isEmpty() -> {                              // pierwszy wynik zawsze, najwyżej przycięty
+                      chosen += h.copy(content = tokens.truncate(h.content, budget - HEADER_TOKENS))
+                      used = budget; truncated++
+                  }
+                  else -> break                                      // nie dokładamy słabszych kosztem budżetu
+              }
+          }
+          return PackedContext(chosen, used, hits.size - chosen.size, truncated)
+      }
+
+      private companion object { const val HEADER_TOKENS = 30 }
+  }
+</script>
+<ul>
+  <li><strong>Tokenizer.</strong> <code>TokenCounter</code> z 4.2 liczy tokenizerem bge-m3, a model odpowiedzi ma własny (polski bywa o 10–30% dłuższy), więc budżet jest przybliżony; górnej granicy pilnuje test z końca lekcji.</li>
+  <li><strong>Sąsiednie chunki.</strong> Dwa kolejne chunki tego samego dokumentu (nakładka 12% z 4.2) łączymy w jeden fragment bez powtórzonej nakładki; oszczędza to kilkadziesiąt tokenów i jeden numer cytowania.</li>
+  <li><strong>Lost in the middle</strong> przy 5 fragmentach ma małe znaczenie, przy 20 był realnym źródłem błędów. Kolejność zostaje malejąca, bo 4.4 numeruje cytowania według kolejności wyników.</li>
+</ul>
+<p>Efekt na kroku odpowiedzi: wejście spada z 11 050 do ok. 4 290 tokenów (5 × 450 + 1 200 + 800 + 40), a odpowiedź z mniejszą liczbą źródeł jest krótsza (ok. 350 zamiast 450 tokenów).</p>
+
+<h2>Prompt caching stałej części KB_ANSWER</h2>
+<p><dfn data-t="prompt-caching">Prompt caching</dfn> (ponowne użycie przez dostawcę przetworzonego, identycznego początku promptu po niższej stawce, 2.4) działa tylko dla stałego prefiksu. W <code>KB_ANSWER</code> fragmenty KB i zgłoszenie zmieniają się przy każdym pytaniu, więc cache obejmie tylko instrukcje. Wersja z incydentu zaczynała system prompt od „Dziś jest 2026-10-14 14:32, tenant: Acme, agent: Piotr”, więc nie trafiała nigdy. Prompt <code>kb-answer/v1</code> (4.4) układamy według reguły z 2.4: od najstabilniejszego do najzmienniejszego.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="układ żądania KB_ANSWER">
+  [system]  kb-answer/v1 – STAŁE dla wszystkich tenantów i pytań        ≈ 1 200 tok  ← cache
+            rola, reguły: tylko z fragmentów, cytuj [KB-n], nazwij sprzeczność (4.5),
+            „Nie znalazłem tego w bazie wiedzy”, język pytania, 2 krótkie przykłady
+  [user]    data (dzień), fragmenty [KB-1]…[KB-5] z nagłówkami,            ≈ 3 100 tok
+            zgłoszenie (oznaczone jako niezaufane, 3.4), pytanie
+</script>
+<p>Konfiguracja LiteLLM z 2.4 (<code>cache_control_injection_points</code> na wiadomościach <code>system</code> modelu <code>helpdesk-default</code>) działa bez zmian, o ile wszystko zmienne jest w wiadomości <code>user</code>. Przykłady (few-shot) mają tu podwójną rolę: poprawiają format cytowań i podnoszą prefiks powyżej minimum cache (często ok. 1 024 tokenów). Przy trafieniu w 90% wywołań: 1 080 × 0,30 + 3 210 × 3,00 + 350 × 15 (wyjście), razem ok. 0,0152 USD zamiast 0,0399 (−62%).</p>
+<div class="box warn"><span class="label">Pułapka: mały model, większe minimum</span><p>Minimalna długość cachowanego prefiksu zależy od modelu; w tabeli z 2.4 jeden z małych modeli wymaga 4 096 tokenów. Prefiks 1 200 tokenów na <code>helpdesk-fast</code> może więc w ogóle nie trafiać do cache i nie ma błędu, tylko <code>cached_tokens = 0</code>. W kaskadzie liczymy koszt taniego kroku bez cache, a odsetek trafień sprawdzasz osobno per alias (metryka z 2.6).</p></div>
+<p>Dla Globexu vLLM ma automatyczne cache'owanie prefiksów (sprawdź <code>--enable-prefix-caching</code> w swojej wersji): nie zmienia rachunku, ale skraca czas do pierwszego tokenu i odciąża GPU.</p>
+
+<h2>Kaskada modeli: tani najpierw, drogi przy niskiej pewności</h2>
+<p><dfn data-t="model-cascade">Kaskada modeli</dfn> to wzorzec, w którym zadanie najpierw wykonuje tani model, a droższy dostaje je tylko wtedy, gdy sygnały wskazują, że tani sobie nie poradził. Opłaca się, gdy większość przypadków jest prosta, a sygnał niskiej pewności jest wiarygodny. Kluczowe pytanie brzmi więc: <strong>skąd wiesz, że odpowiedź taniego modelu jest wystarczająca?</strong></p>
+<table>
+  <tr><th>Sygnał</th><th>Wiarygodność</th></tr>
+  <tr><td>Przed generowaniem: wynik rerankera najlepszego fragmentu ≥ próg i wyraźna przewaga nad drugim</td><td>Dobra, deterministyczna; progi z evali</td></tr>
+  <tr><td>Po: walidacja cytowań w backendzie (4.4): każde <code>[KB-n]</code> istnieje, jest co najmniej jedno</td><td>Dobra dla formy, nie dla treści</td></tr>
+  <tr><td>Po: „Nie znalazłem” mimo wysokiego wyniku rerankera</td><td>Niezgodność kroków: eskaluj</td></tr>
+  <tr><td>Po: pole <code>confidence</code> wypisane przez model</td><td>Słaba: modele są źle skalibrowane</td></tr>
+  <tr><td>Po: logprobs (prawdopodobieństwa tokenów)</td><td>Niedostępne u części dostawców i proxy, trudne dla długiego tekstu</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/answer/KbAnswerCascade.kt">
+  sealed interface Gate {
+      data object Accept : Gate
+      data class Escalate(val reason: String) : Gate
+  }
+
+  @Component
+  class KbAnswerCascade(private val router: ModelRouter, private val generator: KbAnswerGenerator,
+                        private val citations: KbCitationValidator, private val props: KbAnswerProperties) {
+
+      fun answer(tenantId: UUID, q: QuestionMeta, ctx: PackedContext, scores: List<Double>, question: String): KbAnswer {
+          val routes = router.cascade(tenantId, AiTask.KB_ANSWER)
+          check(routes.isNotEmpty()) { "KB_ANSWER wyłączone dla tenanta" }   // wcześniej sprawdza AiAvailability
+          if (!props.cascade.enabled || routes.size == 1 || !preGate(scores)) {
+              return generator.generate(routes.last(), q, ctx, question)       // od razu model docelowy
+          }
+          val cheap = generator.generate(routes.first(), q, ctx, question)     // kb-answer, model helpdesk-fast
+          return when (val g = postGate(cheap, ctx)) {
+              Gate.Accept -> cheap.also { count("accepted", "-") }
+              is Gate.Escalate -> generator.generate(routes.last(), q, ctx, question)
+                  .copy(escalatedFrom = routes.first().alias).also { count("escalated", g.reason) }
+          }
+      }
+      // count(): licznik helpdesk.kb.cascade z tagami result i reason (stała, mała lista wartości)
+
+      private fun preGate(s: List<Double>): Boolean {
+          val top = s.firstOrNull() ?: return false
+          val margin = top - (s.getOrNull(1) ?: 0.0)
+          return top >= props.cascade.minTopScore && margin >= props.cascade.minMargin
+      }
+
+      private fun postGate(a: KbAnswer, ctx: PackedContext): Gate = when {
+          a.finishReason == FinishReason.LENGTH -> Gate.Escalate("length")
+          a.notFound -> Gate.Escalate("not-found-despite-high-score")
+          !citations.allValid(a.text, ctx.hits.size) -> Gate.Escalate("invalid-citations")
+          citations.count(a.text) == 0 -> Gate.Escalate("no-citations")
+          else -> Gate.Accept
+      }
+  }
+</script>
+<p>Rachunek kaskady: tani krok bez cache to 4 290 × 0,40 / 1e6 + 350 × 1,60 / 1e6 ≈ 0,0023 USD. Przy 30% eskalacji średni koszt odpowiedzi to 0,0023 + 0,3 × 0,0152 ≈ 0,0068 USD wobec 0,0152, czyli ok. 55% mniej na tym kroku.</p>
+<div class="box warn"><span class="label">Ryzyka kaskady</span><ul>
+  <li><strong>Eskalacja kosztuje podwójnie</strong>: płacisz za obie odpowiedzi i czekasz na obie. Gdy odsetek eskalacji przekracza ok. 50%, kaskada jest droższa i wolniejsza od samego dużego modelu (stąd alert <code>escalation-rate-alert</code>).</li>
+  <li><strong>Streaming</strong>: nie da się wysłać użytkownikowi odpowiedzi taniego modelu, a potem jej „cofnąć”. W panelu <code>KB_ANSWER</code> (podpowiedź dla agenta) buforowanie jest akceptowalne; w czacie kaskada odpowiedzi praktycznie odpada.</li>
+  <li><strong>Ciche pogorszenie</strong>: bramka przepuszcza odpowiedzi poprawne w formie, błędne w treści; evale 4.7 raportujesz osobno dla ścieżki taniej i eskalowanej.</li>
+  <li><strong>Dryf progów</strong>: zmiana modelu albo rerankera zmienia rozkład wyników; progi są częścią <code>config_version</code> i wymagają ponownej kalibracji.</li>
+  <li><strong>Globex</strong> ma jedną trasę (<code>helpdesk-local</code>), więc kaskady nie ma; to celowe, bo nie istnieje tańsza lokalna alternatywa.</li>
+</ul></div>
+
+<h2>Cache: embeddingi zapytań i gotowe podpowiedzi</h2>
+<p>Embedding pytania kosztuje grosze, ale obciąża TEI, a ten sam tekst wraca często: agent otwiera to samo zgłoszenie kilka razy, dwóch agentów patrzy na jedno zgłoszenie, klienci pytają „jak wyeksportować fakturę do PDF”. Krótkotrwały cache embeddingów zapytań:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/search/QueryEmbeddingCache.kt">
+  @Component
+  class QueryEmbeddingCache(private val embedder: KbEmbedder, meters: MeterRegistry) {
+      private val cache = Caffeine.newBuilder()
+          .maximumSize(20_000)                         // ok. 20 000 × 4 kB = 80 MB na replikę
+          .expireAfterWrite(Duration.ofMinutes(10))    // krótko: pytania mogą zawierać dane osobowe
+          .recordStats()
+          .build<String, FloatArray>()
+
+      init { CaffeineCacheMetrics.monitor(meters, cache, "kb-query-embedding") }
+
+      fun embed(query: String): FloatArray {
+          val text = query.trim().replace(Regex("\\s+"), " ")
+          val key = embedder.modelId + ":" + sha256Hex(text)   // model w kluczu: inny model = inny wektor
+          return cache.get(key) { embedder.embedQuery(text) }
+      }
+  }
+</script>
+<ul>
+  <li><strong>Model w kluczu</strong>: podczas reindeksu blue/green (4.3) działają równolegle dwie przestrzenie wektorów.</li>
+  <li><strong>Tenant.</strong> Embedding zależy tylko od tekstu, więc cache bez tenanta w kluczu nie ujawnia dokumentów; filtry tenantu i widoczności działają później, w SQL (4.4). Cache'owanie <em>wyników wyszukiwania</em> wymagałoby w kluczu tenanta, ról i wersji dokumentów; tego nie robimy.</li>
+  <li><strong><dfn data-t="pii">Dane osobowe</dfn>.</strong> Pytania mogą zawierać nazwiska i e-maile: cache tylko w pamięci procesu, krótki TTL, hash w kluczu, bez logowania i bez Redisa. To nie jest <dfn data-t="semantic-cache">cache semantyczny</dfn> (odpowiedź dla podobnego pytania), który w systemie multi-tenant łatwo zwraca cudze dane.</li>
+</ul>
+<p>Większą oszczędność daje cache <strong>gotowej podpowiedzi</strong>. Ilustracyjnie: panel generuje 2 500 podpowiedzi dziennie, ale różnych par (zgłoszenie, wersja zgłoszenia) jest ok. 1 100; reszta to ponowne otwarcia. Podpowiedź zapisujemy z kluczem, który unieważnia się sam:</p>
+<script type="text/x-code" data-lang="sql" data-title="V47__kb_answer_suggestions.sql (numer przykładowy)">
+  CREATE TABLE kb_answer_suggestions (
+      ticket_id       uuid NOT NULL,
+      tenant_id       uuid NOT NULL,              -- RLS jak w tickets (1.1)
+      ticket_version  bigint NOT NULL,            -- nowy komentarz podbija tickets.version (3.5)
+      config_version  text NOT NULL,              -- nowy prompt/model/k = nowa podpowiedź
+      doc_versions    jsonb NOT NULL,             -- [{"id":"…","v":3}] użyte w odpowiedzi
+      answer          text NOT NULL,
+      citations       jsonb NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (ticket_id, ticket_version, config_version)
+  );
+  -- ważna, gdy wiek < 24 h i każdy dokument z doc_versions jest ACTIVE z current_version = v
+  -- retencja 7 dni; usunięcie dokumentu (4.3) usuwa podpowiedzi, które go cytują
+</script>
+<p>Do tego zmiana UX: podpowiedź po kliknięciu „Zaproponuj odpowiedź” zamiast przy każdym otwarciu panelu. Te dwie zmiany obniżają liczbę wywołań <code>KB_ANSWER</code> bardziej niż jakakolwiek zmiana modelu.</p>
+
+<h2>Indeksowanie: inkrementalny reindeks i contextual retrieval w liczbach</h2>
+<p>Drugą połowę incydentu, nocne przeliczanie całej bazy, naprawia mechanizm z 4.3: hash treści dokumentu plus <code>kb_embedding_cache</code> (embedding pod kluczem <dfn data-t="content-hash">hasha treści</dfn> i modelu). Liczby z 4.3 przeliczone na zasoby:</p>
+<table>
+  <tr><th>Strategia</th><th>Tokeny dziennie</th><th>TEI na CPU (ok. 1 500 tok/s)</th><th>Koszt infrastruktury</th></tr>
+  <tr><td>Pełne przeliczenie co noc (incydent)</td><td>90 mln</td><td>ok. 16,7 h: nie mieści się w nocy</td><td>+2 węzły GPU: ok. 1 168 USD / mies.</td></tr>
+  <tr><td>Tylko zmienione dokumenty w całości</td><td>1,8 mln</td><td>ok. 20 min</td><td>CPU wystarcza</td></tr>
+  <tr><td>Zmienione dokumenty + cache chunków</td><td>270 tys.</td><td>ok. 3 min</td><td>CPU wystarcza</td></tr>
+</table>
+<p>Pełne przeliczenie zostaje jako operacja wyjątkowa: zmiana modelu (blue/green z 4.3, nowy alias <code>helpdesk-embed-v2</code>) albo zmiana sposobu budowania tekstu embeddingu. Uruchamiasz je świadomie, z niskim priorytetem w kolejce i z bulkheadem <code>kb-embed-ingest</code> (4.2), a nie z crona.</p>
+<h3>Contextual retrieval: policz, zanim włączysz</h3>
+<p><dfn data-t="contextual-retrieval">Contextual retrieval</dfn> (4.2) to dopisanie do każdego chunka krótkiego kontekstu wygenerowanego przez LLM, który widzi cały dokument. Na każdy chunk przypada jedno wywołanie z <em>całym dokumentem</em> w prompcie. Przykład: nowy klient importuje 2 000 dokumentów po 40 chunków (80 000 chunków, dokument ok. 18 000 tokenów):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="contextual retrieval dla 80 000 chunków">
+  wejście na chunk: instrukcja 150 + dokument 18 000 + chunk 450 = 18 600 tok; wyjście 80 tok
+
+  helpdesk-default, bez cache: (18 600 × 3,00 + 80 × 15) / 1e6 = 0,0570 × 80 000 ≈ 4 560 USD
+  helpdesk-fast, bez cache:    (18 600 × 0,40 + 80 × 1,6) / 1e6 = 0,00757 × 80 000 ≈ 605 USD
+  helpdesk-fast + cache dokumentu (40 chunków tego samego dokumentu po kolei):
+    1. chunk:      18 600 × 0,40 / 1e6                      = 0,00744
+    2.–40. chunk:  18 150 × 0,04 / 1e6 + 450 × 0,40 / 1e6   = 0,000906 × 39 = 0,03533
+    wyjście:       40 × 80 × 1,6 / 1e6                      = 0,00512
+    na dokument 0,0479 USD × 2 000                          ≈ 96 USD
+  ta sama konfiguracja „co noc dla całej bazy” (5 000 dokumentów): ≈ 240 USD × 30 ≈ 7 200 USD / mies.
+</script>
+<p>Rząd wielkości zgadza się z szacunkiem z publikacji Anthropic (ok. 1 USD na milion tokenów dokumentów przy tańszym modelu z cache; u nas ok. 2,7 USD przy cenach ilustracyjnych). Warunki praktyczne:</p>
+<ul>
+  <li><strong>Cache wymaga kolejności</strong>: worker przetwarza chunki jednego dokumentu po kolei, w czasie życia cache (często 5 minut), zamiast przeplatać dokumenty. Droższy zapis do cache (np. 1,25× u Anthropic, 2.4) przy 40 odczytach nie zmienia wniosku.</li>
+  <li><strong>Inkrementalnie</strong>: kontekst tylko dla chunków z nowym hashem; jest częścią <code>EmbeddingText</code> i hasha cache (4.2).</li>
+  <li><strong><dfn data-t="batch-api">Batch API</dfn></strong> (paczka żądań przetwarzana asynchronicznie z rabatem ok. 50%) pasuje do importu; czy łączy się z rabatem cache, sprawdź w cenniku.</li>
+  <li><strong>Globex</strong>: tylko <code>helpdesk-local</code>, czyli godziny pracy GPU dzielonego z triage. Domyślnie wyłączone.</li>
+  <li><strong>Najpierw eval</strong>: włączasz, jeśli 4.7 pokaże wzrost recall wart tej kwoty; darmowe nagłówki z 4.2 dają część efektu.</li>
+</ul>
+
+<h2>Self-hosting TEI czy embeddingi zewnętrzne: próg opłacalności</h2>
+<p>Lekcja 4.1 wybrała self-hosted <code>helpdesk-embed</code> z powodów innych niż koszt (jedna przestrzeń wektorów, dane Globexu, brak wycofań modelu). Policzmy, ile ta decyzja kosztuje, bo to samo pytanie padnie przy rerankerze. Ceny ilustracyjne: węzeł CPU 0,20 USD/h (146 USD/mies.), węzeł z GPU klasy L4 0,80 USD/h (584 USD/mies.), embeddingi zewnętrzne 0,02–0,13 USD za milion tokenów, rerank zewnętrzny ok. 2 USD za 1 000 wyszukiwań (do 100 dokumentów każde; sprawdź cennik).</p>
+<script type="text/x-code" data-lang="plaintext" data-title="próg opłacalności = koszt stały / cena jednostkowa">
+  zużycie HelpDesk po naprawie (embeddingi):
+    dokumenty: 270 tys. tok/dzień × 30 = 8,1 mln;  pytania: 75 000 × 40 tok = 3 mln  → ok. 11 mln tok / mies.
+    zewnętrznie: 11 × 0,02 = 0,22 USD / mies.   (droższy model: 11 × 0,13 = 1,43 USD)
+
+  embeddingi, węzeł CPU 146 USD:  146 / 0,02 = 7 300 mln tok / mies. (7,3 mld)
+      ale CPU przy 1 500 tok/s przerobi maks. 1 500 × 2,6 mln s ≈ 3,9 mld tok / mies.
+      → przy tanich embeddingach CPU NIGDY nie zwraca się kosztowo
+  embeddingi, węzeł GPU 584 USD:  584 / 0,02 = 29 200 mln tok / mies. (29 mld; przy 0,13: 4,5 mld)
+
+  rerank, węzeł GPU 584 USD:      584 / 0,002 = 292 000 wyszukiwań / mies. ≈ 9 700 dziennie
+      HelpDesk dziś: 2 500 dziennie → zewnętrznie ok. 150 USD / mies., self-hosted 584 USD
+</script>
+<p>Wnioski są niewygodne i właśnie dlatego trzeba je mieć na piśmie:</p>
+<ul>
+  <li>Self-hosting embeddingów jest w skali HelpDesk o trzy rzędy wielkości poniżej progu. To <strong>koszt zgodności i architektury</strong>, jak model lokalny Globexu w 1.6, i tak go raportujesz (koszt platformy, nie „oszczędność”).</li>
+  <li>Reranker zewnętrzny byłby dziś tańszy dla Acme, ale nie może dostać treści Globexu, a dwa rerankery to dwie kalibracje progów i dwa zestawy evali. Od ok. 10 tys. pytań dziennie GPU zwraca się także finansowo.</li>
+  <li>Koszt stały licz uczciwie: druga karta dla wysokiej dostępności podwaja kwotę, do tego monitoring, aktualizacje i czas ludzi.</li>
+</ul>
+
+<h2>Przed i po: koszt na pytanie i na poprawną odpowiedź</h2>
+<table>
+  <tr><th>Krok</th><th>Przed</th><th>USD</th><th>Po</th><th>USD</th></tr>
+  <tr><td>Przepisanie</td><td><code>helpdesk-default</code>, każde pytanie, 1 000 / 60 tok</td><td>0,0039</td><td><code>helpdesk-fast</code>, 30% pytań, 1 000 / 40 tok</td><td>0,00014</td></tr>
+  <tr><td>Embedding pytania</td><td>TEI, 40 tok</td><td>≈ 0</td><td>TEI + cache 10 min</td><td>≈ 0</td></tr>
+  <tr><td>Rerank</td><td>LLM, 18 600 / 400 tok</td><td>0,0618</td><td>cross-encoder na GPU (amortyzacja)</td><td>0,0078</td></tr>
+  <tr><td>Odpowiedź</td><td>20 chunków, 11 050 / 450 tok, bez cache</td><td>0,0399</td><td>5 chunków, 4 290 / 350 tok, 1 200 z cache</td><td>0,0152</td></tr>
+  <tr><td><strong>Razem na pytanie</strong></td><td></td><td><strong>0,1056</strong></td><td></td><td><strong>0,0232</strong> (−78%)</td></tr>
+  <tr><td>Miesięcznie (75 000 pytań)</td><td>+ 2 węzły GPU na reindeks (1 168)</td><td>9 088</td><td>GPU wliczone w rerank</td><td>1 740</td></tr>
+  <tr><td>Czas odpowiedzi (szac.)</td><td>3 wywołania LLM po kolei</td><td>ok. 21 s</td><td>rerank 0,3 s + odpowiedź</td><td>ok. 7 s</td></tr>
+</table>
+<p>Cały rachunek AI: z ok. 10 800 do ok. 3 440 USD miesięcznie (1 700 dotychczasowych + 1 740 za bazę wiedzy). Cache podpowiedzi nie jest wliczony, dopóki go nie zmierzysz.</p>
+<p>Koszt na pytanie to połowa obrazu. Lekcja 1.6 wprowadziła <dfn data-t="cost-per-correct-task">koszt na poprawne zadanie</dfn>: koszt podzielony przez odsetek poprawnych wyników, ewentualnie powiększony o koszt obsługi błędów. Trafność odpowiedzi zmierzysz evalami z 4.7; poniżej liczby ilustracyjne, a koszt złej podpowiedzi to ok. 0,10 USD (agent czyta ją i odrzuca w ok. 25 s):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="DANE ILUSTRACYJNE – koszt na poprawną odpowiedź">
+  wariant                       USD/pytanie  trafność  USD/poprawna  + błędy (1−acc) × 0,10
+  przed (20 chunków, default)   0,1056       81%       0,1304        0,1246
+  po: default, k = 5            0,0232       86%       0,0270        0,0372
+  po: tylko fast, k = 5         0,0102       74%       0,0138        0,0362
+  po: kaskada fast → default    0,0148       85%       0,0174        0,0298   (30% eskalacji)
+</script>
+<p>Wersja „przed” była nie tylko droższa, ale i gorsza: 20 chunków obniżało trafność. Po doliczeniu kosztu błędów „tylko fast” prawie dogania duży model, choć w trafności wyraźnie przegrywa, więc nie decyduje jedna kolumna. Metrykę w monitoringu produkcyjnym zbudujemy w 5.7.</p>
+
+<h2>Atrybucja kosztu: feature per krok</h2>
+<p>Incydent byłby widoczny w pierwszym tygodniu, gdyby <code>llm_usage</code> miało osobny wiersz dla każdego kroku. Używamy tabeli z 2.6 bez zmiany znaczenia kolumn: <code>feature</code> = krok (<code>kb-rewrite</code>, <code>kb-embed</code>, <code>kb-rerank</code>, <code>kb-answer</code>, <code>kb-contextualize</code>), wspólny <code>question_id</code> łączy kroki jednego pytania. Dokładamy dwie kolumny i zdejmujemy jedno ograniczenie:</p>
+<script type="text/x-code" data-lang="sql" data-title="V48__llm_usage_kb_steps.sql (numer przykładowy)">
+  ALTER TABLE llm_usage
+      ADD COLUMN parent_feature text,          -- 'assistant-chat', gdy krok KB wykonało narzędzie czatu
+      ADD COLUMN units          int;           -- rerank: liczba ocenionych dokumentów; embed: liczba tekstów
+  -- import dokumentów globalnych nie ma tenanta: koszt platformy (2.6), nie koszt klienta
+  ALTER TABLE llm_usage ALTER COLUMN tenant_id DROP NOT NULL;
+  CREATE INDEX ix_llm_usage_feature_time ON llm_usage (feature, occurred_at);
+</script>
+<p>Modele self-hosted nie mają ceny za token, więc jak <code>helpdesk-local</code> w 2.6 dostają <strong>stawkę wewnętrzną</strong>: koszt węzła podzielony przez planowany wolumen. Węzeł GPU 584 USD przy ok. 1 450 mln tokenów miesięcznie (rerank 75 000 × 19 200 plus embeddingi) daje ok. 0,40 USD za milion. Test z 2.6 („każdy alias z routingu ma cenę”) obejmuje teraz także <code>helpdesk-embed</code> i <code>helpdesk-rerank</code>.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml – cennik (ilustracyjny)">
+  helpdesk:
+    ai:
+      pricing:
+        helpdesk-embed:  { effective-from: 2026-11-01, input-per-mtok: 0.40, cached-input-per-mtok: 0.40, output-per-mtok: 0 }
+        helpdesk-rerank: { effective-from: 2026-11-01, input-per-mtok: 0.40, cached-input-per-mtok: 0.40, output-per-mtok: 0 }
+</script>
+<p>Rozszerzenie <code>UsageRecorder</code>: cienka fasada, która z kroku robi <code>LlmCallRecord</code> z 2.6. Wywołania LLM biorą usage z odpowiedzi (<code>UsageExtractor</code>), kroki self-hosted podają tokeny policzone tokenizerem i źródło <code>ESTIMATED</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/cost/KbStepRecorder.kt">
+  @Component
+  class KbStepRecorder(private val usage: UsageRecorder) {
+
+      fun llm(step: KbStep, q: QuestionMeta, tenantId: UUID?, route: ModelRoute.Use,
+              response: ChatResponse?, started: Long, parentFeature: String? = null) =
+          save(step, q, tenantId, route.alias, response?.metadata?.model ?: route.alias,
+               UsageExtractor.from(response) ?: UsageExtractor.estimate(0, 0), started,
+               if (response == null) "ERROR" else "OK", parentFeature, units = null)
+
+      fun selfHosted(step: KbStep, q: QuestionMeta, tenantId: UUID?, alias: String, inputTokens: Int,
+                     units: Int, started: Long, parentFeature: String? = null) =
+          save(step, q, tenantId, alias, alias, TokenUsage(inputTokens, 0, 0, 0, UsageSource.ESTIMATED),
+               started, "OK", parentFeature, units)
+
+      private fun save(step: KbStep, q: QuestionMeta, tenantId: UUID?, alias: String, providerModel: String,
+                       u: TokenUsage, started: Long, outcome: String, parentFeature: String?, units: Int?) {
+          usage.record(LlmCallRecord(q.copy(feature = step.feature), tenantId, userId = null, conversationId = null,
+              modelAlias = alias, providerModel = providerModel, requestId = null, usage = u,
+              latency = Duration.ofNanos(System.nanoTime() - started), ttft = null, round = 1, outcome = outcome),
+              parentFeature, units)
+      }
+  }
+  // UsageRecorder.record(c, parentFeature = null, units = null) – nowe parametry trafiają do INSERT;
+  // LlmCallRecord.tenantId staje się UUID? (dokumenty globalne)
+</script>
+<p>W narzędziu czatu <code>searchKnowledgeBase</code> kroki embed i rerank zapisują się z <code>question_id</code> pytania czatu i <code>parent_feature = 'assistant-chat'</code>; krok odpowiedzi to zwykła runda czatu z 2.6. Etykieta wersji dla <code>KB_ANSWER</code> wzorem <code>AssistantConfigVersion</code> z 2.4 obejmuje wszystko, co zmienia koszt: <code>kb-answer/v1|helpdesk-default|rr-bge-v2-m3|k5-b2500|cfg-3f9a1c2e</code>.</p>
+<script type="text/x-code" data-lang="sql" data-title="koszt i tokeny per krok i tenant (7 dni)">
+  SELECT coalesce(t.name, '(platforma)') AS tenant, u.feature,
+         count(DISTINCT u.question_id)                                         AS questions,
+         round(sum(u.cost_usd), 2)                                             AS cost_usd,
+         round(sum(u.cost_usd) / nullif(count(DISTINCT u.question_id), 0), 5) AS usd_per_question,
+         round(avg(u.input_tokens))                                            AS avg_input,
+         round(100.0 * sum(u.cost_usd) / sum(sum(u.cost_usd)) OVER (PARTITION BY t.name), 1) AS pct_of_kb
+  FROM llm_usage u LEFT JOIN tenants t ON t.id = u.tenant_id
+  WHERE u.feature LIKE 'kb-%' AND u.occurred_at >= now() - interval '7 days'
+  GROUP BY t.name, u.feature
+  ORDER BY tenant, cost_usd DESC;
+
+  -- tenant  feature     questions  cost_usd  usd_per_question  avg_input  pct_of_kb
+  -- Acme    kb-answer      41 200    626,40           0,01520      4 287       65,4
+  -- Acme    kb-rerank      41 200    321,36           0,00780     19 180       33,5
+</script>
+<p>Gdyby ten raport istniał w dniu startu, pierwszy wiersz brzmiałby „<code>kb-rerank</code>, model <code>helpdesk-default</code>, 58% kosztu”. Na stronie administracyjnej ten sam podział pokazujemy dla tenanta; endpoint zwraca agregat, a front podświetla krok pomocniczy zjadający ponad połowę kosztu:</p>
+<script type="text/x-code" data-lang="typescript" data-title="admin/KbCostBreakdown.tsx">
+  // GET /api/admin/ai/costs/kb?tenantId=…&days=7  (ADMIN)
+  type KbStepCost = { feature: string; model: string; usdPerQuestion: number; share: number };
+
+  export const KbCostRow = ({ s }: { s: KbStepCost }) => (
+    <tr className={s.share > 0.5 && s.feature !== "kb-answer" ? "warn" : undefined}>
+      <td>{s.feature}</td><td>{s.model}</td>
+      <td>{s.usdPerQuestion.toLocaleString("pl-PL", { maximumFractionDigits: 5 })}</td>
+      <td>{Math.round(s.share * 100)}%</td>
+    </tr>
+  );
+</script>
+<p>W metrykach Micrometera z 2.6 <code>feature</code> ma teraz kilka wartości więcej; <dfn data-t="cardinality">kardynalność</dfn> (liczba różnych wartości etykiety) dalej jest niska, bo kroków jest pięć.</p>
+
+<h2>Alerty i budżety per funkcja</h2>
+<p>Alert z 2.6 na wzrost tokenów na pytanie czatu rozszerzamy o kroki KB i o dwa niezmienniki, które łapią dokładnie ten incydent. Liczbę pytań daje licznik <code>helpdesk.assistant.questions</code> z 2.6 wywoływany z <code>feature = "kb-answer"</code>.</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts-ai-cost.yml (dopisane reguły)">
+  - alert: KbTokensPerQuestionUp            # +30% tokenów wejścia na pytanie względem tygodnia wcześniej
+    expr: |
+      (sum(increase(helpdesk_llm_tokens_total{feature=~"kb-.*", type=~"input|cached_input"}[3h]))
+         / sum(increase(helpdesk_assistant_questions_total{feature="kb-answer"}[3h])))
+      > 1.3 * (sum(increase(helpdesk_llm_tokens_total{feature=~"kb-.*", type=~"input|cached_input"}[3h] offset 1w))
+         / sum(increase(helpdesk_assistant_questions_total{feature="kb-answer"}[3h] offset 1w)))
+    for: 1h
+  - alert: KbExpensiveModelInAuxStep        # drogi model w kroku pomocniczym = powtórka błędu #6
+    expr: sum(increase(helpdesk_llm_cost_usd_total{feature=~"kb-rewrite|kb-rerank|kb-contextualize", model="helpdesk-default"}[15m])) > 0
+  - alert: KbEmbedFullReindex               # pełny reindeks zamiast inkrementalnego
+    expr: sum(increase(helpdesk_llm_tokens_total{feature="kb-embed"}[1h])) > 20e6
+    for: 30m
+  - alert: KbCascadeEscalationHigh
+    expr: |
+      sum(rate(helpdesk_kb_cascade_total{result="escalated"}[1h])) / sum(rate(helpdesk_kb_cascade_total[1h])) > 0.5
+    for: 2h
+</script>
+<p>Alert mówi „zdrożało”; powiązanie z wdrożeniem daje <dfn data-t="config-version"><code>config_version</code></dfn> (etykieta całej konfiguracji odpowiedzi z 2.4). Po każdym wdrożeniu zmiany w KB uruchamiasz raport per wersja z 2.6, grupując wiersze <code>kb-%</code> po <code>question_id</code>: średnie tokeny wejścia kroku <code>kb-answer</code>, liczba wywołań LLM na pytanie, średni i p95 koszt pytania. Wersja, w której któraś z tych liczb skoczyła, wskazuje winny PR.</p>
+<p>Budżety z 2.6 (<code>tenant_ai_budgets</code>, <code>TenantBudgetGuard</code>) są dzienne i wspólne dla wszystkiego. Po dodaniu KB to za mało: drogi import jednego klienta nie powinien wyłączyć mu czatu. Dokładamy budżety per grupa funkcji z wyborem reakcji:</p>
+<script type="text/x-code" data-lang="sql" data-title="V49__tenant_ai_feature_budgets.sql (numer przykładowy)">
+  CREATE TABLE tenant_ai_feature_budgets (
+      tenant_id        uuid NOT NULL REFERENCES tenants(id),
+      feature_group    text NOT NULL CHECK (feature_group IN ('assistant-chat','kb-query','kb-ingest')),
+      daily_limit_usd  numeric(10,2) NOT NULL,
+      on_exceeded      text NOT NULL CHECK (on_exceeded IN ('BLOCK','DEGRADE')),
+      updated_at       timestamptz NOT NULL DEFAULT now(),
+      updated_by       uuid NOT NULL,
+      PRIMARY KEY (tenant_id, feature_group)
+  );
+  -- kb-query  = kb-rewrite, kb-embed, kb-rerank, kb-answer z parent_feature IS NULL
+  -- kb-ingest = kb-embed i kb-contextualize zapisane przez worker importu
+</script>
+<p><code>TenantBudgetGuard</code> dostaje przeciążenie <code>status(tenantId, featureGroup)</code> (suma <code>cost_usd</code> po grupie, ten sam cache 30 s). Kolejność: najpierw budżet ogólny z 2.6 (429 <code>assistant-budget-exceeded</code>), potem grupa. <code>DEGRADE</code> jest zwykle lepszy niż blokada: agent dalej dostaje podpowiedź, tylko tańszą (bez przepisywania, mniej fragmentów, bez automatycznego generowania). Tryb degradacji też jest częścią <code>config_version</code>, żeby gorsze wyniki z dni z wyczerpanym budżetem nie psuły raportów jakości. Dla importu działa dodatkowo limit tokenów dziennie per tenant (np. 20 mln), bo to on chroni TEI przed zalaniem, a nie kwota w dolarach.</p>
+
+<h2>Jak nie powtórzyć błędu: test budżetu tokenów i koszt w bramce CI</h2>
+<p>Każda pojedyncza decyzja z incydentu wyglądała rozsądnie w PR („dodajmy rerank”, „dajmy więcej kontekstu”). Dlatego koszt musi być <strong>sprawdzany automatycznie</strong>, tak jak uprawnienia. Pierwsza warstwa to test z WireMockiem udającym LiteLLM: liczba wywołań, modele, górna granica tokenów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbAnswerTokenBudgetIT.kt">
+  @SpringBootTest
+  @Testcontainers
+  class KbAnswerTokenBudgetIT(@Autowired val service: KbAnswerService, @Autowired val tokens: TokenCounter) {
+
+      @Test
+      fun `KB_ANSWER to jedno wywolanie LLM w budzecie tokenow`() {
+          stubLiteLlm(chatAnswer = "Eksport włączysz w Ustawieniach [KB-1].", rerankTop = 5)
+          service.answer(PIOTR, HD_1042, KbAnswerRequest())      // KbAnswerService z 4.4
+
+          val chat = wireMock.findAll(postRequestedFor(urlEqualTo("/v1/chat/completions")))
+          assertThat(chat).hasSize(1)                                         // bez rewrite (krótkie zgłoszenie)
+          val body = objectMapper.readTree(chat.single().bodyAsString)
+          assertThat(body["model"].asText()).isEqualTo("helpdesk-default")
+          assertThat(body["max_tokens"].asInt()).isLessThanOrEqualTo(450)
+          val promptText = body["messages"].joinToString("\n") { it["content"].asText() }
+          assertThat(tokens.count(promptText)).isLessThanOrEqualTo(5_000)    // budżet całego wejścia
+          assertThat(Regex("""\[KB-\d+]""").findAll(promptText).count()).isLessThanOrEqualTo(6)
+
+          assertThat(wireMock.findAll(postRequestedFor(urlEqualTo("/rerank")))).hasSize(1)
+      }
+
+      @Test
+      fun `kroki pomocnicze nigdy na drogim modelu`(@Autowired cfg: AiRoutingConfig) {
+          val rewrite = cfg.routing.tasks.getValue(AiTask.QUERY_REWRITE)
+          assertThat(rewrite.external).isNotEqualTo(cfg.routing.tasks.getValue(AiTask.KB_ANSWER).external)
+          assertThat(cfg.selfHostedAliases).contains("helpdesk-rerank", "helpdesk-embed")
+      }
+
+      // + test: ponowny import tej samej treści (4.3) nie wysyła żadnego /v1/embeddings
+  }
+</script>
+<p>Test pilnuje <strong>niezmienników kosztowych</strong>, nie jakości: zmiana <code>limit</code> z 5 na 20 albo drugie wywołanie LLM wywali build i wymusi zmianę progu w tym samym PR, widoczną w review.</p>
+<p>Druga warstwa to <dfn data-t="quality-gate">bramka jakości</dfn> z 3.7 (automatyczny warunek dopuszczenia zmiany do merge). Raport <code>EvalGate</code> dostaje sekcję kosztu: na każdy przypadek suma <code>cost_usd</code> i tokenów z wierszy <code>llm_usage</code> uruchomienia (eval zapisuje <code>question_id</code> przypadku), porównana z <dfn data-t="baseline">baseline</dfn> z gałęzi <code>evals-baseline</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="evals/CostCheck.kt">
+  data class CostStats(val usdPerCase: Double, val inputTokensPerCase: Double, val llmCallsPerCase: Double)
+  enum class CostVerdict { PASS, NEEDS_APPROVAL }
+
+  fun costVerdict(cur: CostStats, base: CostStats, approvedLabel: Boolean, maxIncrease: Double = 0.20): CostVerdict {
+      val worse = cur.usdPerCase > base.usdPerCase * (1 + maxIncrease) ||
+                  cur.llmCallsPerCase > base.llmCallsPerCase + 0.5            // nowy krok LLM w potoku
+      return if (worse && !approvedLabel) CostVerdict.NEEDS_APPROVAL else CostVerdict.PASS
+  }
+  // NEEDS_APPROVAL → status INCONCLUSIVE w EvalGate (3.7); merge po etykiecie „cost-approved”
+  // nadanej przez właściciela budżetu AI (CODEOWNERS), a komentarz w PR pokazuje różnicę:
+  //   koszt / przypadek: 0,0232 → 0,1056 USD (+355%), wywołań LLM: 1,0 → 3,0
+</script>
+<p>Koszt przypadku w evalach różni się od produkcji, ale <strong>względna</strong> zmiana wobec baseline jest wiarygodna: PR z „rerankiem LLM-em” pokazałby +355% przed merge.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Co się dzieje</th><th>Co robimy</th></tr>
+  <tr><td>Globex na <code>helpdesk-local</code></td><td>Brak tańszej alternatywy i kaskady; ograniczeniem jest moc: 20 chunków przy kilku równoczesnych żądaniach zjada <dfn data-t="kv-cache">KV cache</dfn> (pamięć GPU na przetworzone tokeny, 1.6)</td><td>Ten sam budżet kontekstu, stawka wewnętrzna z 2.6 w <code>llm_usage</code>, w szczycie podpowiedź tylko na kliknięcie; koszt GPU w cenie usługi Globexu</td></tr>
+  <tr><td>Import dużej bazy klienta (np. 30 tys. stron)</td><td>Zajęty TEI, wolniejsze wyszukiwania, duża kwota przy contextual retrieval</td><td>Bulkheady z 4.2, niski priorytet, limit tokenów importu per tenant, szacunek kosztu i czasu dla admina przed startem, contextual retrieval przez Batch API albo wcale</td></tr>
+  <tr><td>Skok liczby pytań</td><td>Rerank na GPU się kolejkuje, p95 rośnie</td><td>Cache podpowiedzi i embeddingów, degradacja (20 kandydatów albo sam RRF) oznaczona w <code>config_version</code>; nigdy rerank LLM-em</td></tr>
+  <tr><td><code>helpdesk-fast</code> gorzej rozumie polski</td><td>Zapytanie gubi odmianę i kody błędów, odpowiedź niezgrabna</td><td>Kategoria „polski” w <code>cases.yaml</code> (4.7), osobny raport ścieżki taniej; przy spadku wyłączasz <code>external-cheap</code> lub <code>rewrite</code></td></tr>
+  <tr><td>Zmiana cennika dostawcy</td><td>Optymalny wariant może się odwrócić</td><td>Nowa cena z historią w <code>ModelPricing</code> (2.6), przeliczenie kosztu na poprawną odpowiedź, przegląd progów kaskady i stawek wewnętrznych</td></tr>
+  <tr><td>Nowy model pod tym samym aliasem</td><td>Inny tokenizer, minimum cache i skala pewności</td><td>Alert <code>KbTokensPerQuestionUp</code>, raport per <code>config_version</code>, kalibracja progów (5.4)</td></tr>
+</table>
+<div class="box warn"><span class="label">Optymalizacja, która szkodzi</span><p>Zejście z <code>limit</code> 5 do 2 obetnie koszt odpowiedzi o kolejne 30%, ale pytania łączące dwa dokumenty (dwie wersje limitu z 4.5) stracą drugi fragment. Każde cięcie kontekstu przechodzi przez evale odpowiedzi z 4.7.</p></div>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Policz koszt pytania „przed” w wariancie, w którym „rerank” LLM-em robiony jest osobnym wywołaniem dla każdego z 40 kandydatów (instrukcja 300 + pytanie 50 + chunk 450 tokenów wejścia, 5 tokenów wyjścia). Porównaj z wersją listową z lekcji i z cross-encoderem.</li>
+  <li>Zaimplementuj <code>KbContextPacker</code> z łączeniem sąsiednich chunków tego samego dokumentu i napisz test: 6 hitów (w tym dwa sąsiednie), budżet 2 000 tokenów; sprawdź liczbę fragmentów, tokeny i to, że pierwszy hit zawsze trafia do kontekstu.</li>
+  <li>Dodaj do raportu evali z 3.7 sekcję kosztu (USD i wywołania LLM na przypadek, różnica względem baseline) i sprawdź, że zmiana <code>limit: 5 → 20</code> daje <code>NEEDS_APPROVAL</code>.</li>
+  <li>Policz dla swojego projektu próg opłacalności self-hostingu rerankera (koszt stały z redundancją ÷ cena API). Ile razy musiałby wzrosnąć ruch?</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Który krok potoku z incydentu odpowiadał za największą część kosztu pytania?</p>
+  <button>Przepisanie zapytania na dużym modelu</button>
+  <button>Embedding pytania w TEI</button>
+  <button>„Rerank” 40 kandydatów przez LLM z pełnym tekstem fragmentów w prompcie</button>
+  <button>Wyjście (tokeny odpowiedzi) kroku odpowiedzi</button>
+  <p class="explain">Rerank LLM-em wysyłał ok. 18 600 tokenów wejścia, żeby dostać listę ocen: ok. 0,062 z 0,106 USD. Cross-encoder robi to samo deterministycznie, szybciej i za ułamek kosztu.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Kiedy przepisywanie zapytania (QUERY_REWRITE) ma sens w HelpDesk?</p>
+  <button>Dla długich, wielowątkowych zgłoszeń w panelu KB_ANSWER, o ile eval pokaże wzrost recall</button>
+  <button>Zawsze, najlepiej dużym modelem, bo lepsze zapytanie to lepsza odpowiedź</button>
+  <button>W czacie przed każdym wywołaniem searchKnowledgeBase</button>
+  <p class="explain">W czacie model sam pisze argument <code>query</code>, więc dodatkowe przepisanie to podwójna praca. Krótkie zgłoszenia lepiej wysłać wprost. Decyzję podejmuje porównanie recall@k i MRR w evalach, nie intuicja.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Który sygnał jest najmniej wiarygodny jako podstawa eskalacji w kaskadzie modeli?</p>
+  <button>Wynik rerankera dla najlepszego fragmentu i jego przewaga nad drugim</button>
+  <button>Niepoprawne lub brakujące cytowania [KB-n] wykryte przez backend</button>
+  <button>Odpowiedź „nie znalazłem” mimo wysokiego wyniku rerankera</button>
+  <button>Pole confidence, które model sam wpisał do odpowiedzi</button>
+  <p class="explain">Modele są źle skalibrowane w ocenie własnej pewności. Sygnały liczone deterministycznie (wynik rerankera, walidacja cytowań) albo niezgodność między krokami są znacznie lepsze, a progi i tak kalibrujesz evalami.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Co wynika z rachunku progu opłacalności dla self-hosted embeddingów w skali HelpDesk?</p>
+  <button>Self-hosting zwraca się już po pierwszym pełnym indeksowaniu</button>
+  <button>Przy ok. 11 mln tokenów miesięcznie API kosztowałoby grosze, więc TEI to koszt zgodności i architektury, a nie oszczędność</button>
+  <button>CPU jest zawsze tańszy od API, GPU zawsze droższy</button>
+  <p class="explain">Próg to koszt stały podzielony przez cenę jednostkową: dla węzła GPU dziesiątki miliardów tokenów miesięcznie. Decyzję o bge-m3 w TEI uzasadniają jedna przestrzeń wektorów i dane Globexu (4.1), i tak należy ją raportować.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Które zabezpieczenie złapałoby błąd #6 jeszcze przed wdrożeniem?</p>
+  <button>Dzienny budżet kosztu per tenant z 2.6</button>
+  <button>Alert na koszt godzinowy 3× wyższy niż tydzień temu</button>
+  <button>Test budżetu tokenów i liczby wywołań LLM na pytanie oraz sekcja kosztu w bramce evali w PR</button>
+  <button>Rekoncyliacja z fakturą dostawcy</button>
+  <p class="explain">Budżety, alerty i rekoncyliacja działają po wdrożeniu, na prawdziwych pieniądzach. Test niezmienników kosztowych i porównanie kosztu na przypadek z baseline w PR pokazują problem w review.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

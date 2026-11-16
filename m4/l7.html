@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.7 Evale wyszukiwania i odpowiedzi – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="4.7">
+<main>
+<p class="meta">Lekcja 4.7 · ok. 65 min</p>
+<h1>Evale wyszukiwania i odpowiedzi</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Oceniać RAG w dwóch warstwach, wyszukiwania i generowania, i z wyniku obu warstw od razu wskazywać miejsce naprawy.</li>
+  <li>Zbudować zbiór <code>evals/kb/cases.yaml</code> razem z seedem bazy wiedzy: skąd brać pytania, jak oznaczać relewancję i ile przypadków potrzeba.</li>
+  <li>Liczyć hit rate@k, recall@k, MRR i nDCG@k w Kotlinie, bez modelu generatywnego, na Postgresie i TEI w Testcontainers, w każdym PR.</li>
+  <li>Oceniać odpowiedzi: fakty, cytowania, wierność źródłom i poprawną odmowę przy <code>answerable: false</code>.</li>
+  <li>Porównywać konfiguracje (chunk, hybryda, rerank, top-k, próg) przez koszt na poprawną odpowiedź i włączyć wszystko do bramki CI z 3.7.</li>
+</ul></div>
+
+<p>Baza wiedzy z lekcji 4.1–4.6 działa i ma rozsądny koszt. Każda z nich odsyłała tutaj: rozmiar chunka (4.2), nowy model embeddingów (4.3), wagi RRF (4.4), spadek wagi z wiekiem (4.5), top-k kontekstu (4.6). Nie powtarzamy runnera, pass^k, kanarków ani baseline z 2.8 i bramki z 3.7, tylko rozszerzamy je o to, czego wymaga <dfn data-t="rag">RAG</dfn> (najpierw wyszukaj fragmenty, potem odpowiedz na ich podstawie).</p>
+
+<h2>Dwie warstwy: wyszukiwanie i generowanie</h2>
+<p>Eval z 2.8 ocenia całość: pytanie wchodzi, odpowiedź wychodzi. Dla RAG to za mało, bo odpowiedź „Limit to 10 MB” może mieć dwie zupełnie różne przyczyny. Może wyszukiwanie w ogóle nie zwróciło dokumentu z 25 MB. Może też zwróciło oba, a model wybrał nie ten. Pierwsza wymaga zmian w <dfn data-t="chunking">chunkingu</dfn> (podziale dokumentów na fragmenty), embeddingach albo filtrach, druga w prompcie albo modelu. Wynik end-to-end „84%” nie mówi, którą z nich masz.</p>
+<p>Dlatego każdy przypadek oceniamy dwa razy:</p>
+<ul>
+  <li><strong>Warstwa wyszukiwania (retrieval)</strong>: czy w top-k wyników <code>KnowledgeApi</code> jest dokument, w którym jest odpowiedź, i na którym miejscu. Bez LLM: tylko <dfn data-t="embedding">embedding</dfn> pytania, SQL i <dfn data-t="reranker">reranker</dfn>. Wynik jest deterministyczny, tani i liczony w sekundach.</li>
+  <li><strong>Warstwa odpowiedzi (generation)</strong>: czy odpowiedź ma oczekiwane fakty, czy cytuje to, co dostała, czy każde twierdzenie ma oparcie w kontekście i czy model odmawia, gdy powinien. Z LLM, więc z powtórzeniami i kosztem jak w 2.8.</li>
+</ul>
+<table>
+  <tr><th>Wyszukiwanie</th><th>Odpowiedź</th><th>Diagnoza</th><th>Gdzie szukać</th></tr>
+  <tr><td>dobre</td><td>dobra</td><td>OK</td><td>–</td></tr>
+  <tr><td>dobre</td><td>zła</td><td>Problem generowania</td><td>Prompt <code>kb-answer/v1</code> / <code>assistant-chat/v5</code>, model, kolejność i liczba chunków (<dfn data-t="lost-in-the-middle">lost in the middle</dfn>), obsługa sprzeczności (4.5)</td></tr>
+  <tr><td>złe (brak dokumentu w top-k)</td><td>zła</td><td>Problem wyszukiwania</td><td>Chunking (4.2), embedding i prefiksy (4.1), filtry i wersje (4.3–4.4), gałąź pełnotekstowa i <dfn data-t="hybrid-search">hybryda</dfn>, rerank, próg</td></tr>
+  <tr><td>złe</td><td>dobra</td><td>Podejrzane</td><td>Model odpowiedział z własnej wiedzy (brak oparcia w źródłach) albo oznaczenie relewancji jest niepełne: poprawny był też inny dokument</td></tr>
+  <tr><td>częściowe (1 z 2 dokumentów)</td><td>niepełna</td><td>Wyszukiwanie dla pytań złożonych</td><td>Top-k, chunki z dwóch dokumentów konkurują o miejsce; zapytanie z dwóch tematów</td></tr>
+  <tr><td>dokument zakazany w wynikach</td><td>dowolna</td><td>Błąd uprawnień</td><td>Filtr SQL lub RLS (4.4). Blokuje merge zawsze, niezależnie od odpowiedzi</td></tr>
+</table>
+<p>Drugi zysk jest ekonomiczny: zmiana chunkingu, embeddingów, wag RRF czy progu najpierw przechodzi przez warstwę wyszukiwania (minuty, zero tokenów), a do płatnego evalu odpowiedzi idzie tylko wariant, który tam nie przegrywa.</p>
+<div class="box tip"><span class="label">Zasada</span><p>Żaden prompt nie naprawi wyszukiwania, które nie dostarczyło właściwego fragmentu (4.1), a dobry retrieval nie gwarantuje dobrej odpowiedzi. Mierzysz obie warstwy, bo naprawia się je innymi narzędziami.</p></div>
+
+<h2>Seed bazy wiedzy i dystraktory</h2>
+<p><dfn data-t="eval-set">Zbiór evali</dfn> dla RAG to dwie rzeczy w jednym commicie: pytania z oczekiwaniami i dokumenty, z których system ma odpowiadać. Bez stałych dokumentów pytanie „jaki jest limit eksportu?” raz ma odpowiedź 25 MB, a po edycji w Confluence inną. Dokumenty leżą w repo jako Markdown z nagłówkiem metadanych (front matter, blok YAML na początku pliku):</p>
+<script type="text/x-code" data-lang="plaintext" data-title="src/test/resources/evals/kb/docs/ (fragment)">
+  kb-export-pdf-guide.md            globalny, PUBLIC, OFFICIAL   „Eksport faktur do PDF – instrukcja”
+  kb-export-error-codes.md          globalny, PUBLIC, OFFICIAL   „Lista kodów błędów eksportu” (ERR_PDF_EMPTY, ERR_PDF_LIMIT…)
+  kb-export-limit-2025.md           Acme, PUBLIC, TEAM           „Limit rozmiaru eksportu” – 10 MB (4.5)
+  kb-export-limit-2026.md           globalny, PUBLIC, OFFICIAL   „Limit rozmiaru eksportu” – 25 MB (4.5)
+  kb-promo-export-2026q1.md         globalny, PUBLIC, valid_until 2026-03-31 (4.5)
+  kb-acme-empty-pdf-workaround.md   Acme, INTERNAL, TICKET_SOLUTION z HD-1042
+  kb-acme-premium-terms.md          Acme, INTERNAL               + KANAREK-KB-ACME-INT-7f3a (4.4)
+  kb-globex-sso-escalation.md       Globex, INTERNAL             + KANAREK-KB-GLOBEX-INT-91c2 (4.4)
+  kb-export-csv.md, kb-invoice-print.md, kb-attachment-limit.md (10 MB), kb-sso-setup.md …  ← dystraktory
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="kb-export-limit-2026.md (nagłówek)">
+  ---
+  external_id: kb-export-limit-2026
+  tenant: null                 # globalny
+  visibility: PUBLIC
+  authority: OFFICIAL
+  valid_from: 2026-02-02
+  title: Limit rozmiaru eksportu
+  ---
+</script>
+<p>Najważniejsze w tym katalogu są <dfn data-t="hard-negative">dystraktory</dfn> (hard negatives): dokumenty bliskie tematem, ale nieodpowiadające na pytanie. Baza z pięcioma dokumentami o różnych tematach daje recall bliski 100% dla każdej konfiguracji, a na produkcji z pytaniem o PDF konkurują „Eksport do CSV”, „Drukowanie faktur” i „Limit załączników 10 MB”. Na każdy dokument z odpowiedzią dawaj 2–4 dystraktory, częściowo z produkcyjnej dokumentacji globalnej, bo pisane ręcznie są zwykle zbyt „inne”.</p>
+<p>Seeder wywołuje <code>KbIngestionService.ingest</code> z 4.2, czeka na worker i zwraca mapę <code>documentId → external_id</code>. Idziemy przez produkcyjny import, a nie <code>INSERT</code> wektorów, bo chunking i <code>EmbeddingText</code> są częścią pomiaru.</p>
+
+<h2>Format cases.yaml i przykładowe przypadki</h2>
+<p>Plik <code>src/test/resources/evals/kb/cases.yaml</code> ma pola z kontraktu M4 (<code>id</code>, <code>user</code>, <code>tenant</code>, <code>question</code>, <code>expectedDocs</code>, <code>expectedFacts</code>, <code>mustNotCite</code>, <code>answerable</code>), pole <code>expect</code> z regułami z 2.8 i rozszerzenia z 4.5 (<code>expectNotice</code>, <code>maxCitations</code>). Dokładamy cztery pola: <code>category</code>, <code>surface</code> (kanał odpowiedzi), <code>ticket</code> (dla <code>KB_ANSWER</code>) i <code>alsoRelevant</code> (dokumenty poprawne, ale niewymagane). Dochodzi persona <code>globex-customer</code> (ewa) obok person z 2.8.</p>
+<script type="text/x-code" data-lang="yaml" data-title="src/test/resources/evals/kb/cases.yaml">
+  version: 1
+  seed: evals/kb/docs            # sha256 katalogu trafia do raportu
+  # surface: chat (searchKnowledgeBase) | kb-answer (POST /api/tickets/{id}/kb-answer) | retrieval-only
+  cases:
+    - id: kb-001                                   # odpowiedź w jednym dokumencie
+      category: KB_FACTS
+      surface: chat
+      user: acme-customer
+      tenant: acme
+      question: "Jak wyeksportować fakturę do PDF?"
+      answerable: true
+      expectedDocs: [kb-export-pdf-guide]
+      expectedFacts: ["Faktury › Eksport › PDF|Faktury > Eksport > PDF"]
+      tags: [pr]
+    - id: kb-002                                   # odpowiedź wymaga dwóch dokumentów
+      category: KB_FACTS
+      surface: kb-answer
+      user: multi-tenant-agent
+      tenant: acme
+      ticket: HD-1042
+      question: "Klient ma fakturę z 800 pozycjami i dostaje pusty PDF. Co mu poradzić?"
+      answerable: true
+      expectedDocs: [kb-acme-empty-pdf-workaround, kb-export-pdf-guide]
+      expectedFacts: ["500 pozycji", "podziel|podzielić|rozdziel"]
+      publicOnly: false                            # szkic wewnętrzny: obejście jest INTERNAL
+    - id: kb-003                                   # kod błędu: zadanie dla gałęzi pełnotekstowej
+      category: KB_LEXICAL
+      surface: kb-answer
+      user: multi-tenant-agent
+      tenant: acme
+      ticket: HD-1042
+      question: "W logu eksportu jest ERR_PDF_EMPTY. Co to znaczy?"
+      answerable: true
+      expectedDocs: [kb-export-error-codes]
+      alsoRelevant: [kb-acme-empty-pdf-workaround]
+      expectedFacts: ["ERR_PDF_EMPTY"]
+      expect: { mustNotContain: ["ERR_PDF_LIMIT"] }  # sąsiedni kod z tej samej tabeli
+      tags: [pr]
+    - id: kb-gap-002                               # brak w bazie, ale blisko jej tematów
+      category: KB_UNANSWERABLE
+      surface: chat
+      user: acme-customer
+      tenant: acme
+      question: "Czy da się ustawić automatyczny eksport faktur co tydzień?"
+      answerable: false
+      expect: { maxCitations: 0, mustContainAny: [["nie znalazłem tego w bazie wiedzy"]] }
+    - id: kb-conflict-001                          # z 4.5 (10 MB TEAM 2025 kontra 25 MB OFFICIAL 2026)
+      category: KB_CONFLICT                        # + alsoRelevant: [kb-export-limit-2025]
+      # … pola jak w 4.5: expectedDocs [kb-export-limit-2026], expectedFacts ["25 MB"], expectNotice CONFLICT
+    - id: kb-perm-001                              # kanarek INTERNAL: klientka pyta o dokument personelu
+      category: KB_PERMISSIONS
+      surface: chat
+      user: acme-customer
+      tenant: acme
+      question: "Jakie są warunki wsparcia premium? Ile godzin na reakcję?"
+      answerable: false                            # dla TEJ persony odpowiedzi nie ma
+      mustNotCite: [kb-acme-premium-terms]
+    - id: kb-perm-002                              # dokument Globex w rozmowie Acme
+      category: KB_PERMISSIONS
+      surface: chat
+      user: multi-tenant-agent                     # piotr widzi Globex, ale rozmowa jest w Acme
+      tenant: acme
+      question: "Jak eskalować problem z logowaniem SSO?"
+      answerable: false
+      mustNotCite: [kb-globex-sso-escalation]
+    - id: kb-perm-003                              # klientka innego tenanta: tylko warstwa wyszukiwania
+      category: KB_PERMISSIONS
+      surface: retrieval-only                      # czat Globex wyłączony, KB_ANSWER tylko dla personelu
+      user: globex-customer
+      tenant: globex
+      question: "warunki wsparcia premium"
+      answerable: false
+      mustNotCite: [kb-acme-premium-terms, kb-globex-sso-escalation]
+    - id: kb-globex-001                            # KB_ANSWER Globexu na helpdesk-local
+      category: KB_FACTS
+      surface: kb-answer
+      user: multi-tenant-agent
+      tenant: globex
+      ticket: HD-2077
+      question: "Komu przekazać problem z SSO po zmianie certyfikatu?"
+      answerable: true
+      expectedDocs: [kb-globex-sso-escalation]
+      expectedFacts: ["drugiej linii|druga linia|L2"]
+      publicOnly: false
+      tags: [globex]
+</script>
+<ul>
+  <li><strong><code>answerable</code> zależy od persony.</strong> Dla piotra w rozmowie Globexu pytanie o eskalację SSO ma odpowiedź, dla piotra w rozmowie Acme już nie. Przypadek uprawnień to zwykle <code>answerable: false</code> z <code>mustNotCite</code>.</li>
+  <li><strong><code>expectedFacts</code> z alternatywami po <code>|</code></strong>, porównywane po normalizacji z 2.8. Fakty to liczby, kody i nazwy, a nie zdania.</li>
+  <li><strong><code>kb-globex-001</code></strong> jedzie trasą lokalną (<code>helpdesk-local</code>), więc dokument Globexu nie opuszcza infrastruktury także w evalu; tag <code>globex</code> to osobny przebieg z równoległością 1 (2.8).</li>
+  <li><strong>Kanarki</strong> <code>KANAREK-KB-…</code> z 4.4 runner dopisuje do zakazanych literałów według reguły z 2.8 (persona, tenant rozmowy, zgodność trasy).</li>
+</ul>
+
+<h2>Skąd brać pytania</h2>
+<table>
+  <tr><th>Źródło</th><th>Co daje</th><th>Pułapka</th></tr>
+  <tr><td>Logi: argumenty <code>searchKnowledgeBase</code>, pytania przy <code>KB_ANSWER</code>, odpowiedzi <code>NO_SOURCES</code></td><td>Prawdziwe sformułowania, skróty, wklejone logi, kody błędów</td><td>Najpierw <code>PiiRedactor</code> z 2.7, potem przepisanie na dane seeda. Pytań Globexu nie wysyłasz do zewnętrznego modelu i nie wrzucasz do repo nawet po redakcji (2.8)</td></tr>
+  <tr><td>Raport luk i <code>kb_feedback</code> (4.5): MISSING, WRONG, OUTDATED</td><td>Pytania, na których system już zawiódł. Najcenniejsze przypadki <code>answerable: false</code> i przypadki regresji</td><td>Po dopisaniu artykułu przypadek MISSING zmienia się w <code>answerable: true</code>, a seed dostaje nowy dokument</td></tr>
+  <tr><td>Zespół wsparcia</td><td>„Dziesięć pytań, które klienci zadają co tydzień” i znane podchwytliwe przypadki: sprzeczne wersje, podobne kody</td><td>Ludzie z wsparcia znają dokumenty i piszą pytania ich słowami; poproś o pytania w języku klienta</td></tr>
+  <tr><td>Generowanie przez LLM z dokumentów</td><td>Pokrycie: pytanie do każdej sekcji, szybko i tanio</td><td>Opisane niżej. Zawsze przegląd człowieka</td></tr>
+</table>
+<p><dfn data-t="synthetic-eval-data">Pytania syntetyczne</dfn> to pytania wygenerowane przez model na podstawie fragmentu dokumentu, z tym dokumentem jako etykietą. Pomagają, gdy produkcja jeszcze nie istnieje albo nowy dział bazy nie ma ruchu. Mają jednak systematyczne wady:</p>
+<ul>
+  <li><strong>Przeciek słownictwa.</strong> Model parafrazuje chunk, więc pytanie ma te same rzadkie słowa, a recall wychodzi zawyżony o kilkanaście punktów.</li>
+  <li><strong>Pytania jednofragmentowe.</strong> Prawdziwe pytania łączą dokumenty i niosą kontekst („klient z 800 pozycjami…”).</li>
+  <li><strong>Brak pytań bez odpowiedzi</strong>, literówek i pytań po angielsku.</li>
+  <li><strong>Etykieta za wąska.</strong> To samo pytanie bywa poprawnie obsłużone przez inny dokument niż ten, z którego powstało.</li>
+</ul>
+<script type="text/x-code" data-lang="kotlin" data-title="SyntheticQuestionGenerator.kt (narzędzie developerskie, nie test)">
+  /** Kandydaci do cases.yaml. Wynik trafia do pliku do przeglądu, nigdy wprost do zbioru. */
+  class SyntheticQuestionGenerator(private val chat: ChatClient, private val shingles: Shingles) {
+      private val prompt = """
+          Jesteś klientem systemu HelpDesk, który NIE widział tej dokumentacji.
+          Napisz 3 pytania, na które fragment odpowiada: jedno krótkie i potoczne, jedno z opisem
+          sytuacji (2 zdania), jedno z literówką. NIE używaj słów z tytułu ani nagłówka.
+          Zwróć JSON: {"questions": ["..."]}
+      """.trimIndent()
+
+      fun candidates(doc: KbEvalDoc, chunk: KbEvalChunk): List<SyntheticCandidate> =
+          chat.prompt().system(prompt)
+              .user("Tytuł: ${doc.title}\nSekcja: ${chunk.headingPath}\n\n${chunk.content}")
+              .call().entity(Questions::class.java)!!.questions
+              .filter { q -> shingles.jaccard(q, chunk.content, n = 3) < 0.15 }   // odrzuć parafrazy (3.4)
+              .map { SyntheticCandidate(it, expectedDocs = listOf(doc.externalId),
+                                        source = "synthetic:helpdesk-fast:${LocalDate.now()}") }
+      data class Questions(val questions: List<String>)
+  }
+</script>
+<p>Model wołasz aliasem <code>helpdesk-fast</code> tylko dla dokumentów globalnych i Acme. Dokumenty Globexu idą przez <code>helpdesk-local</code> albo są pomijane. Przegląd człowieka (ok. minuty na pytanie) sprawdza, czy tak pyta klient, czy etykieta jest pełna (<code>alsoRelevant</code>) i czy odpowiedź jest w dokumencie; odpada zwykle 30–50% kandydatów. Raport liczy metryki osobno według pola <code>source</code>: gdy syntetyczne mają recall 0,97, a prawdziwe 0,84, ufasz drugiej liczbie. Syntetyczne niech stanowią najwyżej 30–40% zbioru.</p>
+
+<h2>Oznaczanie relewancji i wielkość zbioru</h2>
+<p><dfn data-t="relevance-judgment">Oznaczenie relewancji</dfn> to decyzja człowieka, które dokumenty odpowiadają na pytanie. Na niej opierają się wszystkie metryki wyszukiwania. Można oznaczać na trzech poziomach:</p>
+<table>
+  <tr><th>Poziom</th><th>Przykład</th><th>Zaleta</th><th>Wada</th></tr>
+  <tr><td>Chunk</td><td><code>chunk 7f2e…</code></td><td>Najdokładniej: ten fragment, nie „gdzieś w dokumencie”</td><td>Każda zmiana <code>ChunkingProperties</code> (4.2) albo nowa wersja dokumentu (4.3) daje nowe id chunków. Etykiety giną dokładnie wtedy, gdy chcesz porównać chunkingi</td></tr>
+  <tr><td>Dokument</td><td><code>kb-export-limit-2026</code></td><td>Stabilny przy zmianie chunkingu, modelu i wersji; prosty w przeglądzie</td><td>Długi dokument (30 chunków) zalicza trafienie, nawet gdy w top-k jest fragment z innej sekcji</td></tr>
+  <tr><td>Fakt w kontekście</td><td><code>expectedFacts: ["25 MB"]</code> w treści top-k</td><td>Niezależny od chunków i id; łapie „dobry dokument, zły fragment”</td><td>Tylko dla faktów o stabilnej postaci (liczby, kody)</td></tr>
+</table>
+<p>Podstawą jest dokument (<code>external_id</code>, nie tytuł, bo tytuły się zmieniają), a uzupełnieniem fakt w kontekście. Razem dają metryki stabilne przy zmianie chunkingu, a „trafienie dokumentu bez faktu” wskazuje za długie dokumenty albo za duże chunki.</p>
+<h3>Ile przypadków</h3>
+<p>Warstwa wyszukiwania nie płaci za tokeny, więc start to 150–200 pytań: ok. 120 z odpowiedzią i 60 bez niej (ten sam zbiór kalibrował progi w 4.5). Warstwa odpowiedzi bierze z niego ok. 60 przypadków: wszystkie <code>KB_PERMISSIONS</code>, sprzeczności i odmowy plus próbkę zwykłych. Przy 120 pytaniach i hit rate 0,91 <dfn data-t="wilson-interval">przedział Wilsona</dfn> z 3.7 wynosi ok. [0,85; 0,95]. Różnica 2 punktów to 2–3 pytania do przeczytania, nie wynik do ogłoszenia.</p>
+<p>Seed i przypadki pilnuje tani test bez modelu, odpowiednik <code>EvalSeedContractTest</code> z 2.8:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbEvalSeedContractTest.kt">
+  class KbEvalSeedContractTest {
+      private val docs = KbEvalDocs.load("/evals/kb/docs")           // front matter + treść
+      private val suite = KbEvalSuiteLoader.load("/evals/kb/cases.yaml")
+
+      @Test
+      fun `kazdy dokument z przypadku istnieje w seedzie`() {
+          val ids = docs.map { it.externalId }.toSet()
+          suite.cases.forEach { c ->
+              assertThat(ids).describedAs(c.id).containsAll(c.expectedDocs + c.alsoRelevant + c.mustNotCite)
+          }
+      }
+      @Test
+      fun `fakty sa doslownie w oczekiwanych dokumentach`() {          // łapie edycję dokumentu
+          suite.cases.filter { it.answerable }.forEach { c ->
+              val text = Text.norm(docs.filter { it.externalId in c.expectedDocs }.joinToString("\n") { it.body })
+              c.expectedFacts.forEach { f ->
+                  assertThat(f.split('|').any { Text.norm(it) in text }).describedAs("${c.id}: $f").isTrue()
+              }
+          }
+      }
+  }
+</script>
+<p>Dopisz trzeci test: dokumenty z <code>mustNotCite</code> muszą być niewidoczne dla persony według <code>KbVisibilityRule</code>, kilkulinijkowej reguły w kodzie testu (tenant dokumentu, visibility, rola, zgodność trasy z 2.2) liczonej z front matter. Eval nie ufa kodowi, który sprawdza (2.8), więc nie woła <code>KnowledgeService</code>.</p>
+
+<h2>Metryki wyszukiwania: hit rate, recall, MRR, nDCG</h2>
+<p>Wszystkie liczymy na liście dokumentów zbudowanej z top-k chunków: kolejność pierwszego wystąpienia dokumentu, bez powtórzeń. <strong>k liczymy w chunkach</strong>, bo tyle widzi model (<code>KbSearchOptions.limit = 5</code>). Pozycje to miejsca w liście dokumentów. Zbiór „istotnych” to <code>expectedDocs ∪ alsoRelevant</code>, a do mianownika recall wchodzą tylko <code>expectedDocs</code>. Przypadki <code>answerable: false</code> nie wchodzą do średnich: mają osobną ocenę (odmowa, <code>mustNotCite</code>).</p>
+<ul>
+  <li><strong>Hit rate@k</strong>: 1, jeśli w top-k jest choć jeden istotny dokument, inaczej 0. Średnia po przypadkach.</li>
+  <li><dfn data-t="recall-at-k">Recall@k</dfn>: jaka część wymaganych dokumentów jest w top-k: |wymagane ∩ top-k| / |wymagane|. Dla pytań z jednym dokumentem równa hit rate, różni się dla pytań wielodokumentowych.</li>
+  <li><dfn data-t="mrr">MRR</dfn> (Mean Reciprocal Rank): średnia z 1 / pozycja pierwszego istotnego dokumentu (0, gdy go nie ma). Mierzy, czy dobry dokument jest wysoko, co ważne przy lost in the middle i małym top-k.</li>
+  <li><dfn data-t="ndcg">nDCG@k</dfn> (normalized Discounted Cumulative Gain): suma zysków istotnych dokumentów z karą za niską pozycję, podzielona przez wynik idealnej kolejności. Przy relewancji binarnej: DCG@k = Σ rel<sub>i</sub> / log<sub>2</sub>(i + 1), nDCG = DCG / IDCG. Uwzględnia wszystkie istotne dokumenty i ich pozycje.</li>
+</ul>
+<script type="text/x-code" data-lang="plaintext" data-title="Przykład: 4 pytania, k = 5, ranking dokumentów po deduplikacji">
+  Q1  wymagane {A}       ranking [B, A, C, D, E]   hit 1  recall 1    RR 1/2 = 0,5
+      DCG = 1/log2(3) = 0,631   IDCG = 1/log2(2) = 1        nDCG = 0,631
+  Q2  wymagane {A, F}    ranking [A, C, D, F, E]   hit 1  recall 2/2  RR 1
+      DCG = 1/log2(2) + 1/log2(5) = 1 + 0,431 = 1,431
+      IDCG = 1 + 1/log2(3) = 1,631                          nDCG = 0,877
+  Q3  wymagane {G}       ranking [B, C, D, E, H]   hit 0  recall 0    RR 0       nDCG = 0
+  Q4  wymagane {A, F}    ranking [C, A, D, E, B]   hit 1  recall 1/2  RR 1/2
+      DCG = 1/log2(3) = 0,631   IDCG = 1,631                nDCG = 0,387
+
+  hit rate@5 = 3/4                         = 0,75
+  recall@5   = (1 + 1 + 0 + 0,5) / 4       = 0,625
+  MRR        = (0,5 + 1 + 0 + 0,5) / 4     = 0,50
+  nDCG@5     = (0,631 + 0,877 + 0 + 0,387) / 4 = 0,474
+  recall@1   = (0 + 0,5 + 0 + 0) / 4       = 0,125   ← z k = 1 model zwykle nie dostaje odpowiedzi
+</script>
+<p>Jak czytać te liczby razem: hit rate 0,75 i recall 0,625 mówią, że jedna czwarta pytań nie ma żadnego dobrego dokumentu (Q3: wyszukiwanie), a pytania złożone tracą drugi dokument (Q4). MRR 0,5 przy dobrym hit rate: dobry dokument jest, ale nie na górze, więc to robota dla rerankera albo wag RRF, nie chunkingu. Spadek nDCG przy stałym recall to pogorszona kolejność, istotna, gdy zmniejszasz top-k.</p>
+<div class="box warn"><span class="label">Pułapka: k w dokumentach zamiast chunków</span><p>Jeśli policzysz „top-5 dokumentów”, a model dostaje 5 chunków, z których 3 są z tego samego długiego dokumentu, metryka obiecuje 5 źródeł, a model widzi 3. Wynik eksperymentu z rozmiarem chunka będzie wtedy fałszywy: duże chunki „wygrają”, bo zajmują mniej pozycji. Zawsze ucinaj na tym samym k, co produkcja.</p></div>
+
+<h2>RetrievalMetrics w Kotlinie</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="RetrievalMetrics.kt">
+  object RetrievalMetrics {
+      /** Dokumenty w kolejności pierwszego wystąpienia w top-k CHUNKÓW. */
+      fun docRanking(hits: List<KbHit>, k: Int, extId: (UUID) -> String): List<String> =
+          hits.take(k).map { extId(it.documentId) }.distinct()
+
+      fun hit(ranked: List<String>, relevant: Set<String>) = if (ranked.any { it in relevant }) 1.0 else 0.0
+
+      fun recall(ranked: List<String>, required: Set<String>) =
+          if (required.isEmpty()) 1.0 else ranked.count { it in required }.toDouble() / required.size
+
+      fun reciprocalRank(ranked: List<String>, relevant: Set<String>): Double {
+          val i = ranked.indexOfFirst { it in relevant }
+          return if (i < 0) 0.0 else 1.0 / (i + 1)
+      }
+
+      fun ndcg(ranked: List<String>, relevant: Set<String>, k: Int): Double {
+          val dcg = ranked.take(k).withIndex().sumOf { (i, d) -> if (d in relevant) 1.0 / log2(i + 2.0) else 0.0 }
+          val idcg = (0 until minOf(relevant.size, k)).sumOf { 1.0 / log2(it + 2.0) }
+          return if (idcg == 0.0) 0.0 else dcg / idcg
+      }
+
+      /** Odsetek oczekiwanych faktów obecnych w treści top-k (niezależny od id chunków). */
+      fun contextFactRecall(hits: List<KbHit>, k: Int, facts: List<String>): Double {
+          if (facts.isEmpty()) return 1.0
+          val ctx = Text.norm(hits.take(k).joinToString("\n") { it.content })
+          return facts.count { f -> f.split('|').any { Text.norm(it) in ctx } }.toDouble() / facts.size
+      }
+  }
+
+  data class RetrievalCaseResult(
+      val caseId: String, val category: KbEvalCategory, val ranked: List<String>,
+      val hit: Double, val recall: Double, val rr: Double, val ndcg: Double, val factRecall: Double,
+      val topScore: Double?, val forbiddenReturned: List<String>, val queryUsed: String,
+  )
+</script>
+<p>Test jednostkowy <code>RetrievalMetricsTest</code> odtwarza dokładnie przykład z poprzedniej sekcji (Q1–Q4). Metryka z błędem o jeden w indeksie (<code>log2(i + 1)</code> zamiast <code>log2(i + 2)</code> przy indeksie od zera) daje liczby, które „wyglądają rozsądnie” i nikt ich nie podważy.</p>
+
+<h2>Runner wyszukiwania: Postgres i TEI, bez LLM</h2>
+<p>Ten eval potrzebuje prawdziwego modelu embeddingów i rerankera. Atrapa <code>HashingKbEmbedder</code> z 4.1 wystarcza do testów uprawnień, ale nie mierzy jakości. Uruchamiamy więc w Testcontainers (biblioteka stawiająca zależności w kontenerach Dockera na czas testu) Postgresa z pgvector, dwa kontenery <dfn data-t="tei">TEI</dfn> i LiteLLM z konfiguracją testową wskazującą aliasy <code>helpdesk-embed</code> i <code>helpdesk-rerank</code> na te kontenery. Ścieżka wywołań jest taka sama jak na produkcji, ale bez modelu generatywnego i bez klucza do dostawcy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbRetrievalEvalTest.kt">
+  @Tag("kb-retrieval")                         // nie "eval": brak kosztu tokenów, może biec w każdym PR
+  @SpringBootTest(properties = ["spring.flyway.locations=classpath:db/migration,classpath:evals/seed"])
+  @Testcontainers
+  @Import(KbEvalConfig::class)                 // stały zegar 2026-11-16T09:00Z (4.5), KbEvalSeeder
+  class KbRetrievalEvalTest(@Autowired val knowledge: KnowledgeApi, @Autowired val seeder: KbEvalSeeder,
+                            @Autowired val tickets: TicketApi) {
+      companion object {        // + net, postgres (pgvector) i litellm z evals/kb/litellm.yaml
+          private fun tei(model: String, alias: String) =
+              GenericContainer(DockerImageName.parse("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9"))
+                  .withCommand("--model-id=$model", "--revision=${System.getenv("REV_$alias") ?: "main"}")
+                  .withFileSystemBind(System.getProperty("user.home") + "/.cache/tei-models", "/data")  // cache CI
+                  .withNetwork(net).withNetworkAliases(alias).withExposedPorts(80)
+                  .waitingFor(Wait.forHttp("/health").withStartupTimeout(Duration.ofMinutes(10)))
+          @Container @JvmStatic val embed = tei("BAAI/bge-m3", "tei-embed")
+          @Container @JvmStatic val rerank = tei("BAAI/bge-reranker-v2-m3", "tei-rerank")
+          @DynamicPropertySource @JvmStatic
+          fun props(r: DynamicPropertyRegistry) {
+              r.add("spring.ai.openai.base-url") { "http://${litellm.host}:${litellm.getMappedPort(4000)}" }
+              System.getProperty("kb.experiment")?.let { KbExperiments.apply(it, r) }   // wariant konfiguracji
+          }
+      }
+
+      @Test
+      fun `wyszukiwanie: metryki i uprawnienia`() {
+          val ids = seeder.seed("/evals/kb/docs")                       // ingest przez KbIngestionService (4.2)
+          val suite = KbEvalSuiteLoader.load("/evals/kb/cases.yaml", System.getProperty("eval.suite"))
+          val results = suite.cases.map { c ->
+              val user = EvalPersonas.user(c.user)
+              val tenant = EvalPersonas.tenant(c.tenant)
+              val query = when (c.surface) {                            // pytamy TAK SAMO jak produkcja
+                  Surface.KB_ANSWER -> KbAnswerQuery.of(c.question, tickets.getByNumber(user, c.ticketNumber()))
+                  else -> c.question                                    // czat: zapytanie pisze model (niżej)
+              }
+              val r = knowledge.searchDetailed(user, tenant, query, KbSearchOptions(limit = 10, minScore = null))
+              KbRetrievalScoring.score(c, r, k = 5, query) { ids.getValue(it) }
+          }
+          val report = KbRetrievalReport.build(suite, results, ids.seedSha256)
+              .also { it.write(File("build/reports/evals/kb-retrieval")) }
+          assertThat(results.flatMap { it.forbiddenReturned }).describedAs("KB_PERMISSIONS").isEmpty()
+          assertThat(report.overall.recallAtK).isGreaterThanOrEqualTo(0.85)
+      }
+  }
+</script>
+<ul>
+  <li><strong><code>KbAnswerQuery.of(question, ticket)</code></strong>: funkcja wydzielona z <code>KbAnswerService</code> (4.4), składająca zapytanie z pytania, tytułu i opisu zgłoszenia. Eval, który pyta inaczej niż produkcja, mierzy inną wyszukiwarkę. W czacie zapytanie pisze model, więc tu używamy pytania jako przybliżenia, a faktyczne zapytania zapisuje warstwa odpowiedzi.</li>
+  <li><strong><code>forbiddenReturned</code></strong>: dokumenty z <code>mustNotCite</code> albo niewidoczne dla persony według <code>KbVisibilityRule</code>, które wróciły w wynikach. To <code>KB_PERMISSIONS</code> bez LLM i bez powtórzeń: wyciek wychodzi, zanim zobaczy go jakikolwiek model.</li>
+  <li><strong>Czas</strong> (orientacyjnie, CPU): start kontenerów 1–2 min; ingest ok. 300 chunków × 450 tokenów przy 1 500 tokenów/s to ok. 1,5 min; 180 zapytań × (embedding 50 ms + rerank 20 par 400 ms) to ok. 1,5 min. Razem ok. 5 minut i zero dolarów.</li>
+  <li><strong>Wagi modeli</strong> (po ok. 2 GB) trzymaj w cache CI z kluczem z rewizji modelu, inaczej każdy PR pobiera je z Hugging Face.</li>
+</ul>
+<div class="box warn"><span class="label">Determinizm: prawie</span><p>Ta sama rewizja modelu, obraz TEI i seed dają te same wyniki. Wyjątki: HNSW budowany przy równoległym wstawianiu może dać nieco inny graf (przy kilkuset chunkach bez znaczenia), a na GPU wynik zależy od wielkości paczki, więc remisy rerankera mogą zamieniać się miejscami. Uruchamiaj eval zawsze na tym samym typie sprzętu (CPU w CI) i sortuj remisy po <code>chunk_id</code>, jak zapytanie z 4.4. Wtedy jeden przebieg wystarcza i nie potrzebujesz pass^k z 2.8.</p></div>
+
+<h2>Metryki odpowiedzi: fakty i poprawna odmowa</h2>
+<p>Warstwa odpowiedzi korzysta z runnera z 2.8 (<code>EvalRunner</code>, <code>Attempt</code>, powtórzenia, równoległość, <code>llm_usage</code>). Dochodzi rejestrator trafień: dekorator <code>KnowledgeApi</code> (bean <code>@Primary</code> w konfiguracji evali) zapisuje wyniki pod kluczem persona + tenant + zapytanie, więc wiemy, jakie fragmenty model dostał. Kolizje kluczy przy równoległych próbach nie szkodzą, bo to samo zapytanie daje te same wyniki.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="RecordingKnowledgeApi.kt">
+  class RecordingKnowledgeApi(private val delegate: KnowledgeApi) : KnowledgeApi by delegate {
+      private val seen = ConcurrentHashMap<String, KbSearchResult>()
+      override fun searchDetailed(user: CurrentUser, tenantId: UUID, query: String, opts: KbSearchOptions) =
+          delegate.searchDetailed(user, tenantId, query, opts).also { seen[key(user, tenantId, query)] = it }
+      fun hitsFor(user: CurrentUser, tenantId: UUID, query: String) = seen[key(user, tenantId, query)]?.hits.orEmpty()
+      private fun key(u: CurrentUser, t: UUID, q: String) = "${u.userId}|$t|${q.trim()}"
+  }
+</script>
+<p>Zakładamy tu, że <code>search</code> deleguje do <code>searchDetailed</code> (4.5). Dla czatu zapytania bierzesz z argumentów <code>searchKnowledgeBase</code> zapisanych przez <code>EvalRecordingToolCallback</code> (2.8), dla <code>KB_ANSWER</code> z <code>KbAnswerQuery.of</code>.</p>
+<h3>Poprawność faktów</h3>
+<p>Reguły jak w 2.8: każdy fakt z <code>expectedFacts</code> (z alternatywami) musi wystąpić w odpowiedzi po normalizacji, która dla liczb z jednostką usuwa spację („25MB” = „25 MB”). Reguły z <code>expect</code> działają bez zmian, a w sprzeczności z 4.5 sprawdzasz, że nieaktualna wartość nie jest podana jako obowiązująca (<code>kb-conflict-002</code>).</p>
+<h3>Odmowa przy answerable: false</h3>
+<p>Poprawna odmowa (<dfn data-t="abstention">wstrzymanie się od odpowiedzi</dfn>, z 4.5) ma dwie drogi, które raport liczy osobno:</p>
+<ul>
+  <li><strong>Kod</strong>: <code>KB_ANSWER</code> zwraca <code>KbAnswerResponse.outcome = NO_SOURCES</code> bez wywołania modelu (pokrycie NONE z 4.5). Próba kosztuje zero tokenów.</li>
+  <li><strong>Model</strong>: pokrycie WEAK, model dostał słabe fragmenty i sam napisał „Baza wiedzy nie zawiera odpowiedzi…” albo „nie znalazłem tego w bazie wiedzy” (czat). Wymagane też zero cytowań (<code>maxCitations: 0</code>).</li>
+</ul>
+<p>Druga strona to <strong>zbędna odmowa</strong>: <code>NO_SOURCES</code> przy <code>answerable: true</code>. To problem wyszukiwania albo progu (najwyższy wynik poniżej <code>none-below</code>), nie modelu. Bez przypadków <code>answerable: true</code> zbiór nagradzałby odmawianie wszystkiego (2.8).</p>
+<p>W kodzie to dwie kontrole <code>Check</code> z 2.8: dla <code>answerable: false</code> „odmowa” (ze szczegółem: kod czy model) i „0 cytowań”, dla <code>answerable: true</code> „bez zbędnej odmowy” z najwyższym wynikiem wyszukiwania w szczegółach.</p>
+
+<h2>Cytowania i wierność źródłom</h2>
+<p><dfn data-t="citation">Cytowania</dfn> <code>[KB-n]</code> z 4.4 oceniamy trzema kontrolami. Wszystkie dane są w <code>KbAnswerResponse</code> (<code>citations</code>, <code>invalidCitations</code>) albo, dla czatu, w <code>ChatReply</code> (rozszerzenie: te same <code>citations</code> i <code>invalid</code> co w zdarzeniu <code>ChatEvent.Citations</code>).</p>
+<table>
+  <tr><th>Kontrola</th><th>Reguła</th><th>Co oznacza porażka</th></tr>
+  <tr><td>Ważność</td><td>Zacytowane ⊆ zwrócone: <code>invalidCitations</code> puste</td><td>Model wymyślił numer źródła. Backend go oznaczył, ale to sygnał słabego modelu lub promptu (częste na <code>helpdesk-local</code>)</td></tr>
+  <tr><td>Zakaz</td><td>Żaden dokument z <code>mustNotCite</code> nie jest zacytowany ani nie był w kontekście</td><td><code>KB_PERMISSIONS</code>: blokada bez dyskusji</td></tr>
+  <tr><td>Trafność</td><td>Wśród zacytowanych jest co najmniej jeden z <code>expectedDocs ∪ alsoRelevant</code>; raport liczy też precision cytowań (istotne / zacytowane)</td><td>Model oparł odpowiedź na dystraktorze, np. limit załączników zamiast limitu eksportu</td></tr>
+</table>
+<p><dfn data-t="faithfulness">Wierność źródłom</dfn> (faithfulness, groundedness) to odsetek twierdzeń odpowiedzi, które mają oparcie w dostarczonym kontekście. Odpowiedź z oczekiwanym faktem i poprawnym cytowaniem może mieć obok zdanie z własnej wiedzy modelu („eksport trwa zwykle do 2 minut”). To <dfn data-t="hallucination">halucynacja</dfn> w najgroźniejszej formie, bo otoczona cytatami wygląda wiarygodnie. Pełna ocena wymaga rozumienia tekstu (5.6); wersja regułowa łapie najczęstszy przypadek: liczby i kody.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="Faithfulness.kt">
+  /** Zdanie z faktem = zawiera liczbę, kod błędu albo ścieżkę menu. Fakt musi być w cytowanym dokumencie. */
+  object Faithfulness {
+      private val sentence = Regex("""(?<=[.!?])\s+""")
+      private val fact = Regex("""\b\d+(?:[.,]\d+)?\s*(?:MB|GB|KB|h|godz\w*|min\w*|dni|%|pozycj\w*)?|\b[A-Z]{2,}(?:_[A-Z0-9]+)+\b""")
+      private val ref = Regex("""\[KB-(\d{1,3})]""")
+
+      data class Claim(val sentence: String, val facts: List<String>, val supported: Boolean, val why: String)
+
+      fun check(answer: String, citations: List<KbCitation>, hits: List<KbHit>): List<Claim> {
+          val byN = citations.associateBy { it.n }
+          return answer.split(sentence).mapNotNull { s ->
+              val facts = fact.findAll(ref.replace(s, "")).map { it.value.trim() }.filter { it.length > 1 }.toList()
+              if (facts.isEmpty()) return@mapNotNull null
+              val docs = ref.findAll(s).mapNotNull { byN[it.groupValues[1].toInt()]?.documentId }.toSet()
+              if (docs.isEmpty()) return@mapNotNull Claim(s, facts, false, "brak cytowania")
+              val ctx = Text.norm(hits.filter { it.documentId in docs }.joinToString("\n") { it.content })
+                  .replace(" ", "")
+              val missing = facts.filter { Text.norm(it).replace(" ", "") !in ctx }
+              Claim(s, facts, missing.isEmpty(), if (missing.isEmpty()) "ok" else "brak w źródle: $missing")
+          }
+      }
+      fun score(claims: List<Claim>) = if (claims.isEmpty()) 1.0 else claims.count { it.supported }.toDouble() / claims.size
+  }
+</script>
+<ul>
+  <li><strong>Łapie</strong>: liczbę z pamięci modelu, liczbę przypisaną złemu źródłu, zdanie z faktem bez cytowania.</li>
+  <li><strong>Nie łapie</strong>: twierdzeń bez liczb („eksport działa tylko dla administratorów”), negacji i wniosków spoza źródła. Rok z daty dokumentu bywa fałszywym alarmem, więc dopuszczaj daty z metadanych kontekstu.</li>
+  <li><strong>Próg</strong>: w przypadku wymagamy 100% popartych zdań z faktami; raport pokazuje średnią i listę niepopartych zdań.</li>
+</ul>
+<p>Lekcja 5.6 doda sędziego LLM, który ocenia pary „zdanie, źródło” i jest kalibrowany na ocenach ludzi; w Spring AI np. <code>FactCheckingEvaluator</code> (dokument jako <code>userText</code> w <code>EvaluationRequest</code>, twierdzenie jako <code>responseContent</code>). Sędzia na zewnętrznym modelu nie może dostać treści Globexu.</p>
+
+<h2>Narzędzia: RAGAS, DeepEval, promptfoo, Spring AI</h2>
+<table>
+  <tr><th>Narzędzie</th><th>Metryki RAG (nazwy z dokumentacji)</th><th>JVM / HelpDesk</th></tr>
+  <tr><td>RAGAS</td><td>Context Precision, Context Recall, Context Entities Recall, Noise Sensitivity, Response Relevancy, Faithfulness. Context Recall ma wariant z LLM, <code>NonLLMContextRecall</code> (porównanie tekstów) i <code>IDBasedContextRecall</code> (porównanie id, jak nasze <code>expectedDocs</code>)</td><td>Biblioteka Pythona. Można karmić ją wynikami z naszego runnera (JSON z pytaniem, kontekstem i odpowiedzią), ale metryki z LLM wołają zewnętrzny model</td></tr>
+  <tr><td>DeepEval</td><td><code>FaithfulnessMetric</code>, <code>AnswerRelevancyMetric</code> (generowanie), metryki kontekstowe: precision, recall, relevancy (wyszukiwanie)</td><td>Python, część funkcji także w TypeScript; integracja z pytest. Dla JVM tylko przez eksport danych</td></tr>
+  <tr><td>promptfoo</td><td>Asercje <code>context-faithfulness</code>, <code>context-recall</code>, <code>context-relevance</code>, <code>answer-relevance</code>, <code>factuality</code></td><td>CLI w Node.js, YAML. Może wołać endpoint HTTP aplikacji (provider HTTP), więc sprawdzi <code>/kb-answer</code> razem z uprawnieniami; trzeba mu zwrócić kontekst w odpowiedzi</td></tr>
+  <tr><td>Spring AI</td><td><code>RelevancyEvaluator</code>, <code>FactCheckingEvaluator</code></td><td>Natywnie w JVM, w tym samym runnerze; lekcja 5.6</td></tr>
+</table>
+<p>Prawie wszystkie te metryki to oceny przez LLM, poza wariantami opartymi na id, których odpowiednikiem są nasze <code>expectedDocs</code>. Narzędzie zewnętrzne ma sens, gdy chcesz szybko dostać metryki sędziowskie, a dane mogą trafić do modelu, którego używa. Nazwy i API zmieniają się między wersjami, sprawdź dokumentację swojej wersji.</p>
+
+<h2>Diagnoza przypadek po przypadku</h2>
+<p>Tabela z pierwszej sekcji staje się kodem. Każdy przypadek dostaje diagnozę z wyniku obu warstw, a raport grupuje porażki według niej. Zamiast „84%” zespół widzi „6 porażek wyszukiwania (4 w <code>KB_LEXICAL</code>), 3 porażki generowania, 1 podejrzaną”.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbDiagnosis.kt">
+  enum class KbDiagnosis { OK, GENERATION, RETRIEVAL, RETRIEVAL_PARTIAL, QUERY_FORMULATION,
+                           UNGROUNDED_OR_LABEL, THRESHOLD, PERMISSION }
+
+  fun diagnose(c: KbEvalCase, r: RetrievalCaseResult, a: AnswerCaseResult?, inChat: RetrievalCaseResult?): KbDiagnosis {
+      if (r.forbiddenReturned.isNotEmpty() || a?.permissionViolation == true) return KbDiagnosis.PERMISSION
+      if (a == null) return if (r.hit == 1.0 || !c.answerable) KbDiagnosis.OK else KbDiagnosis.RETRIEVAL
+      if (!c.answerable)                       // odmowa oczekiwana
+          return if (a.passed) KbDiagnosis.OK
+                 else if ((r.topScore ?: 0.0) >= Thresholds.goodFrom) KbDiagnosis.THRESHOLD   // wyszukiwanie „pewne” bez podstaw
+                 else KbDiagnosis.GENERATION                                                // model odpowiedział mimo WEAK
+      return when {
+          a.passed && r.hit == 1.0 -> KbDiagnosis.OK
+          a.passed -> KbDiagnosis.UNGROUNDED_OR_LABEL          // dobra odpowiedź bez dobrego dokumentu
+          inChat != null && r.hit == 1.0 && inChat.hit == 0.0 -> KbDiagnosis.QUERY_FORMULATION
+          r.hit == 0.0 -> KbDiagnosis.RETRIEVAL
+          r.recall < 1.0 -> KbDiagnosis.RETRIEVAL_PARTIAL
+          else -> KbDiagnosis.GENERATION
+      }
+  }
+</script>
+<ul>
+  <li><strong><code>QUERY_FORMULATION</code></strong> (czat): pytanie użytkownika znajduje dokument, zapytanie napisane przez model już nie. Naprawa: opis parametru <code>query</code> albo reguła promptu v5.</li>
+  <li><strong><code>UNGROUNDED_OR_LABEL</code></strong> czyta człowiek: model wie coś spoza bazy (groźne, nawet gdy trafił) albo etykieta wymaga <code>alsoRelevant</code>.</li>
+  <li><strong><code>GENERATION</code></strong> przy <code>contextFactRecall = 1</code> to czysty problem promptu lub modelu: fakt był w kontekście, a odpowiedź go nie zawiera albo podaje inny.</li>
+</ul>
+
+<h2>Eksperymenty konfiguracyjne na tym samym zbiorze</h2>
+<p>Eksperyment to przebieg obu warstw dla jednego wariantu konfiguracji przy stałym zbiorze i seedzie. Wariant (<code>-Dkb.experiment=chunk-250</code>) ustawia <code>helpdesk.kb.chunking.*</code> (4.2, wymaga ponownego ingestu), nowe przełączniki <code>helpdesk.kb.search.fts-enabled</code> i <code>rerank-enabled</code> (domyślnie <code>true</code>, tylko do eksperymentów), <code>limit</code> albo progi z 4.5. Najpierw warstwa wyszukiwania dla wszystkich wariantów (minuty, zero kosztu), potem odpowiedzi dla 2–3 kandydatów.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="DANE ILUSTRACYJNE – 120 pytań z odpowiedzią (wyszukiwanie), 60 przypadków × 3 (odpowiedź)">
+  wariant                         recall@k  MRR   nDCG@k  odp. OK  odmowy OK  p95 szuk.  USD/pyt.  + błędy*
+  A  450 tok, hybryda, rerank, k=5  0,91    0,78  0,82    86%      88%        0,45 s     0,0232    0,0372
+  B  chunk 250                      0,88    0,76  0,79    82%      87%        0,47 s     0,0202    0,0382
+  C  chunk 800                      0,93    0,71  0,78    84%      86%        0,52 s     0,0285    0,0445
+  D  sam wektor (bez FTS)           0,82    0,70  0,73    80%      85%        0,40 s     0,0232    0,0432
+  E  bez reranku                    0,88    0,63  0,70    79%      61%**      0,09 s     0,0154    0,0364
+  F  k = 3                          0,84    0,77  0,80    83%      88%        0,45 s     0,0200    0,0370
+  G  k = 8                          0,95    0,78  0,83    85%      87%        0,46 s     0,0277    0,0427
+
+  *  koszt na pytanie + (1 − odp. OK) × 0,10 USD (koszt złej podpowiedzi z 4.6)
+  ** progi pokrycia z 4.5 są w skali rerankera; bez niego odmowy kodem przestają działać
+  KB_LEXICAL (kody błędów): A 10/10, D 4/10
+</script>
+<p>Koszt na pytanie bazowego wariantu to 0,0232 USD z 4.6. <dfn data-t="cost-per-correct-task">Koszt na poprawną odpowiedź</dfn> z 1.6 to koszt podzielony przez trafność: 0,0232 / 0,86 = 0,0270 USD. Kolumna „+ błędy” dolicza koszt złych odpowiedzi, jak w 4.6. Jak czytać tabelę:</p>
+<ul>
+  <li><strong>C (duże chunki)</strong> ma najwyższy recall, ale niższy MRR i gorsze odpowiedzi: fragment niesie dużo nieistotnego tekstu, a kontekst jest o 1 750 tokenów dłuższy. Sam recall wybrałby źle.</li>
+  <li><strong>D (sam wektor)</strong> wygląda przyzwoicie średnio, ale kategoria <code>KB_LEXICAL</code> spada do 4/10. Raport per kategoria jest ważniejszy niż średnia.</li>
+  <li><strong>E (bez reranku)</strong> jest najtańszy i najszybszy, a „+ błędy” prawie dogania A. Odpada przez odmowy: progi <dfn data-t="relevance-threshold">trafności</dfn> z 4.5 tracą sens i klienci dostają odpowiedzi z dystraktorów zamiast „nie znalazłem”.</li>
+  <li><strong>F (k = 3)</strong> oszczędza ok. 0,003 USD na pytaniu, czyli ok. 240 USD miesięcznie przy 75 tys. pytań z 4.6, kosztem 3 punktów trafności. Porównanie na parach (<dfn data-t="mcnemar-test">McNemar</dfn> z 3.7): 4 przypadki utracone, 2 zyskane, p = (C(6,4) + C(6,5) + C(6,6)) / 64 = 22/64 ≈ 0,34. To szum. Decyzja: zostaje A, a F wraca na większym zbiorze. Recall@3 = 0,84 mówi, że pytania wielodokumentowe tracą drugi dokument.</li>
+</ul>
+<p>Próg <code>none-below</code> z 4.5 też jest wariantem eksperymentu. Przy 0,10 kod odmawia w 58% pytań bez odpowiedzi, a razem z modelem w szarej strefie w 88%, przy 4,2% zbędnych odmów. Przy 0,20: 77%, 92% i 8,3%. To kompromis z 4.5, zmierzony razem z zachowaniem modelu.</p>
+<p>Tak samo porównasz warianty zapowiedziane wcześniej: wagi RRF (4.4), <dfn data-t="contextual-retrieval">contextual retrieval</dfn> i chunking semantyczny dla dokumentów bez struktury (4.2), spadek wagi z wiekiem (4.5), nowy model embeddingów w reindeksie blue/green (4.3: nowa przestrzeń przechodzi tylko z wynikiem lepszym albo równym i <code>KB_PERMISSIONS</code> 100%).</p>
+
+<div class="box warn"><span class="label">Przeuczenie na zbiorze i holdout</span><p>Siedem wariantów na tych samych 120 pytaniach to strojenie, a każde strojenie grozi <dfn data-t="eval-overfitting">przeuczeniem na zbiorze evali</dfn> (2.8): wybierasz wariant, który akurat lepiej obsługuje kilka konkretnych pytań. W RAG objawy to m.in. synonim w <code>KbTsQueryBuilder</code> dodany „bo kb-017 nie przechodził” albo dokument w seedzie przepisany pod pytanie. Obrona jak w 2.8: <code>evals/kb/holdout.yaml</code> (ok. 20% pytań, w tym prawdziwe z logów), którego nie czytasz przy strojeniu i który uruchamiasz dla zwycięskiego wariantu przed wdrożeniem. Wariant lepszy na zbiorze głównym i gorszy na holdoucie nie przechodzi, a seed zmieniasz tylko za dokumentem produkcyjnym.</p></div>
+
+<h2>Bramka CI: KB_PERMISSIONS, progi, szybki i nocny zestaw</h2>
+<p>Do <dfn data-t="quality-gate">bramki</dfn> z 3.7 dochodzą dwa raporty: <code>kb-retrieval.json</code> (deterministyczny) i wyniki przypadków KB w raporcie evali odpowiedzi. Enum <code>EvalCategory</code> z 2.8 dostaje kategorie KB, a <code>KB_PERMISSIONS</code> jest kategorią bezpieczeństwa: próg 100%, pass^5 w pełnym przebiegu, nigdy w kwarantannie.</p>
+<script type="text/x-code" data-lang="yaml" data-title="src/test/resources/evals/kb/gate.yaml">
+  retrieval:                       # bez LLM, każdy PR dotykający bazy wiedzy
+    k: 5
+    min:      { hitRate: 0.90, recallAtK: 0.85, mrr: 0.70 }
+    maxDrop:  { recallAtK: 0.02, mrr: 0.03 }       # względem baseline
+    permissions: zero              # jakikolwiek dokument zakazany w top-10 → BLOCK
+    perCategoryMin: { KB_LEXICAL: 0.90 }
+  answer:                          # z LLM: szybki zestaw w PR, pełny nocą
+    categories:
+      KB_PERMISSIONS:  { threshold: 1.0, security: true }
+      KB_FACTS:        { threshold: 0.85 }
+      KB_CONFLICT:     { threshold: 0.80 }
+      KB_UNANSWERABLE: { threshold: 0.85 }         # poprawne odmowy
+    faithfulnessMin: 0.95          # średnia z reguł Faithfulness
+    invalidCitationsMax: 0.02      # odsetek prób z wymyślonym [KB-n]
+</script>
+<p>Dla warstwy wyszukiwania polityka różni się od 3.7: wynik jest deterministyczny, więc nie ma szumu, dogrywki ani testu McNemara, a spadek recall@5 z 0,91 na 0,89 to dokładnie dwa lub trzy pytania, które przestały znajdować dokument (raport je wymienia). Bramka blokuje spadek powyżej <code>maxDrop</code>, ale właściciel zbioru może go świadomie zatwierdzić (override z 3.7). Problemu z uprawnieniami zatwierdzić się nie da.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbRetrievalGate.kt">
+  class KbRetrievalGate(private val cfg: KbGateConfig) {
+      fun evaluate(cur: KbRetrievalReport, base: KbRetrievalReport?): GateResult {
+          val f = mutableListOf<Finding>()
+          cur.cases.filter { it.forbiddenReturned.isNotEmpty() }
+              .forEach { f += Finding("KB_PERMISSIONS", GateVerdict.BLOCK, "${it.caseId}: ${it.forbiddenReturned}") }
+          if (cur.overall.recallAtK < cfg.min.recallAtK)
+              f += Finding("próg", GateVerdict.BLOCK, "recall@${cfg.k} %.3f < %.2f".format(cur.overall.recallAtK, cfg.min.recallAtK))
+          // + perCategoryMin (np. KB_LEXICAL) analogicznie
+          if (base != null && base.suiteSha256 == cur.suiteSha256 && base.seedSha256 == cur.seedSha256) {
+              val drop = base.overall.recallAtK - cur.overall.recallAtK
+              val lost = cur.cases.filter { c -> c.hit == 0.0 && base.case(c.caseId)?.hit == 1.0 }.map { it.caseId }
+              if (drop > cfg.maxDrop.recallAtK)
+                  f += Finding("spadek", GateVerdict.BLOCK, "recall −%.3f, utracone: %s".format(drop, lost))
+          } else if (base != null) {
+              f += Finding("baseline", GateVerdict.PASS, "UWAGA: inny zbiór lub seed – porównanie tylko wspólnych przypadków")
+          }
+          return GateResult(f.maxOfOrNull { it.verdict } ?: GateVerdict.PASS, f, emptyList())
+      }
+  }
+</script>
+<table>
+  <tr><th>Zestaw</th><th>Kiedy</th><th>Zawartość</th><th>Koszt i czas (orientacyjnie)</th></tr>
+  <tr><td>Wyszukiwanie</td><td>Każdy PR dotykający <code>knowledge/**</code>, <code>evals/kb/**</code>, migracji KB, konfiguracji TEI i LiteLLM (dopisz do <code>.github/assistant-paths.yml</code> z 3.7)</td><td>Cały zbiór, k = 5 i 10, uprawnienia</td><td>0 USD, ok. 5 min</td></tr>
+  <tr><td>Odpowiedź – szybki</td><td>PR zmieniający prompt <code>kb-answer</code> lub <code>assistant-chat</code>, model, top-k, progi</td><td>Wszystkie <code>KB_PERMISSIONS</code> (k = 3) + przypadki z tagiem <code>pr</code></td><td>ok. 25 przypadków, ok. 1 USD, 5 min</td></tr>
+  <tr><td>Odpowiedź – pełny</td><td>Nocą i po merge do main</td><td>60 przypadków × 3, bezpieczeństwo × 5; osobno <code>globex</code> na <code>helpdesk-local</code></td><td>ok. 2–3 USD, 12 min</td></tr>
+  <tr><td>Holdout</td><td>Przed releasem i przed zmianą modelu embeddingów</td><td><code>holdout.yaml</code></td><td>ok. 0,5 USD</td></tr>
+</table>
+<p>Próba <code>KB_ANSWER</code> kosztuje ok. 0,023 USD (4.6), a odmowy kodem nic, więc przebiegi są tańsze niż evale czatu z 3.7. Raport Markdown trafia do komentarza w PR obok sekcji czatu:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="build/reports/evals/kb.md (DANE ILUSTRACYJNE)">
+  ## Baza wiedzy – wyszukiwanie   (seed 3e91…a4, zbiór v4, 180 pytań, k = 5)
+  | Metryka            | Teraz | Baseline | Zmiana |
+  | hit rate@5         | 0,93  | 0,93     |  0     |
+  | recall@5           | 0,89  | 0,91     | −0,02  |
+  | MRR                | 0,79  | 0,78     | +0,01  |
+  | fakty w kontekście | 0,90  | 0,91     | −0,01  |
+  KB_PERMISSIONS: 0 dokumentów zakazanych w top-10 → OK
+  UTRACONE (hit 1 → 0): kb-044 „limit eksportu w Excelu”, kb-102 „ERR_XLS_ROWS”
+  Syntetyczne (52): recall 0,96 | prawdziwe (68): recall 0,84
+  ## Baza wiedzy – odpowiedzi   (kb-answer/v1 | helpdesk-default | cfg-7c21…)
+  KB_PERMISSIONS 9/9 · KB_FACTS 26/30 · KB_CONFLICT 5/6 · KB_UNANSWERABLE 10/12 (kod 7, model 3)
+  faithfulness 0,97 | nieważne cytowania 1,1% | koszt 1,08 USD | koszt/poprawną 0,027 USD
+  Diagnoza porażek: RETRIEVAL 3 · GENERATION 2 · THRESHOLD 1 · UNGROUNDED_OR_LABEL 1
+  Werdykt: BLOCK – recall −0,02 w granicy, ale KB_LEXICAL 0,88 < 0,90 (kb-102)
+</script>
+<p>Raport sam wskazuje kierunek: oba utracone przypadki dotyczą Excela, więc ktoś zmienił <code>KbTsQueryBuilder</code> albo dokument o eksporcie do Excela. Po merge do main baseline aktualizuje się jak w 3.7 (gałąź <code>evals-baseline</code>) razem z hashami zbioru i seeda, żeby kolejne porównania były uczciwe.</p>
+
+<h2>Monitoring produkcyjny jako uzupełnienie</h2>
+<p>Evale mierzą znane pytania na stałych dokumentach, a produkcja ma nowe pytania i 40 tys. chunków zamiast 300. Jej sygnały nie dają etykiet, ale pokazują trendy i podsuwają przypadki:</p>
+<table>
+  <tr><th>Sygnał</th><th>Skąd</th><th>Co sugeruje</th></tr>
+  <tr><td>Odsetek <code>NO_SOURCES</code> i pokrycia NONE/WEAK per tenant</td><td>Licznik <code>helpdesk.kb.coverage</code> (4.5)</td><td>Skok po wdrożeniu oznacza awarię wyszukiwania albo zmianę progu, a nie luki w wiedzy</td></tr>
+  <tr><td>Kliknięcia w źródła</td><td>Lista <code>KbSources</code> (4.4) → licznik <code>helpdesk.kb.citation.clicks</code></td><td>Spadek przy stałym ruchu: cytowane źródła przestały pasować do pytań (słaba miara, ale tania)</td></tr>
+  <tr><td>„Zgłoś nieaktualne”, WRONG, HELPFUL</td><td><code>kb_feedback</code> (4.5)</td><td>WRONG z rozmowy to gotowy kandydat na przypadek regresji</td></tr>
+</table>
+<p>Co tydzień zapytanie do <code>kb_feedback</code> (WRONG, MISSING, OUTDATED z ostatnich 30 dni, zgłoszone przez co najmniej dwie osoby) daje listę kandydatów. Z każdego powstaje przypadek: po redakcji PII i przepisaniu na dokumenty seeda, z pochodzeniem w polu <code>source</code>. Połączenie tych sygnałów z kosztem i trafnością w jeden produkcyjny widok „koszt na poprawne zadanie” to temat lekcji 5.7.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Co się dzieje</th><th>Obsługa</th></tr>
+  <tr><td>Dokument zmienił się i przypadek przestał pasować</td><td>Produkcyjny limit wzrósł do 50 MB, seed ma nadal 25 MB: eval przechodzi i wprowadza w błąd. Albo zmieniono seed i padają przypadki</td><td>Seed i <code>cases.yaml</code> zmieniasz w jednym commicie; <code>KbEvalSeedContractTest</code> sprawdza fakty w dokumentach; raport zapisuje <code>seedSha256</code>, a bramka nie porównuje z baseline o innym seedzie</td></tr>
+  <tr><td>Kilka poprawnych dokumentów</td><td>Instrukcja globalna i notatka Acme opisują to samo; metryka karze za „inny” poprawny dokument</td><td><code>alsoRelevant</code> liczy się do hit, MRR i nDCG, ale nie do mianownika recall; diagnoza <code>UNGROUNDED_OR_LABEL</code> wymusza przegląd etykiet</td></tr>
+  <tr><td>Pytania wielojęzyczne</td><td>Gałąź pełnotekstowa nic nie znajduje, wyniki rerankera są niższe (4.5)</td><td>Kategoria <code>KB_LANG</code> i raport per język; progi kalibrowane osobno; liczby i kody są takie same w obu językach</td></tr>
+  <tr><td>Niedeterminizm: reranker a LLM</td><td>Cross-encoder przy tym samym wejściu i sprzęcie zwraca te same liczby, LLM nie</td><td>Wyszukiwanie: jeden przebieg, remisy po <code>chunk_id</code>. Odpowiedź: k prób i pass^k z 2.8. Degradacja rerankera (4.4) w evalu unieważnia przebieg</td></tr>
+  <tr><td>Usunięty dokument</td><td>Erasure z 4.3: dokument nie może wrócić w żadnej odpowiedzi</td><td>Seeder po ingeście usuwa jeden dokument; przypadek z jego <code>mustNotCite</code> sprawdzają obie warstwy</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Przygotuj seed <code>evals/kb/docs</code> z 8 dokumentami z tej lekcji i co najmniej 12 dystraktorami. Napisz 30 przypadków (w tym 8 <code>answerable: false</code> i 4 <code>KB_PERMISSIONS</code>) oraz <code>KbEvalSeedContractTest</code>. Zmień w seedzie „25 MB” na „30 MB” i sprawdź, który test to wyłapie.</li>
+  <li>Zaimplementuj <code>RetrievalMetrics</code> i test odtwarzający przykład Q1–Q4 z lekcji. Uruchom <code>KbRetrievalEvalTest</code> z TEI i porównaj warianty A, D i E, w tym kategorię <code>KB_LEXICAL</code> osobno.</li>
+  <li>Wygeneruj 20 pytań syntetycznych dla dokumentów globalnych, przejrzyj je i zapisz, ile odrzuciłeś i dlaczego. Porównaj recall@5 pytań syntetycznych i napisanych ręcznie.</li>
+  <li>Wprowadź celowo błąd: usuń warunek <code>visibility</code> z gałęzi pełnotekstowej zapytania z 4.4. Sprawdź, czy warstwa wyszukiwania wyłapie go bez wywołania LLM (<code>forbiddenReturned</code>) i jaki werdykt da <code>KbRetrievalGate</code>.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Recall@5 wynosi 0,95, a w przypadkach z dobrym wyszukiwaniem odpowiedzi często podają złą liczbę, choć fakt jest w kontekście (fakty w kontekście = 1). Gdzie szukać przyczyny?</p>
+  <button>W chunkingu: chunki są za małe</button>
+  <button>W modelu embeddingów: trzeba zmienić go na lepszy</button>
+  <button>W generowaniu: prompt, model, kolejność i liczba fragmentów w kontekście, obsługa sprzeczności</button>
+  <button>W progu minScore</button>
+  <p class="explain">Wyszukiwanie dostarczyło właściwy dokument i fakt jest w kontekście, więc zmiany w chunkingu czy embeddingach nic nie dadzą. Diagnoza GENERATION kieruje do promptu i modelu.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego <code>expectedDocs</code> oznaczamy na poziomie dokumentu, a nie chunka?</p>
+  <button>Bo id chunków zmieniają się przy każdej zmianie chunkingu lub wersji dokumentu, więc etykiety znikałyby dokładnie wtedy, gdy porównujesz konfiguracje chunkingu</button>
+  <button>Bo metryki wyszukiwania działają tylko na dokumentach</button>
+  <button>Bo chunki są poufne i nie mogą trafić do repozytorium</button>
+  <button>Bo dokument zawsze mieści się w jednym chunku</button>
+  <p class="explain">Etykieta dokumentowa jest stabilna przy zmianie chunkingu, modelu i wersji. Jej słabość (zły fragment z dobrego dokumentu) uzupełnia metryka „fakty w kontekście”.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Dla pytania z wymaganymi dokumentami {A, F} ranking top-5 to [C, A, D, E, B]. Ile wynoszą recall@5 i RR (odwrotność pozycji pierwszego istotnego)?</p>
+  <button>recall 1, RR 1</button>
+  <button>recall 0,5, RR 1</button>
+  <button>recall 1, RR 0,5</button>
+  <button>recall 0,5, RR 0,5</button>
+  <p class="explain">W top-5 jest tylko A z dwóch wymaganych dokumentów, więc recall = 1/2. Pierwszy istotny dokument jest na pozycji 2, więc RR = 1/2.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Wariant bez rerankera jest najtańszy, a jego koszt z kosztem błędów jest prawie równy wariantowi bazowemu. Dlaczego mimo to go odrzucamy?</p>
+  <button>Bo zawsze wybieramy wariant o najwyższym recall</button>
+  <button>Bo progi pokrycia z 4.5 są w skali rerankera i bez niego poprawne odmowy przy pytaniach bez odpowiedzi spadają z 88% do 61%</button>
+  <button>Bo reranker jest wymagany przez pgvector</button>
+  <button>Bo bez rerankera wyszukiwanie przestaje filtrować uprawnienia</button>
+  <p class="explain">Jedna kolumna kosztu nie pokazuje jakości odmów. Bez rerankera klienci dostawaliby odpowiedzi z dystraktorów zamiast „nie znalazłem”. Uprawnienia egzekwuje SQL, niezależnie od rerankera.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Dlaczego eval wyszukiwania może biec w każdym PR bez dogrywek i testu McNemara, a eval odpowiedzi nie?</p>
+  <button>Bo wyszukiwanie zawsze ma recall 100%</button>
+  <button>Bo eval wyszukiwania używa atrapy <code>HashingKbEmbedder</code></button>
+  <button>Bo bez LLM wynik jest deterministyczny (ta sama rewizja modelu, ten sam seed, remisy po chunk_id), tani i szybki, więc każda zmiana wyniku to konkretne pytania, a nie szum</button>
+  <button>Bo bramka CI nie obsługuje przypadków z LLM</button>
+  <p class="explain">Embedding, SQL i cross-encoder dają te same liczby przy tym samym wejściu i sprzęcie. Odpowiedź LLM jest niedeterministyczna, więc wymaga k prób, pass^k i statystyki z 3.7. Atrapa embeddingów nie mierzy jakości, dlatego eval używa prawdziwego TEI.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

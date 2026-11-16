@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.2 Import wiedzy: chunking, metadane – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="4.2">
+<main>
+<p class="meta">Lekcja 4.2 · ok. 60 min</p>
+<h1>Import wiedzy: parsowanie, chunking, metadane</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zaprojektować drogi, którymi dokumenty trafiają do bazy wiedzy, w tym rozwiązania zgłoszeń dopuszczane po akceptacji człowieka i redakcji danych osobowych.</li>
+  <li>Zbudować <code>POST /api/kb/documents</code> z walidacją typu, rozmiaru i uprawnień.</li>
+  <li>Sparsować Markdown, HTML, DOCX i PDF do wspólnego modelu bloków bez gubienia nagłówków i tabel.</li>
+  <li>Napisać <code>KbChunker</code>: podział strukturalny, 300–600 tokenów tokenizerem modelu embeddingów, nakładka, nierozcinane tabele i kod.</li>
+  <li>Uruchomić import asynchronicznie: kolejka z <code>FOR UPDATE SKIP LOCKED</code>, partie embeddingów, bulkhead, ponowienia, status w UI, metryki i testy.</li>
+</ul></div>
+
+<h2>Skąd biorą się dokumenty w HelpDesk</h2>
+<p>Lekcja 4.1 dała schemat (<code>kb_documents</code>, <code>kb_chunks</code> z <code>embedding vector(1024)</code>) i model bge-m3 pod aliasem <code>helpdesk-embed</code>. Ta lekcja dotyczy importu, który zespoły zwykle robią „na szybko”, a potem łatają miesiącami. Jakość <dfn data-t="rag">RAG</dfn> (model odpowiada na podstawie wyszukanych fragmentów dokumentów) ogranicza to, co trafiło do indeksu. Nagłówek zgubiony przy parsowaniu PDF albo tabela rozcięta w połowie to błąd, którego żaden prompt nie naprawi.</p>
+<table>
+  <tr><th>Źródło</th><th><code>source_type</code></th><th>Kto dodaje</th><th>Ryzyko</th></tr>
+  <tr><td>Plik MD, HTML, PDF, DOCX</td><td><code>UPLOAD</code></td><td>AGENT/ADMIN tenanta; globalny tylko ADMIN</td><td>Zły format, makra, ukryty tekst, dane osobowe</td></tr>
+  <tr><td>Strony Confluence</td><td><code>CONFLUENCE</code></td><td>Synchronizacja (4.3)</td><td>Makra Confluence, usunięte strony wracające w odpowiedziach</td></tr>
+  <tr><td>Strona WWW</td><td><code>URL</code></td><td>ADMIN</td><td>Nawigacja w treści, pośredni prompt injection</td></tr>
+  <tr><td>Rozwiązanie zgłoszenia</td><td><code>TICKET_SOLUTION</code></td><td>AGENT po akceptacji</td><td>Dane osobowe klienta, tekst napisany przez klienta</td></tr>
+</table>
+<script type="text/x-code" data-lang="plaintext" data-title="potok importu">
+  POST /api/kb/documents ─┐
+  Confluence sync (4.3) ──┼─► KbIngestionService.ingest(cmd)              [w żądaniu, ~100 ms]
+  Rozwiązanie zgłoszenia ─┘     uprawnienia → plik do magazynu → typ → content_hash
+                                └─ TX: kb_documents (current_version NULL) + kb_ingestion_jobs (QUEUED)
+                         KbIngestionWorker (FOR UPDATE SKIP LOCKED)          [w tle]
+                           parser → bloki → normalizacja → KbChunker → partie → helpdesk-embed
+                           → kb_chunks (wersja N) → TX: current_version = N, zadanie DONE
+</script>
+<p>Wyszukiwanie zawsze filtruje <code>document_version = current_version</code> (4.4). Nowy dokument ma <code>current_version = NULL</code>, więc częściowo zaindeksowany plik nigdy nie trafi do odpowiedzi.</p>
+
+<h2>Rozwiązania zgłoszeń: akceptacja i redakcja PII</h2>
+<p>Najcenniejsza wiedza siedzi w rozwiązanych zgłoszeniach: „pusty PDF przy fakturach powyżej 500 pozycji, obejście: eksport w dwóch częściach” (HD-1042). Automatyczne indeksowanie zamkniętych zgłoszeń byłoby jednak powtórką <strong>błędu #5</strong> z 2.7: imiona, telefony i e-maile klientów trafiłyby do odpowiedzi dla innych osób, a na trasie zewnętrznej do dostawcy LLM. Dlatego <code>TICKET_SOLUTION</code> ma trzy reguły:</p>
+<ol>
+  <li><strong>Człowiek akceptuje</strong> (<dfn data-t="hitl">human-in-the-loop</dfn>): agent klika „Zaproponuj jako artykuł”, poprawia szkic i zatwierdza.</li>
+  <li><strong>Redakcja szkicu i ponownie po edycji</strong>, bo agent może dopisać telefon klienta.</li>
+  <li><strong>Tylko tenant zgłoszenia.</strong> Rozwiązanie z Globexu nigdy nie staje się dokumentem globalnym; awans do dokumentacji produktu to nowy <code>UPLOAD</code> ADMIN-a.</li>
+</ol>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/solution/KbSolutionService.kt">
+  data class SolutionApproval(val ticketId: UUID, val ticketNumber: String,   // "HD-1042" → external_id
+                              val approvedBy: UUID, val approvedAt: Instant, val textSha256: String)
+
+  @Service
+  class KbSolutionService(private val tickets: TicketApi, private val comments: CommentApi,
+                          private val redactor: PiiRedactor, private val ingestion: KbIngestionService,
+                          private val clock: Clock) {
+
+      fun draft(user: CurrentUser, ticketId: UUID): String {
+          require(user.isStaff)
+          val t = tickets.get(user, ticketId)                                   // 404 dla cudzego
+          check(t.status == TicketStatus.RESOLVED || t.status == TicketStatus.CLOSED)
+          val fix = comments.list(user, ticketId).lastOrNull { it.visibility == Visibility.PUBLIC }?.body.orEmpty()
+          val raw = "# ${t.title}\n\n## Objawy\n\n${t.description}\n\n## Rozwiązanie\n\n$fix"
+          return redactor.redact(raw, RedactionContext(t.tenantId, RedactionPurpose.KB_INGEST)).text  // mapping odrzucony
+      }
+
+      fun approve(user: CurrentUser, ticketId: UUID, edited: String): IngestResult {
+          val t = tickets.get(user, ticketId)
+          val check = redactor.redact(edited, RedactionContext(t.tenantId, RedactionPurpose.KB_INGEST))
+          if (check.mapping.isNotEmpty()) throw KbPiiDetectedException(check.mapping.keys.map(::entityType).toSet())
+          val text = TextNormalizer.normalize(edited).text
+          return ingestion.ingest(IngestDocument.ticketSolution(user, t.tenantId, text,
+              SolutionApproval(t.id, t.displayNumber, user.userId, clock.instant(), sha256(text))))
+      }
+  }
+</script>
+<p><code>RedactionPurpose.KB_INGEST</code> to nowa wartość enuma z 2.7. Mapowanie placeholderów nie jest nigdzie zapisywane, więc tekst w KB jest zanonimizowany, a nie <dfn data-t="pseudonymization">pseudonimizowany</dfn>. Numerowane znaczniki zostają, bo „&lt;PERSON_1&gt; potwierdził obejście” czyta się lepiej niż same <code>&lt;PERSON&gt;</code>. <code>KbPiiDetectedException</code> to 422 <code>kb-pii-detected</code> z typami encji (bez wartości).</p>
+<div class="box warn"><span class="label">Pułapka: zatwierdzony tekst ≠ indeksowany tekst</span><p>Między akceptacją a indeksowaniem jest kolejka. Worker nie pobiera treści ponownie ze zgłoszenia (zaindeksowałby komentarz dopisany później), tylko plik zapisany przy akceptacji, i porównuje jego <code>sha256</code> z <code>textSha256</code>. Niezgodność to <code>PROVENANCE_MISMATCH</code>, nie ciche zaindeksowanie.</p></div>
+
+<h2>Endpoint POST /api/kb/documents</h2>
+<p>Upload to <code>multipart/form-data</code>: część <code>file</code> i część <code>metadata</code> (JSON). Kontroler wymusza <code>source_type = UPLOAD</code>, więc nie da się nim ominąć akceptacji rozwiązań.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/web/KbDocumentController.kt">
+  data class UploadMetadata(
+      val tenantId: UUID?,                                   // null = globalny (tylko ADMIN)
+      @field:Size(max = 300) val title: String? = null,
+      val visibility: Visibility? = null, val authority: KbAuthority? = null,
+      @field:Pattern(regexp = "^[a-z]{2}$") val language: String? = null,
+      val validFrom: Instant? = null, val validUntil: Instant? = null, val reviewDueAt: Instant? = null,
+  )
+
+  @RestController
+  @RequestMapping("/api/kb/documents")
+  class KbDocumentController(private val ingestion: KbIngestionService) {
+      @PostMapping(consumes = [MediaType.MULTIPART_FORM_DATA_VALUE])
+      fun upload(user: CurrentUser, @RequestPart("file") file: MultipartFile,
+                 @Valid @RequestPart("metadata") meta: UploadMetadata): ResponseEntity<IngestResult> {
+          val r = file.inputStream.use { ingestion.ingest(IngestDocument.upload(user, file.originalFilename ?: "plik", it, meta)) }
+          return ResponseEntity.status(if (r.duplicate) HttpStatus.OK else HttpStatus.ACCEPTED)
+              .location(URI.create("/api/kb/documents/${r.documentId}")).body(r)
+      }
+  }
+</script>
+<p>202 Accepted mówi uczciwie „przyjęte, przetwarzanie trwa”, a <code>Location</code> wskazuje zasób ze statusem. Uprawnienia zależą od danych żądania, więc sprawdza je serwis:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbIngestionService.authorize">
+  private fun authorize(cmd: IngestDocument) {
+      val u = cmd.user
+      if (!u.isStaff) throw KbForbiddenException("Dokumenty dodaje personel")
+      if (cmd.tenantId == null) {
+          if (Role.ADMIN !in u.roles) throw KbForbiddenException("Dokument globalny dodaje tylko administrator")
+          require(cmd.sourceType != KbSourceType.TICKET_SOLUTION)
+      } else tenants.get(u, cmd.tenantId)                                     // 404 dla niewidocznego tenanta
+      if (cmd.meta.authority == KbAuthority.OFFICIAL && Role.ADMIN !in u.roles)
+          throw KbForbiddenException("Status OFFICIAL nadaje administrator")
+      if (cmd.sourceType == KbSourceType.TICKET_SOLUTION) requireNotNull(cmd.solution) { "Brak akceptacji" }
+  }
+</script>
+<p>„OFFICIAL tylko ADMIN”, bo w 4.5 przy sprzecznych źródłach wygrywa <code>authority</code>.</p>
+<h3>Rozmiar i typ pliku</h3>
+<p>Limity: <code>spring.servlet.multipart.max-file-size: 20MB</code> (przekroczenie to <code>MaxUploadSizeExceededException</code> → 413 <code>kb-file-too-large</code>), <code>file-size-threshold: 1MB</code> (większe pliki buforowane na dysku), 500 stron PDF, 3 mln znaków tekstu, 2 000 chunków. Typu nie bierzemy z rozszerzenia ani z <code>Content-Type</code>, bo oba kontroluje klient. Decyduje <dfn data-t="apache-tika">Apache Tika</dfn> (biblioteka Javy do wykrywania typu i wyciągania tekstu z ponad tysiąca formatów) na podstawie zawartości:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/ingest/KbFileInspector.kt">
+  fun inspect(path: Path, fileName: String): KbFormat {
+      val mime = TikaInputStream.get(path).use { tika.detect(it, fileName) }       // bajty + nazwa
+      if (mime.contains("macroEnabled", true) || mime == "application/msword")
+          throw KbRejectedException("kb-macro-not-allowed", "Pliki z makrami i stary .doc są odrzucane")
+      val format = ALLOWED[mime]                    // pdf, docx, text/html, text/x-web-markdown
+          ?: if (mime == "text/plain" && fileName.endsWith(".md", true)) KbFormat.MARKDOWN
+             else throw KbRejectedException("kb-unsupported-type", "Nieobsługiwany typ: $mime")
+      if (format == KbFormat.DOCX) ZipFile(path.toFile()).use { zip ->               // DOCX to ZIP
+          var total = 0L
+          for (e in zip.entries()) {
+              if (e.name.endsWith("vbaProject.bin", true)) throw KbRejectedException("kb-macro-not-allowed", "Makra VBA")
+              total += e.size.coerceAtLeast(0)
+              if (total > 200L shl 20) throw KbRejectedException("kb-zip-bomb", "Rozpakowana treść > 200 MB")
+          }
+      }
+      return format
+  }
+</script>
+<p><dfn data-t="zip-bomb">Bomba dekompresyjna</dfn> to mały ZIP, który po rozpakowaniu zajmuje gigabajty i wyczerpuje pamięć parsera. Rozmiary z nagłówków ZIP da się sfałszować, więc to tylko pierwsza linia. Drugą jest <code>ZipSecureFile</code> w Apache POI (którego Tika używa dla DOCX), trzecią parsowanie w osobnym procesie.</p>
+
+<h2>Parsowanie: Markdown, HTML, DOCX, PDF</h2>
+<p>Każdy format sprowadzamy do listy bloków. Chunker nie wie, skąd pochodził tekst; wie tylko, gdzie są nagłówki, akapity, tabele i kod.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/parse/Blocks.kt">
+  sealed interface Block {
+      data class Heading(val level: Int, val text: String) : Block
+      data class Paragraph(val text: String) : Block          // także lista: linie "- …"
+      data class Table(val header: List<String>, val rows: List<List<String>>) : Block
+      data class Code(val lang: String?, val text: String) : Block
+  }
+  data class ParsedDocument(val title: String?, val blocks: List<Block>,
+                            val frontMatter: Map<String, String> = emptyMap(),
+                            val warnings: Set<String> = emptySet(), val pages: Int? = null)
+</script>
+<p><strong>Markdown</strong> ma jawną strukturę. commonmark-java z rozszerzeniami GFM tables i YAML front matter daje drzewo: <code>Heading</code> (z <code>level</code>), <code>FencedCodeBlock</code> (<code>info</code>, <code>literal</code>), <code>TableBlock</code>, akapity i listy; <code>YamlFrontMatterVisitor</code> zwraca metadane z nagłówka pliku. Mapowanie węzłów najwyższego poziomu na bloki to kilkanaście linii.</p>
+<p><strong>HTML</strong> ze strony czy wiki to w połowie menu, okruszki i stopka. Powtarzają się na każdej stronie, więc po zaindeksowaniu każde pytanie trafia w chunk „Strona główna › Produkty › Kontakt”. Usuwamy szum i ukryte elementy, zachowujemy <code>h1</code>–<code>h6</code>, akapity, listy, <code>pre</code> i tabele (Jsoup):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/parse/HtmlParser.kt">
+  class HtmlParser {
+      private val noise = "script, style, noscript, template, iframe, svg, nav, header, footer, aside, form, " +
+          "[hidden], [aria-hidden=true], [role=navigation], .breadcrumb, .toc"
+
+      fun parse(doc: Document): ParsedDocument {
+          val warnings = mutableSetOf<String>()
+          val hidden = doc.select("[style~=(?i)display\\s*:\\s*none|visibility\\s*:\\s*hidden|font-size\\s*:\\s*0]")
+          if (hidden.text().length > 20) warnings += "HIDDEN_CONTENT"            // sygnał injection
+          hidden.remove(); doc.select(noise).remove()
+          val comments = mutableListOf<Node>(); doc.forEachNode { if (it is Comment) comments += it }
+          comments.forEach { it.remove() }
+          val root = doc.selectFirst("main, article, [role=main]") ?: doc.body()
+          return ParsedDocument(doc.title().ifBlank { null }, mutableListOf<Block>().also { walk(root, it) }, warnings = warnings)
+      }
+
+      private fun walk(el: Element, out: MutableList<Block>) {
+          for (c in el.children()) when (c.tagName()) {
+              "h1", "h2", "h3", "h4", "h5", "h6" -> out += Block.Heading(c.tagName()[1].digitToInt(), c.text())
+              "p", "blockquote" -> if (c.hasText()) out += Block.Paragraph(c.text())
+              "ul", "ol" -> out += Block.Paragraph(c.select("> li").joinToString("\n") { "- " + it.text() })
+              "pre" -> out += Block.Code(c.selectFirst("code")?.className()?.removePrefix("language-"), c.wholeText())
+              "table" -> out += table(c)          // wiersz z th → header; colspan rozwijany do pustych komórek
+              else -> walk(c, out)                // div, section…
+          }
+      }
+  }
+</script>
+<p><strong>DOCX i PDF</strong> czyta Tika, ale z wynikiem jako XHTML (<code>ToXMLContentHandler</code>) zamiast gołego tekstu. W DOCX style „Nagłówek 1/2” stają się <code>h1</code>/<code>h2</code>, a tabele Worda tabelami HTML, więc dalej działa ten sam <code>HtmlParser</code>. PDF daje tylko <code>&lt;div class="page"&gt;</code> z akapitami.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/parse/TikaXhtmlParser.kt (rdzeń)">
+  val xhtml = ToXMLContentHandler()
+  val metadata = Metadata()
+  val ctx = ParseContext().apply {
+      set(PDFParserConfig::class.java, PDFParserConfig().apply {
+          isSortByPosition = false          // true potrafi skleić dwie kolumny w jedną linię: testuj na swoich PDF-ach
+          isExtractInlineImages = false     // bez OCR obrazy nie dają tekstu
+      })
+  }
+  try {
+      AutoDetectParser().parse(TikaInputStream.get(input), WriteOutContentHandler(xhtml, maxChars), metadata, ctx)
+  } catch (e: EncryptedDocumentException) { throw KbPermanentException("ENCRYPTED", "Dokument z hasłem") }
+  val pages = metadata.getInt(PagedText.N_PAGES)
+  val doc = Jsoup.parse(xhtml.toString()).also { if (format == KbFormat.PDF) PdfCleanup.apply(it) }
+  val parsed = html.parse(doc).copy(pages = pages)
+  if (format == KbFormat.PDF && pages != null && parsed.charCount() < pages * 50)
+      throw KbPermanentException("NO_TEXT_LAYER", "PDF bez warstwy tekstowej (skan?)")
+  // limit znaków: WriteOutContentHandler zgłasza przekroczenie wyjątkiem; nazwy sprawdź w swojej wersji Tiki
+</script>
+<p>Parsowanie niezaufanych plików to kod z długą historią podatności i nieograniczonym zużyciem pamięci. Na produkcji przenieś je do osobnego procesu: kontener <code>tika-server</code> (REST, XHTML przy <code>Accept: text/html</code>) z limitem pamięci i timeoutem albo forkowanie Tiki („tika-pipes”, sprawdź w dokumentacji). Złośliwy PDF zabije wtedy kontener parsera, a nie HelpDesk.</p>
+<table>
+  <tr><th>Ograniczenie PDF</th><th>Efekt</th><th>Co robimy</th></tr>
+  <tr><td>Dwie kolumny</td><td>Linie z obu kolumn przemieszane, zależnie od kolejności w pliku</td><td>Testy na reprezentatywnych plikach; przy złych wynikach parser świadomy układu albo prośba o DOCX/MD</td></tr>
+  <tr><td>Nagłówki i stopki stron</td><td>„Instrukcja v3.2 – strona 7 z 40” 40 razy w treści</td><td><code>PdfCleanup</code>: linie powtarzające się na ≥ 60% stron (cyfry → <code>#</code>) usuwane</td></tr>
+  <tr><td>Brak nagłówków</td><td>Tytuły rozdziałów jako akapity</td><td>Krótka linia pasująca do <code>^\d+(\.\d+)*\.?\s+\p{Lu}</code> → <code>Heading</code>; flaga <code>NO_HEADINGS</code></td></tr>
+  <tr><td>Tabele</td><td>Komórki rozdzielone spacjami</td><td>Zostaje tekst; ważne tabele w innym formacie</td></tr>
+  <tr><td>Skan</td><td>Pusty tekst</td><td><code>NO_TEXT_LAYER</code> → FAILED z komunikatem</td></tr>
+</table>
+<p><dfn data-t="ocr">OCR</dfn> (optyczne rozpoznawanie znaków) zamienia obraz strony na tekst. Tika potrafi wołać Tesseract, ale to dodatkowy obraz, sekundy na stronę i błędy w polskich znakach. W HelpDesk OCR jest wyłączony: skan dostaje czytelny błąd zamiast pustego indeksu.</p>
+
+<h2>Spring AI DocumentReader czy własny parser</h2>
+<p>Spring AI ma czytniki w swoim potoku ETL: <code>TikaDocumentReader</code> (<code>spring-ai-tika-document-reader</code>), <code>MarkdownDocumentReader</code> (opcje m.in. <code>withHorizontalRuleCreateDocument</code>, <code>withIncludeCodeBlock</code>), <code>JsoupDocumentReader</code> (selektor CSS, domyślnie <code>body</code>), <code>PagePdfDocumentReader</code>/<code>ParagraphPdfDocumentReader</code> (PDFBox). Każdy zwraca listę <code>Document</code> (tekst i metadane). Prototyp to dwie linie: <code>TikaDocumentReader(resource).get()</code> i <code>TokenTextSplitter.builder().withChunkSize(500).build().apply(docs)</code>.</p>
+<table>
+  <tr><th>Kryterium</th><th>Czytniki Spring AI</th><th>Własny model bloków</th></tr>
+  <tr><td>Struktura</td><td><code>TikaDocumentReader</code> zwraca płaski tekst: nagłówki i granice tabel znikają</td><td>Nagłówki, tabele, kod dla każdego formatu</td></tr>
+  <tr><td>Jednolitość</td><td>Różne metadane i granulacja (strona, akapit, sekcja)</td><td>Jeden <code>ParsedDocument</code>, jeden chunker</td></tr>
+  <tr><td>Bezpieczeństwo</td><td>Brak kontroli nad ukrytym tekstem i limitami</td><td>Usuwanie ukrytych elementów, limity, flagi</td></tr>
+  <tr><td>Koszt</td><td>Minuty, utrzymanie z nowymi wersjami</td><td>Dzień lub dwa, utrzymanie po Twojej stronie</td></tr>
+</table>
+<p><strong>Decyzja:</strong> własne parsery na tych samych bibliotekach (Tika, commonmark, Jsoup), bo potrzebujemy <code>heading_path</code> i całych tabel. Czytniki Spring AI zostają do prototypów i jako punkt odniesienia w evalach 4.7. Ich API zmieniało się między wersjami, więc nazwy sprawdź w dokumentacji swojej wersji.</p>
+
+<h2>Normalizacja tekstu i ukryte treści</h2>
+<p>Dokument z KB trafi do promptu jako wynik <code>searchKnowledgeBase</code> (4.4). To kanał <dfn data-t="indirect-prompt-injection">pośredniego prompt injection</dfn>: ktoś, kto edytuje stronę Confluence albo pisze treść zgłoszenia, które stanie się rozwiązaniem, umieszcza w niej polecenia dla modelu. Najgroźniejszy jest <dfn data-t="hidden-text">ukryty tekst</dfn>, którego recenzent nie widzi: <code>display:none</code> w HTML, ukryty tekst Worda (Tika może go wyciągnąć), <dfn data-t="invisible-unicode">niewidoczne znaki Unicode</dfn> i znaki tagów.</p>
+<p>Każdy blok przechodzi przez <code>TextNormalizer</code> z 3.3 (<dfn data-t="unicode-normalization">normalizacja Unicode</dfn> do NFC, usunięcie znaków sterujących, bidi, zerowej szerokości i tagów) oraz sklejenie przeniesień „eks-\nport”. Flagi <code>BIDI</code>, <code>TAG_CHARS</code>, <code>HIDDEN_CONTENT</code> i <code>INJECTION_SUSPECTED</code> (heurystyki <code>InjectionDetector</code> z 3.4) trafiają do <code>ParsedDocument.warnings</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/parse/BlockNormalizer.kt (fragment)">
+  fun clean(s: String): String {
+      val n = TextNormalizer.normalize(s.replace(HYPHEN_BREAK, "$1$2"))   // (\p{Ll})-\n(\p{Ll}), TextNormalizer z 3.3
+      flags += n.suspicious
+      return n.text.replace(SPACES, " ")                                   // [ \t ]+; w blokach kodu bez zwijania
+  }
+</script>
+<p>Flagi nie blokują importu (fałszywe alarmy są częste), tylko lądują w <code>kb_documents.flags</code>, w UI i w audycie. Obrona właściwa jest w 4.4: wynik wyszukiwania to <code>ToolResult.Ok(data = hits, untrusted = true)</code> (3.4). Normalizacja sprawia, że recenzent i model widzą ten sam tekst.</p>
+<div class="box warn"><span class="label">Kolejność ma znaczenie</span><p>Normalizuj przed liczeniem tokenów, hashem i chunkingiem. Ten sam dokument z U+00A0 zamiast spacji dałby inne hashe chunków, a cache embeddingów z 4.3 przestałby trafiać.</p></div>
+
+<h2>Dlaczego rozmiar chunka ma znaczenie</h2>
+<p><dfn data-t="chunking">Chunking</dfn> dzieli dokument na fragmenty, z których każdy dostaje własny <dfn data-t="embedding">embedding</dfn> (wektor opisujący znaczenie tekstu). Chunk jest jednostką, którą da się znaleźć, i jednostką, którą model zobaczy w kontekście.</p>
+<table>
+  <tr><th>Rozmiar</th><th>Wyszukiwanie</th><th>Odpowiedź</th><th>Koszt</th></tr>
+  <tr><td>Za mały (50–100 tokenów)</td><td>Trafia w zdanie bez kontekstu („Limit wynosi 25 MB.” – czego?)</td><td>Model dopowiada resztę: <dfn data-t="hallucination">halucynacje</dfn></td><td>Dużo wektorów, większy indeks</td></tr>
+  <tr><td>300–600</td><td>Jeden temat na chunk</td><td>Pełna myśl z warunkami i wyjątkami</td><td>5 chunków ≈ 2,3 tys. tokenów</td></tr>
+  <tr><td>Za duży (1500+)</td><td>Embedding uśrednia kilka tematów: pasuje trochę do wszystkiego, mocno do niczego</td><td>Fakt zagubiony w środku (<dfn data-t="lost-in-the-middle">lost in the middle</dfn>)</td><td>5 chunków ≈ 7,5 tys. tokenów na pytanie</td></tr>
+</table>
+<p>Rachunek dla <code>KB_ANSWER</code> przy 20 tys. pytań miesięcznie i ilustracyjnej cenie 3 USD za milion tokenów wejścia: 5 × 450 tokenów to ok. 135 USD, 5 × 1 500 to ok. 450 USD miesięcznie, tylko za fragmenty dokumentów (ceny sprawdź w cenniku). W 4.6 zobaczysz ten efekt pomnożony przez trzy kroki zapytania. Zakres 300–600 to punkt startowy dla instrukcji i procedur, nie prawo natury: właściwą wartość wybiera eval z 4.7 (np. 250/450/800 na tym samym zbiorze pytań).</p>
+
+<h2>Strategie chunkingu</h2>
+<table>
+  <tr><th>Strategia</th><th>Jak działa</th><th>Zalety</th><th>Wady</th></tr>
+  <tr><td>Stały rozmiar</td><td>Co N tokenów, opcjonalnie z nakładką</td><td>Prosta, przewidywalna</td><td>Tnie zdania, tabele i kod; ignoruje strukturę</td></tr>
+  <tr><td>Rekurencyjna</td><td>Dzieli po <code>\n\n</code>, potem <code>\n</code>, zdaniu, spacji, aż kawałek zmieści się w limicie</td><td>Rzadko tnie zdania</td><td>Nie zna nagłówków; chunk nie wie, z której sekcji jest</td></tr>
+  <tr><td>Strukturalna</td><td>Sekcja pod nagłówkiem; duże sekcje dzielone po akapitach</td><td>Chunk = temat; naturalny <code>heading_path</code>; całe tabele</td><td>Wymaga dobrego parsowania; nierówne rozmiary</td></tr>
+  <tr><td>Semantyczna</td><td>Embedding każdego zdania, cięcie przy spadku podobieństwa sąsiadów</td><td>Wykrywa zmianę tematu bez nagłówków</td><td>Wielokrotnie droższy import, trudne progi, wyniki zmienne między wersjami</td></tr>
+</table>
+<p>HelpDesk łączy strukturalną (sekcje) z rekurencyjną (akapity, zdania) wewnątrz dużych sekcji. Semantyczna to eksperyment dla dokumentów bez struktury w 4.7. Wariant „mały do dużego” (wyszukiwanie po małych chunkach, do modelu cała sekcja) wraca w 4.6.</p>
+
+<h2>KbChunker: algorytm i kod</h2>
+<p>Reguły z kontraktu: nagłówki, potem akapity; cel 300–600 tokenów; <dfn data-t="chunk-overlap">nakładka</dfn> (końcówka poprzedniego chunka powtórzona na początku następnego, żeby myśl na granicy nie straciła kontekstu) 10–15%; tabele i kod nie rozcinane w środku; <code>heading_path</code> dla każdego chunka.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/chunk/KbChunker.kt">
+  @ConfigurationProperties("helpdesk.kb.chunking")
+  data class ChunkingProperties(val targetTokens: Int = 450, val maxTokens: Int = 600, val minTokens: Int = 120,
+                                val overlapRatio: Double = 0.12,      // ok. 54 tokeny
+                                val atomicMaxTokens: Int = 1200)      // tabela/kod do tej wielkości w całości
+
+  data class ChunkDraft(val index: Int, val headingPath: String, val content: String, val tokenCount: Int)
+
+  class KbChunker(private val tokens: TokenCounter, private val p: ChunkingProperties) {
+      private data class Piece(val text: String, val tokens: Int, val atomic: Boolean)
+
+      fun chunk(doc: ParsedDocument): List<ChunkDraft> {
+          val out = mutableListOf<Pair<String, String>>()                      // (headingPath, content)
+          for ((path, blocks) in sections(doc.blocks)) pack(path, blocks.flatMap(::pieces), out)
+          return mergeSmall(out).mapIndexed { i, (path, text) -> ChunkDraft(i, path, text, tokens.count(text)) }
+      }
+
+      private fun sections(blocks: List<Block>): List<Pair<String, List<Block>>> {
+          val stack = ArrayDeque<Block.Heading>(); val out = mutableListOf<Pair<String, List<Block>>>()
+          var cur = mutableListOf<Block>()
+          fun flush() { if (cur.isNotEmpty()) out += stack.joinToString(" > ") { it.text } to cur; cur = mutableListOf() }
+          for (b in blocks) {
+              if (b !is Block.Heading) { cur += b; continue }
+              flush()
+              while (stack.isNotEmpty() && stack.last().level >= b.level) stack.removeLast()   // H2 po H4 zdejmuje H3, H4
+              stack.addLast(b)
+          }
+          flush(); return out
+      }
+
+      private fun pieces(b: Block): List<Piece> = when (b) {
+          is Block.Paragraph -> splitBySentences(b.text, p.maxTokens).map { Piece(it, tokens.count(it), false) }
+          is Block.Table -> TableRenderer.parts(b, p.atomicMaxTokens, p.maxTokens, tokens).map { Piece(it, tokens.count(it), true) }
+          is Block.Code -> CodeSplitter.parts(b, p.atomicMaxTokens, p.maxTokens, tokens).map { Piece(it, tokens.count(it), true) }
+          is Block.Heading -> emptyList()
+      }
+
+      private fun pack(path: String, pieces: List<Piece>, out: MutableList<Pair<String, String>>) {
+          val buf = mutableListOf<Piece>(); var bufTokens = 0
+          var overlap: Piece? = null                                         // nakładka tylko w obrębie sekcji
+          fun emit() {
+              if (buf.isEmpty()) return
+              out += path to (listOfNotNull(overlap) + buf).joinToString("\n\n") { it.text }
+              overlap = tail(buf.last()); buf.clear(); bufTokens = 0
+          }
+          for (pc in pieces) {
+              if (bufTokens > 0 && bufTokens + pc.tokens > p.maxTokens - (overlap?.tokens ?: 0)) emit()
+              buf += pc; bufTokens += pc.tokens
+              if (bufTokens >= p.targetTokens) emit()
+          }
+          emit()
+      }
+
+      /** Ostatnie zdania akapitu do budżetu nakładki; po tabeli i kodzie bez nakładki. */
+      private fun tail(last: Piece): Piece? {
+          if (last.atomic) return null
+          val budget = (p.targetTokens * p.overlapRatio).toInt()
+          val picked = ArrayDeque<String>(); var t = 0
+          for (s in Sentences.split(last.text).asReversed()) {         // BreakIterator, Locale("pl")
+              val n = tokens.count(s); if (t + n > budget) break
+              picked.addFirst(s); t += n
+          }
+          return picked.takeIf { it.isNotEmpty() }?.let { Piece(it.joinToString(" "), t, false) }
+      }
+      // mergeSmall: chunk < minTokens doklejany do następnego o tym samym rodzicu w heading_path,
+      // z nazwą podsekcji w treści; wynik dostaje ścieżkę rodzica.
+  }
+</script>
+<ul>
+  <li><strong>Tabela jako Markdown</strong> (<code>| a | b |</code>), którą modele czytają dobrze. Tabela większa niż <code>atomicMaxTokens</code> jest dzielona <em>po wierszach</em>, każda część dostaje powtórzony nagłówek i dopisek „(tabela, część 2/5)”. Wiersz „Faktura PDF | 25 MB” bez nagłówka „Format | Limit” jest bezużyteczny.</li>
+  <li><strong>Kod po liniach</strong>, nigdy w środku linii.</li>
+  <li><strong>Nakładka nie przekracza sekcji</strong>: pierwszy chunk sekcji ma kontekst z <code>heading_path</code>, nie z końcówki rozdziału o czymś innym.</li>
+  <li><strong>Determinizm</strong>: ten sam dokument zawsze daje te same chunki. To warunek testów snapshotowych i cache embeddingów (4.3).</li>
+</ul>
+<p>Przykład: „Eksport faktur do PDF – instrukcja” daje 7 chunków po 180–560 tokenów, m.in. <code>Eksport faktur do PDF &gt; Limity</code> z całą tabelą limitów i akapitem nad nią.</p>
+
+<h2>Liczenie tokenów tokenizerem bge-m3</h2>
+<p>„600 tokenów” ma sens tylko w konkretnym <dfn data-t="tokenizer">tokenizerze</dfn>. bge-m3 używa tokenizera XLM-RoBERTa (SentencePiece, słownik ok. 250 tys. tokenów). Tokenizery modeli czatu, np. <code>cl100k_base</code>, dzielą polski inaczej, a różnice sięgają kilkudziesięciu procent. Liczymy tym, czego używa serwer embeddingów.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/chunk/HfTokenCounter.kt">
+  // implementation("ai.djl.huggingface:tokenizers:<wersja>") – natywna biblioteka (Rust) w JAR-ze;
+  // sprawdź wsparcie dla platformy obrazu (Alpine/musl, ARM).
+  interface TokenCounter { fun count(text: String): Int }
+
+  class HfTokenCounter(tokenizerJson: Path) : TokenCounter, AutoCloseable {
+      private val tokenizer = HuggingFaceTokenizer.builder()
+          .optTokenizerPath(tokenizerJson)      // tokenizer.json z BAAI/bge-m3, w zasobach aplikacji
+          .optAddSpecialTokens(false)           // <s> i </s> doliczamy (+2) przy limicie modelu
+          .optTruncation(false)                 // liczymy, nie obcinamy
+          .build()
+      override fun count(text: String) = tokenizer.encode(text).ids.size
+      override fun close() = tokenizer.close()
+  }
+</script>
+<p><code>tokenizer.json</code> trzymamy w repozytorium (wersjonowany razem z <code>embedding_model</code>), żeby produkcja nie zależała od Hugging Face przy starcie. Tokenizacja akapitu to mikrosekundy, więc chunker może liczyć wielokrotnie.</p>
+<p>Druga droga to endpoint <code>POST /tokenize</code> w Text Embeddings Inference (TEI, serwer embeddingów z 4.1): pola <code>inputs</code> i <code>add_special_tokens</code> (domyślnie <code>true</code>), odpowiedź to lista tokenów z <code>id</code>, <code>text</code>, <code>special</code>, <code>start</code>/<code>stop</code>. To źródło prawdy, ale wywołanie sieciowe na każdy akapit obciąża serwer embeddingów. Używamy go w <strong>teście kontraktowym</strong>: 200 próbek polskiego tekstu, <code>HfTokenCounter</code> musi dać tyle tokenów co <code>/tokenize</code> z <code>add_special_tokens: false</code>. Test wykryje podmianę modelu w TEI bez aktualizacji <code>tokenizer.json</code>.</p>
+<div class="box bug"><span class="label">Pułapka: ciche obcinanie</span><p>TEI domyślnie obcina wejście dłuższe niż limit modelu (<code>--auto-truncate</code>; sprawdź domyślną wartość w swojej wersji). Tabela na 9 tys. tokenów dostanie embedding tylko z początku i żaden błąd się nie pojawi. Stąd <code>atomicMaxTokens</code> w chunkerze i asercja w workerze: <code>tokens(tekst embeddingu) + 2 ≤ limit modelu</code>.</p></div>
+<table>
+  <tr><th></th><th><code>TokenTextSplitter</code> (Spring AI)</th><th><code>KbChunker</code></th></tr>
+  <tr><td>Tokenizer</td><td>JTokkit, domyślnie <code>CL100K_BASE</code> (tokenizery OpenAI)</td><td>Tokenizer bge-m3</td></tr>
+  <tr><td>Rozmiar</td><td><code>chunkSize</code> 800, <code>minChunkSizeChars</code> 350</td><td>cel 450, maks. 600</td></tr>
+  <tr><td>Granice</td><td>Co N tokenów, cofnięcie do <code>.</code>, <code>?</code>, <code>!</code>, <code>\n</code></td><td>Nagłówki → akapity → zdania</td></tr>
+  <tr><td>Nakładka</td><td>Brak</td><td>10–15% w obrębie sekcji</td></tr>
+  <tr><td>Tabele, kod</td><td>Mogą zostać rozcięte</td><td>Całe albo po wierszach z nagłówkiem</td></tr>
+</table>
+<p>Wartości domyślne pochodzą z dokumentacji Spring AI; w nowszych wersjach zalecany jest <code>TokenTextSplitter.builder()</code>, sprawdź API swojej wersji. Dla tekstu bez nagłówków <code>TokenTextSplitter</code> wypada podobnie jak nasz chunker, więc jest dobrym punktem odniesienia w evalach.</p>
+
+<h2>Kontekst chunka: contextual headers i contextual retrieval</h2>
+<p>Chunk „Limit wynosi 25 MB. Większe pliki dziel na części.” jest dwuznaczny: jego embedding nie wie, że chodzi o eksport faktur. Kontrakt przewiduje <dfn data-t="contextual-chunk-header">nagłówek kontekstowy chunka</dfn>: do tekstu embeddingu doklejamy tytuł i <code>heading_path</code>. Do wyświetlenia i promptu trafia sam <code>content</code>, a tytuł i ścieżka idą osobnymi polami <code>KbHit</code> (4.4).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/chunk/EmbeddingText.kt">
+  object EmbeddingText {
+      /** Tekst do embeddingu (content_tsv liczy baza, 4.1); nie zapisujemy go jako content. */
+      fun of(title: String, headingPath: String, content: String) = buildString {
+          append("Dokument: ").append(title).append('\n')
+          if (headingPath.isNotBlank()) append("Sekcja: ").append(headingPath).append('\n')
+          append('\n').append(content)
+      }
+  }
+</script>
+<p>Nagłówek kosztuje 15–40 tokenów, więc worker sprawdza limit modelu dla <code>EmbeddingText</code>, nie dla <code>content</code>. Hash do <code>kb_embedding_cache</code> (4.3) też liczymy z <code>EmbeddingText</code>: zmiana tytułu zmienia embedding, więc musi unieważnić cache. Spring AI ma podobny mechanizm: <code>MetadataMode.EMBED</code> dokleja wybrane metadane <code>Document</code> do tekstu embeddingu (szczegóły w dokumentacji <code>ContentFormatter</code>).</p>
+<p>Krok dalej to <dfn data-t="contextual-retrieval">contextual retrieval</dfn>: LLM dostaje cały dokument i jeden chunk, pisze 50–100 tokenów kontekstu, który doklejamy przed embeddingiem i indeksowaniem pełnotekstowym. W publikacji Anthropic z 2024 r. odsetek nietrafionych wyszukiwań (top-20) spadł o 35% dla embeddingów, o 49% z wyszukiwaniem pełnotekstowym i o 67% z rerankingiem. To ich dane, nie Twoje. Koszt: wywołanie LLM na każdy chunk z całym dokumentem w kontekście (opłacalne dopiero z <dfn data-t="prompt-caching">prompt caching</dfn>), niedeterministyczny tekst, a dla Globexu tylko <code>helpdesk-local</code>. Zaczynamy od darmowych nagłówków; contextual retrieval porównamy w 4.7, a jego koszt w 4.6.</p>
+
+<h2>Metadane: dokument i chunk</h2>
+<p>Metadane służą filtrowaniu (tenant, widoczność, status, wersja), rozstrzyganiu sprzeczności (authority, daty, 4.5) i odpowiedzialności (właściciel).</p>
+<table>
+  <tr><th>Pole</th><th>Źródło (priorytet)</th><th>Uwagi</th></tr>
+  <tr><td><code>title</code></td><td>formularz → frontmatter → <code>&lt;title&gt;</code>/H1 → nazwa pliku</td><td>Wchodzi do nagłówka kontekstowego</td></tr>
+  <tr><td><code>visibility</code></td><td>bardziej restrykcyjna z formularza i frontmattera; domyślnie <code>INTERNAL</code></td><td>PUBLIC to świadoma decyzja</td></tr>
+  <tr><td><code>authority</code></td><td>formularz → frontmatter → <code>TEAM</code>; rozwiązania zawsze <code>TEAM</code></td><td>OFFICIAL tylko ADMIN</td></tr>
+  <tr><td><code>language</code></td><td>formularz → frontmatter → detekcja</td><td>Niżej</td></tr>
+  <tr><td><code>valid_from</code>, <code>valid_until</code>, <code>review_due_at</code></td><td>formularz → frontmatter; przegląd domyślnie +6 mies.</td><td>4.5</td></tr>
+  <tr><td><code>owner_id</code></td><td>frontmatter <code>owner</code> (e-mail personelu tenanta) → dodający</td><td>Adresat zgłoszeń „nieaktualne”</td></tr>
+  <tr><td><code>content_hash</code></td><td>SHA-256 bajtów pliku, liczony w locie</td><td>Deduplikacja</td></tr>
+</table>
+<script type="text/x-code" data-lang="yaml" data-title="eksport-faktur-pdf.md (frontmatter)">
+  ---
+  title: Eksport faktur do PDF – instrukcja
+  visibility: PUBLIC
+  authority: OFFICIAL
+  valid_from: 2026-01-15
+  review_due_at: 2026-07-15
+  owner: dokumentacja@helpdesk.example
+  ---
+</script>
+<p>Frontmatter (blok YAML na początku pliku Markdown) jest niezaufany jak cała treść pliku: nieznany e-mail, zła data czy <code>authority: OFFICIAL</code> od agenta dają ostrzeżenie i wartość domyślną, nigdy podniesienie uprawnień.</p>
+<p>bge-m3 jest wielojęzyczny, więc język nie zmienia embeddingu, ale liczy się dla konfiguracji <code>tsvector</code> (4.1/4.4), języka odpowiedzi i raportów. <dfn data-t="language-detection">Wykrywanie języka</dfn> robi biblioteka Lingua (JVM, offline), zawężona do realnych języków, bo mniej kandydatów to większa trafność:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/ingest/LanguageDetection.kt">
+  private val detector = LanguageDetectorBuilder.fromLanguages(Language.POLISH, Language.ENGLISH, Language.GERMAN).build()
+
+  fun detect(blocks: List<Block>): String? {
+      val sample = blocks.filterIsInstance<Block.Paragraph>().joinToString(" ") { it.text }.take(5000)
+      if (sample.length < 200) return null                        // za mało tekstu: wartość domyślna
+      return detector.detectLanguageOf(sample).takeIf { it != Language.UNKNOWN }?.isoCode639_1?.name?.lowercase()
+  }
+</script>
+<p>Wiersz <code>kb_chunks</code> dostaje zdenormalizowane <code>tenant_id</code> i <code>visibility</code> (filtr i <dfn data-t="rls">RLS</dfn> bez joinów), <code>document_version</code>, <code>chunk_index</code>, <code>heading_path</code>, <code>content</code>, <code>token_count</code> (tokeny samego <code>content</code>, do budżetu kontekstu w 4.6), <code>embedding</code>, <code>embedding_model = 'bge-m3'</code>. <code>content_tsv</code> liczy sama baza (kolumna GENERATED z 4.1: <code>heading_path</code> z wagą A i <code>content</code> z wagą B), więc słowa ze ścieżki nagłówków też są wyszukiwalne.</p>
+
+<h2>Przetwarzanie asynchroniczne: transakcja i kolejka zadań</h2>
+<p>Import 40-stronicowego PDF to sekundy parsowania i kilka wywołań modelu embeddingów: za długo na żądanie HTTP (timeout proxy, brak ponowień). Żądanie robi rzeczy szybkie i zapisuje zadanie. Rozszerzamy schemat z 4.1:</p>
+<script type="text/x-code" data-lang="sql" data-title="V42__kb_ingestion.sql (numer przykładowy)">
+  ALTER TABLE kb_documents ADD COLUMN mime_type text, ADD COLUMN size_bytes bigint,
+      ADD COLUMN flags text[] NOT NULL DEFAULT '{}';
+  -- ten sam plik dwa razy w tym samym zakresie → ten sam dokument (PostgreSQL 15+)
+  CREATE UNIQUE INDEX ux_kb_documents_hash ON kb_documents (tenant_id, content_hash)
+      NULLS NOT DISTINCT WHERE status <> 'DELETED';
+
+  ALTER TABLE kb_ingestion_jobs
+      ADD COLUMN tenant_id uuid,                -- kontekst RLS workera; NULL = globalny
+      ADD COLUMN storage_key text NOT NULL,     -- plik w magazynie (Blob/S3), nie w bazie
+      ADD COLUMN format text NOT NULL,
+      ADD COLUMN next_attempt_at timestamptz NOT NULL DEFAULT now(),
+      ADD COLUMN locked_by text, ADD COLUMN locked_until timestamptz,
+      ADD COLUMN error_code text, ADD COLUMN stats jsonb;
+  CREATE INDEX ix_kb_jobs_ready ON kb_ingestion_jobs (next_attempt_at) WHERE status = 'QUEUED';
+  CREATE UNIQUE INDEX ux_kb_chunks_position ON kb_chunks (document_id, document_version, chunk_index);
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="KbIngestionService.ingest">
+  fun ingest(cmd: IngestDocument): IngestResult {
+      authorize(cmd)
+      val staged = blobs.stage(cmd.content, maxBytes = props.maxFileBytes)    // strumieniowo, SHA-256 w locie
+      val format = cmd.format ?: inspector.inspect(staged.path, cmd.fileName)
+      return tx.execute {                       // DuplicateKeyException (równoległy upload) → odczyt i duplicate()
+          tenantSession.bind(cmd.user)
+          repo.findActiveByHash(cmd.tenantId, staged.sha256)?.let { return@execute duplicate(it, staged) }
+          val docId = repo.insertDocument(cmd, staged, format)                  // ACTIVE, current_version NULL
+          val jobId = repo.insertJob(docId, version = 1, cmd.tenantId, staged.key, format)   // QUEUED
+          IngestResult(docId, 1, jobId, "QUEUED", duplicate = false)
+      }!!
+  }
+</script>
+<p>To <dfn data-t="idempotency">idempotencja</dfn> na poziomie treści: drugi upload tego samego pliku zwraca 200 z <code>duplicate: true</code>, zamiast tworzyć duplikat, który w wynikach zająłby dwa z pięciu miejsc. Dokument i zadanie w jednej transakcji to wzorzec <dfn data-t="outbox">transactional outbox</dfn> z 3.5: nie ma dokumentu bez zadania. Plik zapisany przed nieudaną transakcją zostaje sierotą; sprząta go nocny job.</p>
+<p>Worker pobiera zadanie jak <code>ActionExpiryJob</code> z 3.5. <dfn data-t="skip-locked">FOR UPDATE SKIP LOCKED</dfn> blokuje wybrany wiersz i pomija zablokowane przez inne instancje, więc repliki nie wezmą tego samego zadania:</p>
+<script type="text/x-code" data-lang="sql" data-title="KbJobRepository.claimNext">
+  WITH next AS (
+      SELECT id FROM kb_ingestion_jobs
+       WHERE status = 'QUEUED' AND next_attempt_at <= now()
+       ORDER BY next_attempt_at LIMIT 1
+       FOR UPDATE SKIP LOCKED)
+  UPDATE kb_ingestion_jobs j
+     SET status = 'RUNNING', attempts = j.attempts + 1, started_at = now(),
+         locked_by = :workerId, locked_until = now() + interval '15 minutes'
+    FROM next WHERE j.id = next.id
+  RETURNING j.*;
+</script>
+<p>Decyzja: <strong>krótka transakcja na przejęcie, długa praca poza transakcją</strong>. Trzymanie <code>FOR UPDATE</code> przez minuty to zajęte połączenie z puli i wstrzymany autovacuum. Zamiast blokady jest <dfn data-t="lease">dzierżawa</dfn> (<code>locked_until</code>): czasowe prawo do zadania, przedłużane po każdej partii. Gdy instancja padnie, dzierżawa wygasa, a „żniwiarz” zwraca zadanie do kolejki.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/ingest/KbIngestionWorker.kt">
+  @Scheduled(fixedDelayString = "\${helpdesk.kb.poll-interval-ms:2000}")
+  fun poll() {
+      while (busy.get() < props.workerThreads) {                     // np. 2 wątki na instancję
+          val job = jobs.claimNext(workerId) ?: return
+          busy.incrementAndGet()
+          pool.submit { try { process(job) } finally { busy.decrementAndGet() } }
+      }
+  }
+
+  @Scheduled(fixedDelay = 60_000)
+  fun reap() = jobs.requeueExpiredLeases()        // RUNNING i locked_until < now() → QUEUED, LEASE_EXPIRED
+
+  private fun process(job: ClaimedJob) {
+      val outcome = try {
+          jobs.complete(job, workerId, pipeline.run(job, workerId)); "done"
+      } catch (e: KbPermanentException) {
+          jobs.fail(job, workerId, e.code, e.message); e.code
+      } catch (e: Exception) {
+          if (job.attempts >= props.maxAttempts) { jobs.fail(job, workerId, "RETRIES_EXHAUSTED", e.message); "exhausted" }
+          else { jobs.retryLater(job, workerId, Backoff.fullJitter(job.attempts, base = 30.seconds, cap = 30.minutes)); "retry" }
+      }
+      metrics.jobFinished(job, outcome)
+  }
+</script>
+<script type="text/x-code" data-lang="sql" data-title="KbJobRepository.complete (jedna transakcja)">
+  -- 0 wierszy → LeaseLostException i rollback (zadanie przejął ktoś inny)
+  UPDATE kb_ingestion_jobs SET status = 'DONE', finished_at = now(), stats = :stats, locked_by = NULL
+   WHERE id = :jobId AND status = 'RUNNING' AND locked_by = :workerId;
+  UPDATE kb_documents SET current_version = :version, language = coalesce(:language, language),
+         flags = :flags, updated_at = now()
+   WHERE id = :documentId AND status = 'ACTIVE';
+  -- chunki starszych wersji sprząta 4.3
+</script>
+<p>Gwarancja to <dfn data-t="at-least-once">at-least-once</dfn>, więc przetwarzanie jest idempotentne: <code>pipeline.run</code> zaczyna od usunięcia chunków <code>(document_id, version)</code> po przerwanej próbie, a <code>ux_kb_chunks_position</code> nie pozwoli wstawić chunka dwa razy. Worker nie ma użytkownika, więc przed zapisem ustawia RLS na tenanta dokumentu (<code>set_config('app.tenant_ids', tenantId, true)</code>, pusty dla globalnego) zamiast <code>app.bypass_rls</code>: błąd w workerze nie zapisze chunków do cudzego tenanta.</p>
+<div class="box tip"><span class="label">Sprawiedliwość kolejki</span><p>Admin wgrywający 3 000 stron dokumentacji zablokuje na godzinę notatkę zespołu Acme. W <code>claimNext</code> pomijaj tenantów z ≥ 2 zadaniami <code>RUNNING</code>, a importy masowe oznaczaj niższym priorytetem (<code>priority</code> w <code>ORDER BY</code>).</p></div>
+
+<h2>Embeddingi: partie, bulkhead, ponowienia, duże dokumenty</h2>
+<p>Embeddingi liczy <code>helpdesk-embed</code> przez LiteLLM (<code>EmbeddingModel</code> Spring AI na endpoincie zgodnym z OpenAI, 4.1). Kontrakt mówi: <code>EMBEDDING</code> zawsze lokalnie. Worker to sprawdza, bo pomyłka w routingu wysłałaby całą bazę wiedzy Globexu do dostawcy zewnętrznego:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/ingest/KbIngestEmbedder.kt (import; pod spodem KbEmbedder z 4.1)">
+  fun embed(tenantId: UUID?, texts: List<String>, tokenCount: Int): List<FloatArray> {
+      if (tenantId != null) {
+          val route = router.route(tenantId, AiTask.EMBEDDING)
+          check(route is ModelRoute.Use && !route.external) { "EMBEDDING musi być lokalne: $route" }   // fail closed
+      }
+      val vectors = bulkhead.executeSupplier { embedder.embedDocuments(texts) }   // KbEmbedder z 4.1, bulkhead "kb-embed-ingest"
+      check(vectors.size == texts.size && vectors.all { it.size == 1024 })
+      usage.recordEmbedding(tenantId, feature = "kb-embed", alias = "helpdesk-embed", inputTokens = tokenCount)
+      return vectors
+  }
+</script>
+<p><strong>Partie.</strong> TEI ma limit wejść na żądanie (<code>--max-client-batch-size</code>, domyślnie 32) i budżet tokenów partii po stronie serwera (<code>--max-batch-tokens</code>, domyślnie 16 384). Dzielimy więc chunki na partie po maks. 32 elementy i maks. ok. 12 tys. tokenów (podobnie robi <code>TokenCountBatchingStrategy</code> w Spring AI). Każda partia to osobna krótka transakcja zapisu i przedłużenie dzierżawy.</p>
+<p><strong>Bulkhead.</strong> Ten sam TEI liczy embedding <em>pytania</em> przy każdym wyszukiwaniu (4.4), gdzie czeka człowiek. Import nie może go zagłodzić, więc osobne <dfn data-t="bulkhead">bulkheady</dfn> z 1.5:</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  resilience4j:
+    bulkhead:
+      instances:
+        kb-embed-ingest: { max-concurrent-calls: 2,  max-wait-duration: 10s }   # import poczeka
+        kb-embed-query:  { max-concurrent-calls: 16, max-wait-duration: 0 }     # wyszukiwanie: od razu odmów
+  helpdesk.kb: { worker-threads: 2, max-attempts: 5, embed-batch-size: 32, embed-batch-max-tokens: 12000 }
+</script>
+<p>Limity są per instancja: trzy repliki to do 6 partii importu naraz. Ilustracyjnie: 1 000 dokumentów po ok. 6 tys. tokenów to ok. 14 tys. chunków i ok. 700 partii po 20. Przy 1,5 s na partię (GPU, do zmierzenia) i 6 równolegle to ok. 3 minuty; na CPU rząd wielkości dłużej.</p>
+<p><strong>Ponowienia.</strong> Zgodnie z regułą jednej warstwy z 1.5 szybkie ponowienia wywołania robi LiteLLM. Worker ponawia całe zadanie po minutach z <dfn data-t="backoff">wykładniczym backoffem z jitterem</dfn> (30 s, 1 min, 2 min… do 30 min, maks. 5 prób). Przejściowe są timeouty, 5xx, 429 i <code>BulkheadFullException</code>. Trwałe od razu kończą zadanie jako FAILED:</p>
+<table>
+  <tr><th><code>error_code</code></th><th>Przyczyna</th><th>Komunikat w UI</th></tr>
+  <tr><td><code>ENCRYPTED</code></td><td>Plik z hasłem</td><td>„Usuń hasło i wgraj ponownie.”</td></tr>
+  <tr><td><code>NO_TEXT_LAYER</code></td><td>Skan bez OCR</td><td>„PDF nie zawiera tekstu (skan).”</td></tr>
+  <tr><td><code>PARSE_ERROR</code></td><td>Uszkodzony plik</td><td>„Nie udało się odczytać pliku.”</td></tr>
+  <tr><td><code>TOO_MANY_CHUNKS</code>, <code>TOO_MANY_PAGES</code></td><td>Limity</td><td>„Dokument za duży; podziel go.”</td></tr>
+  <tr><td><code>PII_DETECTED</code>, <code>PROVENANCE_MISMATCH</code></td><td>Rozwiązanie nie przeszło weryfikacji</td><td>„Treść wymaga ponownej akceptacji.”</td></tr>
+  <tr><td><code>RETRIES_EXHAUSTED</code></td><td>5 prób z błędem przejściowym</td><td>„Spróbuj później” + przycisk dla ADMIN</td></tr>
+</table>
+<p><strong>Duże dokumenty.</strong> Pamięć ograniczają: strumieniowy zapis pliku (nigdy cały plik w <code>ByteArray</code>), limit znaków w Tice, <code>max-chunks-per-document</code> sprawdzany <em>przed</em> pierwszym embeddingiem (40 tys. chunków to zwykle zrzut logów, nie dokumentacja) i zapis partiami zamiast trzymania wszystkich wektorów w pamięci.</p>
+
+<h2>Status w UI i metryki</h2>
+<p><code>GET /api/kb/documents/{id}</code> zwraca dokument z ostatnim zadaniem: <code>ingestion: { status, attempts, errorCode, chunkCount, warnings }</code>. Frontend odpytuje go, dopóki zadanie trwa:</p>
+<script type="text/x-code" data-lang="typescript" data-title="kb/useKbDocument.ts">
+  export type IngestionStatus = "QUEUED" | "RUNNING" | "DONE" | "FAILED";
+
+  export async function uploadKbDocument(file: File, meta: UploadMetadata, token: string) {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("metadata", new Blob([JSON.stringify(meta)], { type: "application/json" }));
+    // bez ręcznego Content-Type: przeglądarka doda boundary (dlatego nie api() z 1.1, które wymusza JSON)
+    const res = await fetch("/api/kb/documents", { method: "POST", body: form, headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new ApiError(await res.json());
+    return (await res.json()) as { documentId: string; status: string; duplicate: boolean };
+  }
+
+  export function useKbDocument(id: string) {
+    const { token } = useAuth();
+    return useQuery({
+      queryKey: ["kb-document", id],
+      queryFn: () => api<KbDocumentDto>(`/api/kb/documents/${id}`, { token }),
+      refetchInterval: (q) => {
+        const s = q.state.data?.ingestion?.status;
+        return s === "QUEUED" || s === "RUNNING" ? 2000 : false;
+      },
+    });
+  }
+</script>
+<p>UI pokazuje „W kolejce”, „Przetwarzanie”, „Gotowe: 7 fragmentów” albo komunikat z tabeli błędów, a obok flagi dokumentu.</p>
+<table>
+  <tr><th>Metryka</th><th>Typ, tagi</th><th>Po co</th></tr>
+  <tr><td><code>helpdesk.kb.ingestion.duration</code></td><td>Timer: <code>format</code>, <code>source</code>, <code>outcome</code></td><td>p95 importu, regresja po zmianie parsera</td></tr>
+  <tr><td><code>helpdesk.kb.ingestion.chunks</code></td><td>DistributionSummary: <code>format</code></td><td>Skok chunków na dokument = zepsute parsowanie</td></tr>
+  <tr><td><code>helpdesk.kb.ingestion.failures</code></td><td>Counter: <code>error_code</code></td><td>Alert na <code>PARSE_ERROR</code>, <code>RETRIES_EXHAUSTED</code></td></tr>
+  <tr><td><code>helpdesk.kb.ingestion.queue</code></td><td>Gauge: <code>status</code></td><td>Rosnąca kolejka = za mało workerów lub TEI nie nadąża</td></tr>
+</table>
+<p>Bez tagu <code>document_id</code> (<dfn data-t="cardinality">kardynalność</dfn> z 2.6); szczegóły per dokument są w <code>kb_ingestion_jobs.stats</code>. Embeddingi idą do <code>llm_usage</code> z <code>feature = 'kb-embed'</code> (4.6): koszt marginalny modelu self-hosted jest bliski zeru, ale liczba tokenów pokazuje pracę TEI i oszczędności cache z 4.3.</p>
+
+<h2>Testy</h2>
+<p><strong>Golden testy chunkera.</strong> Każda zmiana heurystyki przesuwa granice chunków. <dfn data-t="snapshot-test">Test snapshotowy</dfn> zapisuje wynik w czytelnym pliku i pokazuje diff w pull requeście:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbChunkerGoldenTest.kt">
+  @ParameterizedTest
+  @ValueSource(strings = ["eksport-faktur-pdf.md", "procedura-sso.html", "warunki-premium.docx", "limity-tabela.pdf"])
+  fun `chunki zgodne ze wzorcem`(fixture: String) {
+      val parsed = Parsers.forFile(fixture).parse(resource("kb/fixtures/$fixture")).let(BlockNormalizer::normalize)
+      val chunks = chunker.chunk(parsed)
+      assertThat(chunks).allMatch { it.tokenCount <= 600 || it.content.startsWith("|") }   // tylko tabela > 600
+      Snapshot.assertMatches("kb/golden/$fixture.chunks.txt",                               // -Dsnapshots.update=true
+          chunks.joinToString("\n") { "=== #${it.index} [${it.tokenCount} tok] ${it.headingPath}\n${it.content}" })
+  }
+</script>
+<p>Dołóż test <dfn data-t="property-based-testing">oparty na właściwościach</dfn>: dla losowych dokumentów złączenie chunków bez nakładek zawiera każdy akapit dokładnie raz, a tabela do <code>atomicMaxTokens</code> jest w jednym chunku. <strong>Test PDF z tabelą</strong> jest uczciwy wobec ograniczeń: nie sprawdza struktury tabeli (PDF jej nie ma), tylko że chunk z „25 MB” zawiera też nagłówek „Limit”, a fraza „strona 1 z” nie występuje w żadnym chunku.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbIngestionWorkerIT.kt (Testcontainers)">
+  @Test
+  fun `dwa workery nie przetwarzaja tego samego zadania`() {
+      repeat(20) { fixtures.queueMarkdownDocument(ACME, "doc-$it.md") }
+      val claimed = ConcurrentHashMap.newKeySet<UUID>(); val duplicates = AtomicInteger()
+      val start = CountDownLatch(1)
+      val workers = (1..2).map { w ->
+          thread {
+              start.await()
+              while (true) {
+                  val job = jobs.claimNext("w$w") ?: break
+                  if (!claimed.add(job.id)) duplicates.incrementAndGet()
+                  jobs.complete(job, "w$w", pipeline.run(job, "w$w"))
+              }
+          }
+      }
+      start.countDown(); workers.forEach { it.join() }
+      assertThat(duplicates.get()).isZero()
+      assertThat(claimed).hasSize(20)
+  }
+
+  @Test
+  fun `rozwiazanie zgloszenia bez akceptacji albo z dopisanym telefonem nie przechodzi`() {
+      assertThrows<IllegalArgumentException> {
+          ingestion.ingest(IngestDocument.ticketSolution(piotr, ACME, "# Pusty PDF", solution = null))
+      }
+      val edited = solutions.draft(piotr, HD_1042) + "\n\nKontakt do klienta: 600 700 800"
+      assertThat(assertThrows<KbPiiDetectedException> { solutions.approve(piotr, HD_1042, edited) }.entityTypes)
+          .contains("PHONE")
+  }
+</script>
+<p>Dopisz test dzierżawy (po <code>LEASE_EXPIRED</code> stary worker dostaje <code>LeaseLostException</code>) i <code>PROVENANCE_MISMATCH</code> (podmieniony plik, zero chunków).</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Przypadek</th><th>Bez obsługi</th><th>Obsługa</th></tr>
+  <tr><td>Dokument w dwóch językach (PL z załącznikiem EN)</td><td>Detekcja daje <code>pl</code>, część angielska w <code>tsvector</code> z polską konfiguracją</td><td>Język dominujący; bge-m3 radzi sobie z oboma; opcjonalnie <code>kb_chunks.language</code> per chunk dla pełnotekstowego</td></tr>
+  <tr><td>Pusty PDF ze skanem</td><td>ACTIVE bez chunków, „nic nie znajduje”</td><td><code>NO_TEXT_LAYER</code> z komunikatem; job spójności z 4.3 łapie ACTIVE bez chunków</td></tr>
+  <tr><td>Tabela na 2 000 wierszy</td><td>Chunk na 30 tys. tokenów, po cichu obcięty</td><td>Podział po wierszach z nagłówkiem; powyżej ok. 200 wierszy ostrzeżenie: dane tabelaryczne lepiej obsłużyć narzędziem SQL niż RAG-iem</td></tr>
+  <tr><td><code>.docm</code> przemianowany na <code>.docx</code></td><td>Plik z makrami w magazynie i do pobrania</td><td>422 <code>kb-macro-not-allowed</code> (typ <code>macroEnabled</code> lub <code>vbaProject.bin</code>)</td></tr>
+  <tr><td>PDF z listą kontaktów klientów</td><td>Asystent podaje telefon klienta innym</td><td><code>UPLOAD</code>: detekcja Presidio jako ostrzeżenie <code>PII_SUSPECTED</code> i decyzja właściciela; <code>TICKET_SOLUTION</code>: twarda blokada</td></tr>
+  <tr><td>Akapit na 3 000 tokenów (wklejony log)</td><td>Chunk ponad limit</td><td>Zdania, potem linie, w ostateczności twardo co <code>maxTokens</code></td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Przepuść trzy prawdziwe dokumenty (Markdown, DOCX z tabelą, PDF z dwiema kolumnami) przez <code>TikaDocumentReader</code> + <code>TokenTextSplitter</code> i przez model bloków z tej lekcji. Policz chunki z rozciętą tabelą, zaczynające się w połowie zdania i zawierające stopkę strony.</li>
+  <li>Napisz test kontraktowy <code>HfTokenCounter</code> kontra TEI <code>/tokenize</code> na 100 akapitach. Podmień w TEI model na inny i sprawdź, że test się wywala.</li>
+  <li>Zaimplementuj <code>TableRenderer.parts</code> i test właściwości: każdy wiersz jest w dokładnie jednej części, każda część zaczyna się od nagłówka i mieści w <code>maxTokens</code>.</li>
+  <li>Zabij worker po trzeciej partii dużego dokumentu. Sprawdź, że po wygaśnięciu dzierżawy zadanie wraca, chunki przerwanej próby znikają, a wyszukiwanie nigdy nie widzi połowy dokumentu.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego chunk na 1 500 tokenów zwykle wyszukuje się gorzej niż chunk na 450?</p>
+  <button>Bo model embeddingów nie przyjmuje tekstów dłuższych niż 512 tokenów</button>
+  <button>Bo dłuższe chunki zajmują więcej miejsca w indeksie HNSW</button>
+  <button>Bo embedding uśrednia kilka tematów i staje się rozmyty: pasuje trochę do wielu pytań, mocno do żadnego</button>
+  <button>Bo PostgreSQL ogranicza rozmiar kolumny text</button>
+  <p class="explain">Jeden wektor opisuje cały fragment; im więcej tematów, tym słabiej reprezentuje każdy z nich. Duże chunki zwiększają też koszt kontekstu i ryzyko „lost in the middle”. bge-m3 przyjmuje znacznie dłuższe wejścia niż 512 tokenów.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Agent zatwierdza rozwiązanie HD-1042 jako artykuł, ale w edycji dopisuje telefon klienta. Co powinno się stać?</p>
+  <button>Ponowna redakcja zatwierdzanego tekstu wykrywa PII i akceptacja kończy się 422 z typami danych do usunięcia</button>
+  <button>Nic, bo szkic przeszedł już redakcję Presidio</button>
+  <button>Worker zaindeksuje tekst, a redakcja nastąpi przy wysyłce do modelu</button>
+  <button>Telefon zostanie zapisany, bo dokument ma widoczność INTERNAL</button>
+  <p class="explain">Redakcja szkicu nie obejmuje tego, co człowiek dopisze. Zatwierdzony tekst jest sprawdzany ponownie, a worker weryfikuje hash, żeby zaindeksować dokładnie to, co przeszło kontrolę. INTERNAL nie chroni danych klienta przed innymi pracownikami.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Dlaczego worker przejmuje zadanie krótką transakcją z dzierżawą, zamiast trzymać <code>FOR UPDATE</code> przez całe przetwarzanie?</p>
+  <button>Bo <code>SKIP LOCKED</code> nie działa w długich transakcjach</button>
+  <button>Bo dzierżawa gwarantuje przetworzenie dokładnie raz</button>
+  <button>Bo PostgreSQL zrywa blokady po 60 sekundach</button>
+  <button>Bo długa transakcja zajmuje połączenie z puli i wstrzymuje autovacuum, a dzierżawa po awarii wygasa i zadanie wraca do kolejki</button>
+  <p class="explain">Dzierżawa daje at-least-once, nie exactly-once. Dlatego przetwarzanie jest idempotentne (usuwanie chunków po przerwanej próbie, unikalny indeks), a zapis wyniku sprawdza, czy dzierżawa wciąż należy do tego workera.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Do czego służy nagłówek kontekstowy chunka (tytuł + <code>heading_path</code>)?</p>
+  <button>Jest pokazywany użytkownikowi zamiast treści chunka</button>
+  <button>Jest doklejany do tekstu embeddingu, żeby „Limit wynosi 25 MB” wiedział, czego dotyczy; wyświetlany jest sam <code>content</code></button>
+  <button>Zastępuje kolumnę <code>heading_path</code> w <code>kb_chunks</code></button>
+  <button>Jest generowany przez LLM dla każdego chunka</button>
+  <p class="explain">Nagłówek kontekstowy jest darmowy i deterministyczny. Kontekst pisany przez LLM to osobna technika (contextual retrieval), droższa i włączana, gdy evale pokażą zysk.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Liczysz tokeny chunków tokenizerem <code>cl100k_base</code>, a embeddingi liczy bge-m3 w TEI z obcinaniem. Jakie jest główne ryzyko?</p>
+  <button>Embeddingi będą miały inny wymiar niż 1024</button>
+  <button>TEI odrzuci wszystkie żądania z błędem 413</button>
+  <button>Liczby tokenów się rozjadą, a za długie chunki zostaną po cichu obcięte i część treści nie wpłynie na embedding</button>
+  <button>Żadne, bo wszystkie tokenizery dają tę samą liczbę tokenów dla polskiego</button>
+  <p class="explain">Każdy model ma własny słownik. Chunker liczy tokenizerem modelu embeddingów (np. DJL z <code>tokenizer.json</code> bge-m3), test kontraktowy z <code>/tokenize</code> pilnuje zgodności, a limit egzekwujemy sami, bo obcinanie nie zgłasza błędu.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.3 Aktualizacja i usuwanie dokumentów – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="4.3">
+<main>
+<p class="meta">Lekcja 4.3 · ok. 65 min</p>
+<h1>Aktualizacja i usuwanie dokumentów w bazie wiedzy</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć, dlaczego utrzymanie aktualności bazy wiedzy jest trudniejsze niż jej pierwszy import.</li>
+  <li>Zaimplementować wersjonowanie dokumentów: nowe chunki obok starych i przełączenie <code>current_version</code> w jednej transakcji.</li>
+  <li>Przeliczać tylko zmienione chunki dzięki hashowi i <code>kb_embedding_cache</code> oraz policzyć oszczędność.</li>
+  <li>Synchronizować bazę z Confluence, z wykrywaniem zmian i usuniętych stron.</li>
+  <li>Usuwać dokumenty tak, żeby ich treść nie wracała w odpowiedziach, także w kontekście RODO.</li>
+  <li>Bezpiecznie zmienić model embeddingów (reindeks blue/green) i pilnować spójności jobem z alertami.</li>
+</ul></div>
+
+<h2>Dlaczego aktualizacja to najtrudniejsza część RAG</h2>
+<p>W lekcji 4.2 zaimportowaliśmy dokumenty: parser, <dfn data-t="chunking">chunking</dfn>, <dfn data-t="embedding">embeddingi</dfn>, zapis do <code>kb_chunks</code>. Demo <dfn data-t="rag">RAG</dfn> na tym się kończy, bo w demo dokumenty się nie zmieniają. W HelpDesk zmieniają się codziennie: poprawiona procedura eskalacji SSO, limit eksportu PDF podniesiony z 10 do 25 MB, skasowana notatka z nazwiskiem klienta.</p>
+<table>
+  <tr><th>Problem</th><th>Jak wygląda w HelpDesk</th><th>Skutek</th></tr>
+  <tr><td>Nieaktualne chunki dalej „odpowiadają”</td><td>Stary chunk „limit eksportu to 10 MB” nadal jest w <code>kb_chunks</code> i jest semantycznie bardzo blisko pytania</td><td>Asystent podaje stary limit, bo wektor nie wie, że treść jest nieaktualna</td></tr>
+  <tr><td>Duplikaty</td><td>Ten sam plik wgrany dwa razy albo ta sama strona zsynchronizowana dwiema ścieżkami</td><td>Dwa identyczne trafienia wypychają z top-5 inne źródła</td></tr>
+  <tr><td>Osierocone wektory</td><td>Dokument usunięty, ale chunki zostały (błąd w połowie, ręczny <code>UPDATE</code>)</td><td>Treść usuniętego dokumentu wraca w odpowiedziach, a przy danych osobowych łamie RODO</td></tr>
+  <tr><td>Wyścig import–wyszukiwanie</td><td>Wyszukiwanie trafia w moment, gdy stare chunki są już skasowane, a nowe jeszcze niepoliczone</td><td>„Nie znalazłem tego w bazie wiedzy” albo mieszanka dwóch wersji w jednym kontekście</td></tr>
+  <tr><td>Zmiana modelu embeddingów</td><td>Nowy model ma lepsze wyniki dla polskiego</td><td>Wektory starego i nowego modelu są nieporównywalne, więc trzeba przeliczyć wszystko</td></tr>
+</table>
+<p>Wspólny mianownik: <strong>wektor jest kopią treści</strong>, a każda kopia może się rozjechać z oryginałem. Cała lekcja to zestaw mechanizmów, które pilnują, żeby kopia była albo aktualna, albo jej nie było.</p>
+
+<h2>Model wersji: content_hash, document_version, current_version</h2>
+<p>Kontrakt M4 daje trzy kolumny, które razem tworzą wersjonowanie:</p>
+<ul>
+  <li><code>kb_documents.content_hash</code>: <dfn data-t="content-hash">hash treści</dfn>, czyli skrót SHA-256 znormalizowanego tekstu dokumentu. Ten sam tekst daje ten sam hash, więc porównanie hashy mówi, czy treść się zmieniła, bez porównywania megabajtów tekstu. W 4.2 import deduplikował po hashu bajtów pliku; odtąd kolumna trzyma hash tekstu (nowy eksport PDF zmienia bajty, nie treść).</li>
+  <li><code>kb_chunks.document_version</code>: do której wersji dokumentu należy chunk.</li>
+  <li><code>kb_documents.current_version</code>: która wersja jest bieżąca, czyli widoczna w wyszukiwaniu.</li>
+</ul>
+<p>Rozszerzamy kontrakt o kilka kolumn potrzebnych w tej lekcji:</p>
+<script type="text/x-code" data-lang="sql" data-title="V43__kb_versions.sql">
+  -- hash tekstu wysyłanego do modelu embeddingów (heading_path + treść), klucz do cache
+  ALTER TABLE kb_chunks ADD COLUMN content_hash text NOT NULL;
+  CREATE INDEX ix_kb_chunks_hash ON kb_chunks (content_hash);
+
+  -- wersja, której dotyczy job, jest unikalna per dokument; job zna hash i źródło treści
+  ALTER TABLE kb_ingestion_jobs
+      ADD COLUMN content_hash text NOT NULL,
+      ADD COLUMN source_ref   text NOT NULL;      -- np. klucz pliku w magazynie z 4.2
+  CREATE UNIQUE INDEX ux_kb_jobs_doc_version ON kb_ingestion_jobs (document_id, version);
+
+  -- synchronizacja ze źródłem i powód usunięcia (tombstone)
+  ALTER TABLE kb_documents
+      ADD COLUMN source_version    text NULL,     -- np. numer wersji strony Confluence
+      ADD COLUMN source_updated_at timestamptz NULL,
+      ADD COLUMN deleted_reason    text NULL
+          CHECK (deleted_reason IN ('USER','SOURCE_REMOVED','ERASURE','MOVED'));
+  CREATE UNIQUE INDEX ux_kb_documents_external
+      ON kb_documents (source_type, external_id) WHERE external_id IS NOT NULL;
+</script>
+<p>Unikalny <dfn data-t="partial-index">indeks częściowy</dfn> na <code>(source_type, external_id)</code> to pierwsza obrona przed duplikatami: tej samej strony Confluence nie da się zaimportować jako dwóch dokumentów. Tombstone (opisany niżej) zachowuje <code>external_id</code>, więc indeks działa także dla usuniętych.</p>
+<p>Normalizacja przed hashowaniem jest ważna. Jeśli hashujesz surowy HTML z Confluence, zmiana atrybutu CSS da „nową wersję” bez zmiany treści. <code>ContentHash.of(text)</code> liczy SHA-256 z tekstu po parsowaniu z 4.2: Unicode w NFC (<code>java.text.Normalizer</code>), ujednolicone końce linii, bez wielokrotnych spacji.</p>
+
+<h2>Algorytm aktualizacji: przyjęcie nowej treści</h2>
+<p>Aktualizacja ma dwie fazy. Szybka, synchroniczna faza w żądaniu HTTP albo w jobie synchronizacji decyduje, czy jest nowa wersja, i kolejkuje job. Wolna, asynchroniczna faza w workerze z 4.2 liczy chunki i embeddingi, a na końcu przełącza wersję.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="przebieg aktualizacji">
+  nowa treść ──► hash == kb_documents.content_hash ? ──tak──► Unchanged (nic nie robimy)
+                       │ nie
+                       ▼
+               hash == hash joba QUEUED/RUNNING ? ──tak──► AlreadyQueued
+                       │ nie
+                       ▼
+               kb_ingestion_jobs (version = max+1, QUEUED)      ← faza 1, jedna transakcja
+                       ▼
+  worker: chunking → embeddingi (cache) → INSERT chunków v+1 obok v   ← faza 2, paczki
+                       ▼
+  jedna transakcja: current_version = v+1, DELETE chunków < v+1, job DONE
+</script>
+<p>Faza 1 rozszerza <code>KbIngestionService</code> z 4.2 o aktualizację istniejącego dokumentu. <code>IngestResult</code> z 4.2 (klasa z polem <code>status</code>) zamieniamy na typ zamknięty z wariantami:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/KbIngestionService.kt (aktualizacja)">
+  sealed interface IngestResult {
+      data class Queued(val documentId: UUID, val version: Int) : IngestResult
+      data class Unchanged(val documentId: UUID, val version: Int) : IngestResult
+      data class AlreadyQueued(val documentId: UUID, val version: Int) : IngestResult
+  }
+
+  @Transactional
+  fun update(user: CurrentUser, documentId: UUID, content: ParsedContent, expectedVersion: Int?): IngestResult {
+      tenantSession.bind(user)
+      // FOR UPDATE: równoległe aktualizacje tego samego dokumentu ustawiają się w kolejce na tym wierszu
+      val doc = documents.lockForUpdate(documentId) ?: throw KbDocumentNotFoundException(documentId)
+      permissions.requireCanEdit(user, doc)
+      if (doc.status == KbStatus.DELETED) throw KbDocumentDeletedException(documentId)
+      if (expectedVersion != null && expectedVersion != doc.currentVersion) {
+          throw KbDocumentStaleException(documentId, doc.currentVersion)        // 409 kb-document-stale
+      }
+      val hash = ContentHash.of(content.text)
+      if (hash == doc.contentHash) return IngestResult.Unchanged(documentId, doc.currentVersion)
+
+      jobs.findPending(documentId, hash)?.let { return IngestResult.AlreadyQueued(documentId, it.version) }
+
+      val version = jobs.maxVersion(documentId) + 1          // pod blokadą wiersza dokumentu: bez wyścigu
+      val ref = sourceStore.put(documentId, version, content) // treść źródłowa wersji (4.2)
+      jobs.enqueue(documentId, version, hash, ref)
+      audit.record(KbAuditEvent.updateRequested(user, doc, version, hash))
+      return IngestResult.Queued(documentId, version)
+  }
+</script>
+<p>Trzy decyzje w tym kodzie:</p>
+<ul>
+  <li><strong>Brak zmian to brak pracy.</strong> Ten sam plik drugi raz albo strona Confluence z nowym numerem wersji, ale tym samym tekstem, nie tworzy wersji ani joba. Żądanie jest <dfn data-t="idempotency">idempotentne</dfn>.</li>
+  <li><strong>Numer wersji pod blokadą.</strong> <code>FOR UPDATE</code> na wierszu dokumentu serializuje równoczesne aktualizacje: druga czeka, widzi job pierwszej i dostaje kolejny numer. Unikalny indeks <code>(document_id, version)</code> to siatka bezpieczeństwa.</li>
+  <li><strong><dfn data-t="optimistic-locking">Optimistic locking</dfn> dla ludzi.</strong> Edytor w UI wysyła <code>If-Match</code> z oglądaną wersją i dostaje 409 zamiast po cichu nadpisać cudzą poprawkę. Synchronizacja nie wysyła <code>expectedVersion</code>, bo źródłem prawdy jest Confluence.</li>
+</ul>
+<p>Endpoint aktualizacji treści: <code>PUT /api/kb/documents/{id}/content</code> (multipart, nagłówek <code>If-Match</code> opcjonalny) zwraca 202 z <code>IngestResult</code>, a przy braku zmian 200 z <code>Unchanged</code>.</p>
+
+<h2>Worker: nowe chunki obok i przełączenie w jednej transakcji</h2>
+<p>Worker pobiera job przez <dfn data-t="skip-locked">FOR UPDATE SKIP LOCKED</dfn> (wzorzec z 3.5 i 4.2). Nowe chunki zapisuje paczkami obok starych. Wyszukiwanie ich nie widzi, bo filtruje <code>document_version = current_version</code>. Dopiero ostatni krok, krótka transakcja, przełącza wersję.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/KbIngestionWorker.kt (fragment)">
+  fun process(job: ClaimedJob) {
+      val content = sourceStore.get(job.sourceRef)
+      val chunks = chunker.chunk(content)                       // KbChunker z 4.2
+      val vectors = embeddings.embedAll(chunks.map { it.embedText() })   // z cache, niżej
+
+      chunks.zip(vectors).chunked(64).forEach { batch ->
+          tx.executeWithoutResult {
+              systemSession.bind()                              // tryb systemowy RLS (job w tle)
+              // FOR SHARE: równoległy DELETE dokumentu poczeka na koniec tej paczki,
+              // a po usunięciu kolejna paczka zobaczy status DELETED i przerwie pracę
+              val doc = documents.lockForShare(job.documentId)
+              if (doc == null || doc.status == KbStatus.DELETED) throw DocumentGoneException(job.documentId)
+              chunkRepo.insertBatch(doc, job.version, batch, embeddings.modelId)
+          }
+      }
+      switcher.switchTo(job)
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/KbVersionSwitcher.kt">
+  @Component
+  class KbVersionSwitcher(private val jdbc: JdbcClient, private val tx: TransactionTemplate,
+                          private val systemSession: SystemSession, private val audit: KbAuditLog) {
+
+      fun switchTo(job: ClaimedJob): SwitchOutcome = tx.execute {
+          systemSession.bind()
+          val switched = jdbc.sql("""
+              UPDATE kb_documents
+                 SET current_version = :v, content_hash = :hash, status = 'ACTIVE', updated_at = now()
+               WHERE id = :id
+                 AND status <> 'DELETED'
+                 AND (current_version IS NULL OR current_version < :v)   -- wersje tylko rosną
+          """).param("v", job.version).param("hash", job.contentHash).param("id", job.documentId).update()
+
+          if (switched == 1) {
+              // stare wersje znikają w tej samej transakcji: albo jest stara, albo nowa, nigdy obie
+              jdbc.sql("DELETE FROM kb_chunks WHERE document_id = :id AND document_version < :v")
+                  .param("id", job.documentId).param("v", job.version).update()
+              jobs.markDone(job.id)
+              audit.record(KbAuditEvent.versionActivated(job))
+              SwitchOutcome.ACTIVATED
+          } else {
+              // dokument usunięty albo wygrała nowsza wersja: nasze chunki są zbędne
+              jdbc.sql("DELETE FROM kb_chunks WHERE document_id = :id AND document_version = :v")
+                  .param("id", job.documentId).param("v", job.version).update()
+              jobs.markFailed(job.id, "SUPERSEDED_OR_DELETED")
+              SwitchOutcome.DISCARDED
+          }
+      }!!
+  }
+</script>
+<p>Warunek <code>current_version &lt; :v</code> rozwiązuje wyścig dwóch workerów. Jeśli wersja 8 skończy się przed wersją 7, to wersja 7 przy przełączaniu nie cofnie dokumentu, tylko sama się wyrzuci. Usuwanie starych chunków w tej samej transakcji co przełączenie jest bezpieczne dla trwających zapytań dzięki <dfn data-t="mvcc">MVCC</dfn>: Postgres trzyma wiele wersji wierszy, a zapytanie, które wystartowało przed commitem, dalej widzi stare chunki do swojego końca.</p>
+<div class="box warn"><span class="label">Pułapka: worker padł po INSERT, przed przełączeniem</span><p>Zostają chunki wersji, która nie jest bieżąca. Odpowiedziom nie szkodzą (filtr wersji), ale zajmują miejsce w indeksie. Ponowiony job (<code>attempts</code>, backoff z 4.2) najpierw kasuje swoje resztki (<code>document_version = :v</code>), a porzuconych szuka job spójności.</p></div>
+
+<h2>Dlaczego nie „DELETE wszystko i INSERT”</h2>
+<p>Najprostsza implementacja aktualizacji to: usuń chunki dokumentu, policz nowe, wstaw. Problem nie leży w samym SQL, bo w jednej transakcji Postgres zrobiłby to atomowo. Problem w tym, że między usunięciem a wstawieniem są wywołania modelu embeddingów, które trwają sekundy albo minuty i mogą się nie udać.</p>
+<table>
+  <tr><th>Wariant</th><th>Co widzi wyszukiwanie</th><th>Awaria w połowie</th></tr>
+  <tr><td>DELETE (commit), embeddingi, INSERT</td><td>Okno bez wyników: dokument „znika” na czas liczenia</td><td>Dokument bez chunków na stałe, aż ktoś zauważy</td></tr>
+  <tr><td>Wszystko w jednej transakcji, z wywołaniami TEI w środku</td><td>Stara wersja do commitu, poprawnie</td><td>Rollback jest czysty, ale transakcja trwa minuty: trzyma połączenie z puli i blokadę wiersza, blokuje VACUUM, a przy 30 równoległych importach wyczerpuje pulę</td></tr>
+  <tr><td>Nowe chunki obok, krótka transakcja przełączenia</td><td>Zawsze dokładnie jedna kompletna wersja</td><td>Stara wersja dalej działa, job ponawia pracę</td></tr>
+</table>
+<p>Zasada: <strong>przygotuj obok, przełącz atomowo, posprzątaj</strong>. Wróci przy zmianie modelu embeddingów, w skali całej bazy.</p>
+
+<h2>Wyszukiwanie zawsze widzi jedną wersję</h2>
+<p>Przełączanie wersji działa tylko wtedy, gdy każde zapytanie wyszukujące filtruje bieżącą wersję. Pełne zapytanie hybrydowe buduje lekcja 4.4. Tu warunek, który musi być w każdej jego gałęzi:</p>
+<script type="text/x-code" data-lang="sql" data-title="filtr wersji (fragment zapytania z 4.4)">
+  FROM kb_chunks c
+  JOIN kb_documents d ON d.id = c.document_id
+  WHERE d.status = 'ACTIVE'
+    AND c.document_version = d.current_version
+    AND (c.tenant_id IS NULL OR c.tenant_id = :tenantId)
+    AND c.visibility = ANY (:visibilities)
+</script>
+<p>Dlaczego join, skoro kontrakt denormalizuje <code>tenant_id</code> i <code>visibility</code>, żeby joinów unikać? Alternatywa, flaga <code>is_current</code> na chunkach, wymagałaby przy przełączeniu <code>UPDATE</code> chunków dwóch wersji, a w Postgresie <code>UPDATE</code> to nowa wersja wiersza i nowy wpis w indeksie wektorowym (80 wpisów w grafie HNSW przy 40-chunkowym dokumencie). Join po kluczu głównym jest tańszy.</p>
+<div class="box bug"><span class="label">Pułapka: wyszukiwanie w dwóch zapytaniach</span><p>Jeśli gałąź wektorową i pełnotekstową wykonujesz jako dwa osobne zapytania, a RRF liczysz w Kotlinie, to w trybie READ COMMITTED każde zapytanie ma własny snapshot. Między nimi może nastąpić przełączenie i w jednym kontekście znajdą się chunki wersji 7 i 8 („limit 10 MB” obok „limit 25 MB”). Rozwiązania: jedno zapytanie z CTE dla obu gałęzi albo obie gałęzie w transakcji <code>REPEATABLE READ, READ ONLY</code>. To samo dotyczy pobrania treści chunków po rerankingu: chunk mógł zostać skasowany, więc brak wiersza traktuj jako „mniej wyników”, a nie jako błąd.</p></div>
+
+<h2>Aktualizacja inkrementalna: hash chunka i kb_embedding_cache</h2>
+<p>Gdy ktoś poprawi literówkę w jednym akapicie 40-chunkowej instrukcji, liczenie od nowa 40 embeddingów to marnotrawstwo. <code>kb_embedding_cache</code> z kontraktu przechowuje embedding pod kluczem <code>(content_hash, model)</code>, gdzie <code>content_hash</code> to hash dokładnie tego tekstu, który trafia do modelu (z <code>heading_path</code> doklejonym w 4.2).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/CachedEmbeddings.kt">
+  @Component
+  class CachedEmbeddings(
+      private val embeddingModel: EmbeddingModel,          // Spring AI, alias helpdesk-embed przez LiteLLM (4.1)
+      private val jdbc: JdbcClient,
+      private val props: KbEmbeddingProperties,
+      private val meters: MeterRegistry,
+  ) {
+      val modelId: String get() = props.activeSpace().modelId   // np. "bge-m3"
+
+      fun embedAll(texts: List<String>): List<FloatArray> {
+          val hashes = texts.map(ContentHash::of)
+          val cached: Map<String, FloatArray> = jdbc.sql("""
+              SELECT content_hash, embedding FROM kb_embedding_cache
+               WHERE model = :model AND content_hash = ANY (:hashes)
+          """).param("model", modelId).param("hashes", hashes.distinct().toTypedArray())
+              .query { rs, _ -> rs.getString(1) to (rs.getObject(2) as PGvector).toArray() }
+              .list().toMap()
+
+          val missing = texts.indices.filter { hashes[it] !in cached }.distinctBy { hashes[it] }
+          val fresh = mutableMapOf<String, FloatArray>()
+          missing.chunked(32).forEach { idx ->                  // 32 = typowy limit paczki TEI
+              val vectors = embeddingModel.embed(idx.map { texts[it] })
+              idx.zip(vectors).forEach { (i, v) -> fresh[hashes[i]] = v }
+          }
+          if (fresh.isNotEmpty()) saveToCache(fresh)            // INSERT … ON CONFLICT DO NOTHING
+          meters.counter("helpdesk.kb.embedding.cache", "result", "hit").increment((texts.size - missing.size).toDouble())
+          meters.counter("helpdesk.kb.embedding.cache", "result", "miss").increment(missing.size.toDouble())
+          return hashes.map { cached[it] ?: fresh.getValue(it) }
+      }
+  }
+</script>
+<p><code>EmbeddingModel.embed(List&lt;String&gt;)</code> w Spring AI 1.x zwraca listę <code>float[]</code>, a <code>PGvector</code> pochodzi z biblioteki <code>com.pgvector:pgvector</code> (konfiguracja typu w 4.1). Sprawdź sygnatury w swojej wersji.</p>
+<h3>Ile to oszczędza</h3>
+<p>Założenia (zmierz u siebie): baza 5 000 dokumentów, średnio 40 chunków, razem 200 tys. chunków po ok. 450 tokenów tekstu do embeddingu. Dziennie zmienia się 2% dokumentów (100), a typowa zmiana dotyka jednej sekcji: 5 chunków plus 1 sąsiedni przez nakładkę.</p>
+<table>
+  <tr><th>Strategia</th><th>Embeddingi dziennie</th><th>Tokeny dziennie</th><th>Czas TEI przy 100 chunkach/s</th></tr>
+  <tr><td>Nocne przeliczenie wszystkiego (incydent z 4.6)</td><td>200 000</td><td>90 mln</td><td>ok. 33 min każdej nocy</td></tr>
+  <tr><td>Hash dokumentu: tylko zmienione dokumenty, w całości</td><td>4 000</td><td>1,8 mln</td><td>40 s</td></tr>
+  <tr><td>Hash dokumentu + cache chunków</td><td>600</td><td>270 tys.</td><td>6 s</td></tr>
+</table>
+<p>Przy zewnętrznym modelu za ilustracyjne 0,02 USD za milion tokenów pierwszy wiersz to ok. 1,80 USD dziennie, a przy droższym (0,13 USD/mln) ok. 350 USD miesięcznie. Przy self-hosted TEI (Text Embeddings Inference, serwer embeddingów z 4.1) walutą jest zajętość GPU, którą pełne przeliczenie odbiera embeddingom zapytań użytkowników. Prawdziwy zysk to szybsza propagacja zmian i brak nocnych szczytów obciążenia.</p>
+<div class="box warn"><span class="label">Kiedy cache nic nie da</span><ul>
+  <li><strong>Chunking oknem o stałej długości.</strong> Dopisanie zdania na początku przesuwa granice wszystkich kolejnych chunków, więc wszystkie hashe się zmieniają. Chunking strukturalny z 4.2 (po nagłówkach) ogranicza zmianę do jednej sekcji.</li>
+  <li><strong>Zmiana tytułu albo nagłówka nadrzędnego.</strong> <code>heading_path</code> jest częścią tekstu embeddingu, więc zmienia hash każdego chunka pod tym nagłówkiem. Tak ma być: kontekst chunka się zmienił.</li>
+  <li><strong>Zmiana sposobu budowania tekstu</strong> (np. inny separator) unieważnia cały cache: traktuj ją jak zmianę modelu (nowa wartość <code>model</code>, np. <code>bge-m3:ctx2</code>).</li>
+</ul></div>
+<p>Cache bez sprzątania rośnie bez końca. Job usuwa wpisy starsze niż 30 dni, do których nie odwołuje się żaden chunk (<code>NOT EXISTS</code> po <code>kb_chunks.content_hash</code>). Zwłoka pozwala tanio cofnąć zmianę. Wpisy dokumentów z danymi osobowymi usuwamy od razu (część o RODO).</p>
+
+<h2>Synchronizacja z Confluence</h2>
+<p>Dokumenty z uploadu zmienia człowiek przez nasze API. Dokumenty z Confluence zmieniają się poza naszym systemem, więc musimy zmiany wykrywać sami. Klucz łączący to <code>external_id</code> = identyfikator strony w Confluence, a mapowanie przestrzeni na tenanta i widoczność jest w konfiguracji.</p>
+<p>Ogólnie o API Confluence Cloud (REST v2; sprawdź aktualną dokumentację i swoją wersję, Data Center ma inne API):</p>
+<ul>
+  <li><code>GET /wiki/api/v2/spaces/{id}/pages</code> zwraca strony przestrzeni z parametrami <code>status</code> (<code>current</code>, <code>archived</code>, <code>trashed</code>, <code>deleted</code>; domyślnie current i archived), <code>sort</code> (m.in. <code>-modified-date</code>), <code>body-format</code> (<code>storage</code>, <code>atlas_doc_format</code>), <code>limit</code> (do 250) i stronicowaniem kursorem przez nagłówek <code>Link</code>.</li>
+  <li>Każda strona ma obiekt <code>version</code> z polami <code>number</code> i <code>createdAt</code>. Numer wersji rośnie przy każdej edycji, więc porównanie z zapisanym <code>source_version</code> wykrywa zmianę bez pobierania treści.</li>
+  <li><code>GET /wiki/api/v2/pages/{id}?body-format=storage</code> pobiera treść jednej strony.</li>
+  <li>API ma limity żądań: odpowiedź 429 z nagłówkiem <code>Retry-After</code> obsługuj <dfn data-t="backoff">backoffem</dfn>, a nie ponowieniem w pętli.</li>
+</ul>
+<p>Strategia: lista stron bez treści (5 000 stron to 20 żądań po 250), porównanie numerów wersji, pobranie treści tylko zmienionych, a strony, które zniknęły z listy, sprawdzamy pojedynczo.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/sync/ConfluenceSyncJob.kt">
+  @Component
+  class ConfluenceSyncJob(
+      private val client: ConfluenceClient,
+      private val documents: KbDocumentRepository,
+      private val ingestion: KbIngestionService,
+      private val deleter: KbDocumentDeleter,
+      private val props: ConfluenceSyncProperties,
+      private val meters: MeterRegistry,
+  ) {
+      @Scheduled(cron = "\${helpdesk.kb.sync.confluence.cron}")
+      @SchedulerLock(name = "kb-confluence-sync", lockAtMostFor = "PT20M")
+      fun run() = props.spaces.forEach(::syncSpace)
+
+      fun syncSpace(space: SpaceMapping) {
+          val remote = client.listPages(space.spaceId)            // id, title, version.number; bez body
+              .associateBy { it.id }
+          val local = documents.findSyncState(SourceType.CONFLUENCE, space.spaceId)  // external_id → source_version
+              .associateBy { it.externalId }
+
+          // 1. nowe i zmienione: tylko tam, gdzie numer wersji się różni
+          remote.values.filter { local[it.id]?.sourceVersion != it.version.number.toString() }.forEach { page ->
+              val full = client.getPage(page.id)                  // body-format=storage
+              ingestion.upsertFromSource(space, full)             // hash decyduje, czy powstanie wersja
+          }
+
+          // 2. zniknięte z listy: potwierdź pojedynczo, zanim usuniesz
+          val missing = local.keys - remote.keys
+          val ratio = missing.size.toDouble() / maxOf(local.size, 1)
+          if (missing.size > 10 && ratio > props.maxDeleteRatio) {
+              meters.counter("helpdesk.kb.sync.delete_guard_tripped", "space", space.spaceKey).increment()
+              throw SyncAbortedException("Zniknęło ${missing.size} stron (${"%.0f".format(ratio * 100)}%) – wstrzymano usuwanie")
+          }
+          missing.forEach { externalId ->
+              when (client.pageStatus(externalId)) {               // 404, trashed, deleted, archived, current
+                  PageStatus.CURRENT -> Unit                       // przeniesiona poza przestrzeń? obsługa niżej
+                  else -> deleter.tombstone(local.getValue(externalId).documentId, DeletedReason.SOURCE_REMOVED)
+              }
+          }
+      }
+  }
+</script>
+<div class="box bug"><span class="label">Pułapka: masowe usunięcie przez błąd uprawnień</span><p>Konto techniczne synchronizacji traci dostęp do przestrzeni (rotacja tokenu, zmiana uprawnień w Confluence). API zwraca pustą listę, a naiwny algorytm „czego nie ma w źródle, to usuń” kasuje w nocy całą bazę wiedzy tenanta. Bezpiecznik <code>max-delete-ratio</code> działa jak <dfn data-t="circuit-breaker">circuit breaker</dfn>: powyżej progu (np. 20% stron naraz) synchronizacja przerywa usuwanie i wysyła alert do człowieka.</p></div>
+<p><code>upsertFromSource</code> robi to samo co <code>update</code> z poprzedniej sekcji, tylko bez użytkownika i bez <code>expectedVersion</code>. Zapisuje też <code>source_version</code> i <code>source_updated_at</code> nawet wtedy, gdy hash się nie zmienił, żeby kolejny przebieg nie pobierał tej strony znowu. Usuniętą stronę oznaczamy jako <dfn data-t="tombstone">tombstone</dfn>, czyli wiersz-nagrobek, który mówi „ten dokument istniał i został usunięty”. Bez niego nie odróżnisz strony usuniętej od strony, której jeszcze nie zsynchronizowano.</p>
+<p>Strony z ograniczeniami dostępu w Confluence (page restrictions) nie mają odpowiednika w <code>visibility</code>: najbezpieczniej je pomijać albo mapować na INTERNAL po decyzji właściciela przestrzeni.</p>
+
+<h2>Harmonogram: webhook, polling, nocny przegląd</h2>
+<p>Jak szybko zmiana w Confluence ma trafić do asystenta? Są trzy mechanizmy i w praktyce łączy się dwa albo trzy:</p>
+<table>
+  <tr><th>Mechanizm</th><th>Opóźnienie</th><th>Zalety</th><th>Wady</th></tr>
+  <tr><td><dfn data-t="webhook">Webhook</dfn> (źródło woła nasz endpoint przy zmianie)</td><td>sekundy</td><td>Najszybszy, brak pustych zapytań</td><td>Zdarzenia giną, dublują się i przychodzą w złej kolejności; w Confluence Cloud wymaga aplikacji (Connect/Forge)</td></tr>
+  <tr><td>Polling (porównanie wersji co N minut)</td><td>N minut</td><td>Prosty, odporny, sam się naprawia</td><td>Koszt zapytań do API i limity; przy tysiącach przestrzeni rzadziej</td></tr>
+  <tr><td>Nocny pełny przegląd</td><td>do doby</td><td>Wykrywa usunięcia i dryf, którego nie widać w zdarzeniach</td><td>Za wolny jako jedyny mechanizm</td></tr>
+</table>
+<p>Webhook traktuj jako <em>podpowiedź</em>, a nie źródło danych: z treści zdarzenia bierz tylko identyfikator strony i kolejkuj jej synchronizację, a treść pobieraj z API. Nazwy zdarzeń (np. <code>page_created</code>, <code>page_updated</code>, <code>page_removed</code>, <code>page_trashed</code>, <code>page_restored</code>) i ich znaczenie (przeniesienie do kosza czy trwałe usunięcie) różnią się między Cloud a Data Center, więc sprawdź je w dokumentacji swojej wersji. Endpoint weryfikuje podpis albo token integracji i odpowiada szybko 202. W HelpDesk: webhook tam, gdzie jest aplikacja, polling co 15 minut (<code>helpdesk.kb.sync.confluence.cron</code>) i nocny pełny przegląd (<code>full-scan-cron</code>), który jako jedyny pewnie wykrywa usunięcia.</p>
+
+<h2>Usuwanie dokumentu: DELETE /api/kb/documents/{id}</h2>
+<p>Kontrakt jest jednoznaczny: status DELETED i <strong>natychmiastowe fizyczne usunięcie chunków w tej samej transakcji</strong>. Dokument zostaje jako tombstone przez okres retencji.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/KbDocumentDeleter.kt">
+  @Transactional
+  fun delete(user: CurrentUser, documentId: UUID) {
+      tenantSession.bind(user)
+      val doc = documents.lockForUpdate(documentId) ?: throw KbDocumentNotFoundException(documentId)
+      permissions.requireCanDelete(user, doc)              // AGENT: dokumenty swoich tenantów, globalne tylko ADMIN
+      if (doc.status == KbStatus.DELETED) return           // idempotentnie: drugie DELETE też 204
+      tombstoneLocked(doc, DeletedReason.USER)
+      audit.record(KbAuditEvent.deleted(user, doc))
+  }
+
+  internal fun tombstoneLocked(doc: KbDocument, reason: DeletedReason) {
+      jdbc.sql("DELETE FROM kb_chunks WHERE document_id = :id").param("id", doc.id).update()   // wszystkie wersje
+      jdbc.sql("""UPDATE kb_ingestion_jobs SET status = 'FAILED', error = 'DOCUMENT_DELETED', finished_at = now()
+                  WHERE document_id = :id AND status = 'QUEUED'""").param("id", doc.id).update()
+      jdbc.sql("""UPDATE kb_documents SET status = 'DELETED', deleted_reason = :reason,
+                  deleted_at = now(), updated_at = now() WHERE id = :id""")
+          .param("reason", reason.name).param("id", doc.id).update()
+  }
+</script>
+<p>Job RUNNING nie zdoła niczego zostawić: DELETE czeka na blokadę <code>FOR SHARE</code> bieżącej paczki i kasuje ją razem z resztą, kolejna paczka widzi DELETED i przerywa, a przełączenie ma warunek <code>status &lt;&gt; 'DELETED'</code>.</p>
+<h3>Dlaczego soft delete chunków jest groźny</h3>
+<p><dfn data-t="soft-delete">Soft delete</dfn> (z 2.5: oznaczenie wiersza zamiast <code>DELETE</code>) sprawdza się dla rozmów, bo filtruje je jedno zapytanie w <code>ConversationStore</code>. Chunki czyta wiele ścieżek: wyszukiwanie z 4.4, eksport do evali z 4.7, raport luk z 4.5, panel admina, ręczny SQL. Jedna ścieżka bez filtra i usunięta treść wraca w odpowiedzi. Do tego martwe wektory zostają w grafie HNSW i zabierają miejsce kandydatom. Soft delete zostaje więc tylko dla dokumentu (tombstone bez treści).</p>
+<p>Tombstone przechowuje id, tenant, źródło, <code>external_id</code>, status, powód i daty, a po <code>tombstone-retention</code> (np. 90 dni) jest kasowany. Treść źródłową wersji usuwa job po commicie. <code>GET /api/kb/documents/{id}</code> dla tombstone zwraca 410 <code>kb-document-deleted</code> (po sprawdzeniu tenanta, więc cudzy dokument dalej daje 404). Dzięki temu UI cytowania <code>[KB-n]</code> w starej rozmowie pokazuje „Źródło usunięte z bazy wiedzy” zamiast martwego linku (<code>error.status === 410</code> w hooku <code>useKbDocument</code>).</p>
+<div class="box warn"><span class="label">Pułapka: usunięte w HelpDesk, istnieje w Confluence</span><p>Agent usuwa dokument zsynchronizowany z Confluence, bo jest błędny. Strona w Confluence dalej istnieje, więc następna synchronizacja go przywróci. Tombstone z <code>deleted_reason = 'USER'</code> jest dla synchronizacji sygnałem „nie importuj ponownie tego <code>external_id</code>”, a UI powinno podpowiedzieć, że trwałą poprawkę trzeba zrobić w źródle.</p></div>
+
+<h2>RODO: gdzie jeszcze żyje treść usuniętego dokumentu</h2>
+<p>Zwykłe usunięcie wystarcza, gdy dokument jest po prostu nieaktualny. Gdy dokument zawiera dane osobowe i przychodzi żądanie z art. 17 (<dfn data-t="right-to-erasure">prawo do usunięcia</dfn>, 2.5), trzeba przejść wszystkie miejsca, w które treść się rozlała. Lista dla HelpDesk:</p>
+<table>
+  <tr><th>Miejsce</th><th>Co tam jest</th><th>Co robimy</th></tr>
+  <tr><td><code>kb_chunks</code></td><td>treść i wektory</td><td>usunięte przy DELETE</td></tr>
+  <tr><td><code>kb_documents</code> (tombstone)</td><td>tytuł, <code>source_uri</code> (bywa „Procedura – Jan Kowalski”)</td><td>tytuł zastąpiony „[usunięto]”, <code>deleted_reason = 'ERASURE'</code></td></tr>
+  <tr><td><code>kb_embedding_cache</code></td><td>wektory treści</td><td>usunięcie wpisów o hashach chunków dokumentu, o ile nie używa ich inny dokument</td></tr>
+  <tr><td><code>kb_ingestion_jobs.error</code>, <code>kb_feedback.comment</code></td><td>fragmenty treści w błędach i uwagach</td><td>wyczyszczenie pól</td></tr>
+  <tr><td>Cache odpowiedzi</td><td>zapisane sugestie <code>KB_ANSWER</code>, jeśli je cache'ujesz</td><td>unieważnienie wpisów po <code>document_id</code> (wpis musi znać swoje źródła)</td></tr>
+  <tr><td>Historia rozmów (2.5)</td><td>wiadomości <code>TOOL</code> z pełną treścią chunków, odpowiedzi z cytatami</td><td>redakcja wiadomości, które użyły dokumentu</td></tr>
+  <tr><td>Trace i Langfuse (1.4), logi LiteLLM</td><td>prompty z chunkami, jeśli zapis treści był włączony</td><td>krótka retencja (do 14 dni) albo treść wyłączona</td></tr>
+  <tr><td>Dostawca zewnętrznego LLM</td><td>prompty z chunkami (trasa zewnętrzna)</td><td><dfn data-t="zdr">ZDR</dfn> i umowa powierzenia z 1.6; poza naszym zasięgiem technicznym</td></tr>
+  <tr><td>Kopie zapasowe</td><td>wszystko powyżej</td><td>nie edytujemy; rejestr usunięć odtwarzany po restore</td></tr>
+</table>
+<p>Embeddingi to nie „bezpieczne liczby”. Badania nad <dfn data-t="embedding-inversion">odwracaniem embeddingów</dfn> pokazują, że z wektora da się częściowo odtworzyć tekst, zwłaszcza krótki. Traktuj więc wektory jak dane, z których powstały.</p>
+<p>Żeby znaleźć rozmowy, które użyły dokumentu, wiadomość musi zapamiętać swoje źródła. Proponujemy kolumnę <code>assistant_messages.kb_document_ids uuid[]</code> z indeksem GIN, wypełnianą przy zapisie wyniku <code>searchKnowledgeBase</code> (wiadomość <code>TOOL</code>) i odpowiedzi z cytowaniami. Bez tego zostaje przeszukiwanie treści, które jest wolne i zawodne.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/KbErasureService.kt">
+  @Transactional
+  fun erase(admin: CurrentUser, documentId: UUID, requestRef: String) {
+      require(Role.ADMIN in admin.roles)
+      systemSession.bind()                                  // obejmuje wszystkich tenantów i rozmowy wszystkich autorów
+      val doc = documents.lockForUpdate(documentId) ?: throw KbDocumentNotFoundException(documentId)
+      val hashes = jdbc.sql("SELECT DISTINCT content_hash FROM kb_chunks WHERE document_id = :id")
+          .param("id", documentId).query(String::class.java).list()
+
+      deleter.tombstoneLocked(doc, DeletedReason.ERASURE)
+      jdbc.sql("UPDATE kb_documents SET title = '[usunięto]', source_uri = NULL WHERE id = :id")
+          .param("id", documentId).update()
+      jdbc.sql("""DELETE FROM kb_embedding_cache e WHERE e.content_hash = ANY (:h)
+                  AND NOT EXISTS (SELECT 1 FROM kb_chunks c WHERE c.content_hash = e.content_hash)""")
+          .param("h", hashes.toTypedArray()).update()
+      jdbc.sql("UPDATE kb_feedback SET comment = NULL WHERE document_id = :id").param("id", documentId).update()
+      jdbc.sql("""UPDATE assistant_messages SET content = '[treść usunięta: dokument bazy wiedzy usunięty na żądanie]'
+                  WHERE kb_document_ids @> ARRAY[:id]::uuid[]""").param("id", documentId).update()
+      answerCache.evictByDocument(documentId)
+      erasureLog.append(documentId, requestRef)             // kb_erasure_log: do odtworzenia po restore kopii
+      audit.record(KbAuditEvent.erased(admin, documentId, requestRef))
+  }
+</script>
+<p>Endpoint: <code>POST /api/admin/kb/documents/{id}/erasure</code> (tylko ADMIN, z numerem żądania). Hashe pobieramy <em>przed</em> usunięciem chunków, bo potem nie wiadomo, które wpisy cache należały do dokumentu. Redakcja zastępuje treść wiadomości, więc rozmowa zachowuje strukturę (pary wywołanie–wynik z 2.5).</p>
+<div class="box tip"><span class="label">Kopie zapasowe realistycznie</span><p>Edycja kopii zapasowych jest w praktyce niewykonalna. Typowe podejście, które uzgadniasz z IOD i opisujesz w polityce: kopie wygasają w określonym terminie (np. 35 dni), a po każdym odtworzeniu bazy z kopii uruchamiasz ponownie wszystkie usunięcia z <code>kb_erasure_log</code> młodsze niż kopia. Rejestr przechowuje tylko identyfikatory i numer żądania, bez treści.</p></div>
+
+<h2>VACUUM i HNSW po masowych usunięciach</h2>
+<p>Postgres przy <code>DELETE</code> nie zwalnia miejsca od razu. Wiersz staje się martwą krotką (dead tuple), którą później sprząta <dfn data-t="vacuum">VACUUM</dfn>, czyli proces odzyskujący miejsce po usuniętych i nadpisanych wersjach wierszy. Indeks <dfn data-t="hnsw">HNSW</dfn> (graf sąsiedztwa wektorów z 4.1) ma tu dwie słabości:</p>
+<ul>
+  <li><strong>Mniej wyników przed VACUUM.</strong> Dokumentacja pgvector wprost zaznacza, że wyników może być mniej przez martwe krotki i warunki filtrowania. Przeszukiwanie grafu zbiera <code>hnsw.ef_search</code> kandydatów, a część z nich to usunięte wiersze, które odpadają dopiero przy sprawdzaniu widoczności. Po skasowaniu dużej przestrzeni trafność spada do czasu VACUUM.</li>
+  <li><strong>Wolny VACUUM.</strong> Sprzątanie HNSW musi naprawić połączenia w grafie wokół usuniętych węzłów. Dokumentacja pgvector zaleca przyspieszenie przez przebudowę indeksu przed VACUUM.</li>
+</ul>
+<script type="text/x-code" data-lang="sql" data-title="po masowym usunięciu lub reindeksie">
+  SELECT n_live_tup, n_dead_tup, last_autovacuum
+    FROM pg_stat_user_tables WHERE relname = 'kb_chunks';
+
+  -- przebudowa bez blokowania zapisów i odczytów, potem VACUUM (zalecenie z README pgvector)
+  SET maintenance_work_mem = '2GB';            -- graf powinien zmieścić się w pamięci; nie wyczerp RAM serwera
+  REINDEX INDEX CONCURRENTLY ix_kb_chunks_embedding_hnsw;
+  VACUUM (ANALYZE) kb_chunks;
+
+  -- częstszy autovacuum dla tabeli z dużą rotacją wierszy
+  ALTER TABLE kb_chunks SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000);
+</script>
+<p><code>REINDEX CONCURRENTLY</code> buduje nowy indeks obok starego i podmienia go na końcu. W tym czasie potrzebujesz miejsca na dwa indeksy, a budowa HNSW dla setek tysięcy wektorów obciąża CPU przez minuty. Uruchamiaj ją poza szczytem, jako świadomą operację po masowym usunięciu (przestrzeń, tenant, reindeks), a nie po każdej aktualizacji dokumentu. Codzienne drobne zmiany obsłuży zwykły autovacuum.</p>
+<div class="box warn"><span class="label">Odejście tenanta</span><p>Kilkadziesiąt tysięcy chunków usuwaj paczkami (np. po 5 000 w osobnych transakcjach, jak retencja w 2.5), a na końcu wykonaj REINDEX i VACUUM.</p></div>
+
+<h2>Zmiana modelu embeddingów: reindeks blue/green</h2>
+<p>Pojawia się model z lepszym recall dla polskich pytań. Kuszące jest przepięcie aliasu <code>helpdesk-embed</code> w LiteLLM. To katastrofa: zapytania dostaną wektory nowego modelu, dokumenty mają wektory starego, a podobieństwo między nimi to szum. Nawet przy tej samej liczbie wymiarów każdy model ma własną przestrzeń: wymiar 17 w jednym nie znaczy tego, co wymiar 17 w drugim. Wyszukiwanie nie zgłosi błędu, tylko zacznie zwracać losowe chunki.</p>
+<div class="box bug"><span class="label">Cicha podmiana pod aliasem</span><p>To wariant błędu #2 (1.3, 5.4) w RAG, tylko gorszy, bo nie psuje odpowiedzi stopniowo, ale całe wyszukiwanie naraz. Zasada: alias embeddingów nigdy nie zmienia modelu. Nowy model to nowy alias (<code>helpdesk-embed-v2</code>), nowa wartość <code>embedding_model</code> i reindeks. Kolumna <code>embedding_model</code> w <code>kb_chunks</code> i klucz <code>model</code> w cache pozwalają to sprawdzić w każdej chwili.</p></div>
+<p>Reindeks robimy metodą <dfn data-t="blue-green">blue/green</dfn>: nowa przestrzeń wektorów powstaje obok starej, a przełączenie to zmiana flagi. Gdzie trzymać nowe wektory?</p>
+<table>
+  <tr><th>Wariant</th><th>Zalety</th><th>Wady</th></tr>
+  <tr><td>Kolumna <code>embedding_v2</code> w <code>kb_chunks</code></td><td>Brak nowej tabeli i RLS; jedno zapytanie</td><td>Każdy <code>UPDATE</code> backfillu tworzy nową wersję całego wiersza i nowy wpis także w starym indeksie HNSW. 200 tys. aktualizacji to rozdęcie obu indeksów; inny wymiar wymaga i tak nowej kolumny</td></tr>
+  <tr><td>Tabela <code>kb_chunks_v2</code> (id chunka, dokument, wersja, tenant, visibility, wektor, model)</td><td>Stara tabela i indeks nietknięte; sprzątanie to <code>DROP TABLE</code>; dowolny wymiar</td><td>Druga polityka RLS; zapytanie joinuje <code>kb_chunks</code> po treść</td></tr>
+</table>
+<p>Wybieramy tabelę. <code>ON DELETE CASCADE</code> do <code>kb_chunks</code> sprawia, że usunięcie dokumentu i sprzątanie starych wersji kasuje też nowe wektory, więc RODO i przełączanie wersji działają bez zmian w kodzie.</p>
+<script type="text/x-code" data-lang="sql" data-title="V47__kb_chunks_v2.sql">
+  CREATE TABLE kb_chunks_v2 (
+      chunk_id         uuid PRIMARY KEY REFERENCES kb_chunks(id) ON DELETE CASCADE,
+      document_id      uuid NOT NULL,
+      document_version int  NOT NULL,
+      tenant_id        uuid NULL,
+      visibility       text NOT NULL,
+      embedding        vector(1024) NOT NULL,     -- wymiar nowego modelu (przykład)
+      embedding_model  text NOT NULL,
+      created_at       timestamptz NOT NULL DEFAULT now()
+  );
+  ALTER TABLE kb_chunks_v2 ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE kb_chunks_v2 FORCE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON kb_chunks_v2 USING (
+      current_setting('app.bypass_rls', true) = 'on' OR tenant_id IS NULL
+      OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+  -- indeks HNSW budujemy PO backfillu: szybciej niż wstawianie do istniejącego grafu
+</script>
+<p>Plan krok po kroku:</p>
+<ol>
+  <li><strong>Nowy serwer modelu.</strong> TEI serwuje jeden model na instancję: druga instancja i alias <code>helpdesk-embed-v2</code> w LiteLLM.</li>
+  <li><strong>Podwójny zapis</strong> (<code>dual-write: true</code>): import liczy nowe i zmienione chunki w obu modelach, więc luka w <code>kb_chunks_v2</code> przestaje rosnąć.</li>
+  <li><strong><dfn data-t="backfill">Backfill</dfn> w tle</strong>: job uzupełnia brakujące wektory paczkami z limitem tempa (niżej).</li>
+  <li><strong>Pokrycie 100%</strong> (zero bieżących chunków bez wektora v2), dopiero wtedy <code>CREATE INDEX CONCURRENTLY</code> HNSW na <code>kb_chunks_v2</code>.</li>
+  <li><strong>Eval</strong> z 4.7 na obu przestrzeniach: recall@k, MRR, <code>KB_PERMISSIONS</code> na 100%. Nowy model przechodzi tylko z wynikiem lepszym albo równym.</li>
+  <li><strong>Przełączenie flagą</strong> <code>active: v2</code>, najpierw dla jednego tenanta (<dfn data-t="feature-flag">feature flag</dfn>). Embedding zapytania liczy zawsze model aktywnej przestrzeni.</li>
+  <li><strong>Okres powrotu</strong> (np. 2 tygodnie podwójnego zapisu): rollback to zmiana flagi. Po sprzątaniu powrót oznacza pełny reindeks, więc koniec okresu to świadoma decyzja.</li>
+  <li><strong>Sprzątanie</strong>: koniec podwójnego zapisu, usunięcie starej przestrzeni, wpisów cache starego modelu (<code>DELETE FROM kb_embedding_cache WHERE model = 'bge-m3'</code>) i drugiej instancji TEI.</li>
+</ol>
+<script type="text/x-code" data-lang="kotlin" data-title="kb/reindex/KbReindexJob.kt">
+  @Scheduled(fixedDelayString = "PT10S")
+  @SchedulerLock(name = "kb-reindex-v2", lockAtMostFor = "PT5M")
+  fun step() {
+      if (!props.reindex.enabled) return
+      if (teiLatency.p95("helpdesk-embed-v2") > props.reindex.maxP95) return      // ustępujemy zapytaniom
+      val batch = tx.execute {
+          systemSession.bind()
+          jdbc.sql("""
+              SELECT c.id, c.document_id, c.document_version, c.tenant_id, c.visibility, c.heading_path, c.content
+                FROM kb_chunks c
+                JOIN kb_documents d ON d.id = c.document_id AND c.document_version = d.current_version
+               WHERE d.status = 'ACTIVE'
+                 AND NOT EXISTS (SELECT 1 FROM kb_chunks_v2 v WHERE v.chunk_id = c.id)
+               LIMIT :n
+                 FOR UPDATE OF c SKIP LOCKED
+          """).param("n", props.reindex.batchSize).query(ChunkRow.MAPPER).list()
+      }!!
+      if (batch.isEmpty()) { progress.markComplete(); return }
+      val vectors = embeddingsV2.embedAll(batch.map { it.embedText() })    // ten sam cache, model v2
+      tx.executeWithoutResult {
+          systemSession.bind()
+          chunksV2.insertIgnoringMissing(batch, vectors)   // INSERT … SELECT … WHERE EXISTS: chunk mógł zniknąć
+      }
+  }
+</script>
+<p>Blokada <code>SKIP LOCKED</code> kończy się przed wywołaniem modelu, więc dwie instancje mogą rzadko policzyć tę samą paczkę. Zapis z <code>ON CONFLICT DO NOTHING</code> to toleruje, a chunk usunięty w trakcie liczenia odrzuci warunek <code>EXISTS</code> albo klucz obcy.</p>
+<h3>Koszt i czas dla 200 tys. chunków</h3>
+<table>
+  <tr><th>Pozycja</th><th>Obliczenie (założenia do zmierzenia)</th><th>Wynik</th></tr>
+  <tr><td>Czysty czas embeddingów</td><td>200 000 / 100 chunków/s (bge-m3, jedno GPU, ok. 450 tokenów)</td><td>ok. 33 min</td></tr>
+  <tr><td>Backfill z limitem 50% przepustowości</td><td>reszta zostaje dla zapytań i importu</td><td>ok. 70 min</td></tr>
+  <tr><td>Budowa HNSW</td><td>200 tys. × 1024 wymiary, równoległe workery, wystarczające <code>maintenance_work_mem</code></td><td>minuty do kilkunastu minut</td></tr>
+  <tr><td>Miejsce</td><td>1024 × 4 B ≈ 4 KB na wektor × 200 tys. ≈ 0,8 GB + indeks podobnego rzędu</td><td>ok. +2 GB na czas migracji</td></tr>
+  <tr><td>Koszt GPU</td><td>ok. 2 h × ilustracyjne 1 USD/h</td><td>kilka USD</td></tr>
+  <tr><td>Evale z 4.7</td><td>zbiór KB na dwóch przestrzeniach; metryki wyszukiwania bez LLM</td><td>minuty</td></tr>
+</table>
+<p>Wniosek: przy self-hosted modelu reindeks kosztuje grosze. Drogie są koordynacja i ryzyko: drugi serwer modelu, podwójne miejsce, okres podwójnego zapisu, decyzja na podstawie evali. Przepustowość TEI zależy od GPU, długości chunków i paczek, więc zmierz ją, zanim obiecasz termin. Przy braku miejsca rozważ typ <code>halfvec</code> z pgvector (2 B na wymiar; sprawdź w dokumentacji i evalach).</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (fragment)">
+  helpdesk:
+    kb:
+      embedding:
+        active: v1                     # przestrzeń używana przez wyszukiwanie (per tenant: overrides)
+        dual-write: true               # w trakcie migracji: import liczy obie przestrzenie
+        spaces:
+          v1: { alias: helpdesk-embed,    model-id: bge-m3,       table: kb_chunks }
+          v2: { alias: helpdesk-embed-v2, model-id: nowy-model-1, table: kb_chunks_v2 }   # nazwa przykładowa
+      reindex:
+        enabled: true
+        batch-size: 32
+        max-p95: 300ms                 # powyżej: backfill czeka
+</script>
+
+<h2>Job spójności, metryki i alerty</h2>
+<p>Wszystkie mechanizmy powyżej mają przypadki brzegowe: worker zabity w połowie, ręczny SQL admina, błąd w migracji. Job spójności nie zapobiega błędom, tylko je wykrywa, zanim zrobi to klient. Uruchamiany co godzinę, w trybie systemowym, każde zapytanie to jedna metryka:</p>
+<script type="text/x-code" data-lang="sql" data-title="kb/consistency/checks.sql">
+  -- 1. chunki usuniętych dokumentów (FK wyklucza brak dokumentu; to jest „sierota” w praktyce): KRYTYCZNE
+  SELECT count(*) FROM kb_chunks c JOIN kb_documents d ON d.id = c.document_id
+   WHERE d.status = 'DELETED';
+
+  -- 2. dokumenty ACTIVE bez żadnych chunków
+  SELECT count(*) FROM kb_documents d
+   WHERE d.status = 'ACTIVE'
+     AND NOT EXISTS (SELECT 1 FROM kb_chunks c WHERE c.document_id = d.id);
+
+  -- 3. current_version wskazuje wersję bez chunków (choć inne wersje istnieją)
+  SELECT count(*) FROM kb_documents d
+   WHERE d.status = 'ACTIVE'
+     AND EXISTS (SELECT 1 FROM kb_chunks c WHERE c.document_id = d.id)
+     AND NOT EXISTS (SELECT 1 FROM kb_chunks c WHERE c.document_id = d.id
+                                              AND c.document_version = d.current_version);
+
+  -- 4. embedding_model inny niż bieżący model przestrzeni
+  SELECT embedding_model, count(*) FROM kb_chunks
+   WHERE embedding_model <> :currentModel GROUP BY embedding_model;
+
+  -- 5. stare wersje, których nikt nie posprzątał (bez aktywnego joba)
+  SELECT count(*) FROM kb_chunks c JOIN kb_documents d ON d.id = c.document_id
+   WHERE c.document_version < d.current_version AND c.created_at < now() - interval '1 hour';
+
+  -- 6. denormalizacja rozjechana z dokumentem: tenant lub widoczność: KRYTYCZNE (wyciek)
+  SELECT count(*) FROM kb_chunks c JOIN kb_documents d ON d.id = c.document_id
+   WHERE c.tenant_id IS DISTINCT FROM d.tenant_id OR c.visibility <> d.visibility;
+
+  -- 7. joby wiszące w RUNNING
+  SELECT count(*) FROM kb_ingestion_jobs WHERE status = 'RUNNING' AND started_at < now() - interval '30 minutes';
+</script>
+<p><code>KbConsistencyJob</code> (<code>@Scheduled</code> + <code>@SchedulerLock</code>, jak retencja w 2.5) zapisuje każdy wynik jako gauge <code>helpdesk.kb.consistency.violations{check=…}</code> i naprawia tylko to, co bezpieczne:</p>
+<table>
+  <tr><th>Sprawdzenie</th><th>Naprawa</th><th>Alert</th></tr>
+  <tr><td>1. chunki usuniętych dokumentów</td><td>automatyczne <code>DELETE</code></td><td>krytyczny zawsze (błąd w kodzie usuwania)</td></tr>
+  <tr><td>6. rozjechany tenant/visibility</td><td>ręczna</td><td>krytyczny, natychmiast (wyciek)</td></tr>
+  <tr><td>2, 3. brak bieżących chunków</td><td>nowy job importu</td><td>ostrzeżenie po 2 przebiegach</td></tr>
+  <tr><td>4. inny model</td><td>backfill</td><td>ostrzeżenie poza migracją</td></tr>
+  <tr><td>5, 7. resztki, wiszące joby</td><td>sprzątanie, ponowienie</td><td>ostrzeżenie przy trendzie</td></tr>
+</table>
+<p>Do tego metryki przepływu: <code>helpdesk.kb.ingestion.lag</code> (wiek najstarszego joba QUEUED; dla biznesu „zmiana jest widoczna po X minutach”), <code>helpdesk.kb.embedding.cache</code> (hit/miss), <code>helpdesk.kb.sync.delete_guard_tripped</code>.</p>
+
+<h2>Audyt zmian bazy wiedzy</h2>
+<p>Pytanie „kto usunął procedurę eskalacji SSO i kiedy?” albo „od kiedy asystent podaje limit 25 MB?” to ten sam problem co w 3.6, tylko dla treści, a nie akcji. Wystarczy prostsza wersja <dfn data-t="audit-log">logu audytowego</dfn>: tabela <code>kb_audit</code> <dfn data-t="append-only">append-only</dfn> (REVOKE UPDATE, DELETE, jak <code>assistant_audit</code>) z polami <code>occurred_at, tenant_id, actor_id, actor_type, document_id, event_type, version, content_hash, details jsonb</code>. Zdarzenia m.in.: <code>DOCUMENT_CREATED</code>, <code>UPDATE_REQUESTED</code>, <code>VERSION_ACTIVATED</code>, <code>DOCUMENT_DELETED</code>, <code>DOCUMENT_ERASED</code>, <code>DOCUMENT_RESTORED</code>; <code>actor_type = SYSTEM</code> dla synchronizacji i jobów.</p>
+<p>Para <code>version</code> + <code>content_hash</code> mówi, która wersja była bieżąca w chwili danej odpowiedzi asystenta (reklamacja „asystent powiedział mi 10 MB”). Audyt nie przechowuje treści ani tytułu dokumentu, więc nie koliduje z usuwaniem danych osobowych.</p>
+
+<h2>Testy</h2>
+<p>Testy integracyjne na Postgresie z pgvector w Testcontainers (jak w 1.1). Model embeddingów zastępuje deterministyczny stub: wektor z hasha tekstu, żeby testy nie zależały od TEI. Trzy gwarancje z tej lekcji:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="KbVersioningIT.kt">
+  @Test
+  fun `wyszukiwanie w trakcie aktualizacji nigdy nie jest puste ani mieszane`() {
+      val doc = kb.importAndWait(acmeAgent, limitDoc(text = "Limit eksportu PDF to 10 MB."))
+      val stop = AtomicBoolean(false)
+      val anomalies = ConcurrentLinkedQueue<String>()
+      val searchers = (1..4).map {
+          executor.submit {
+              while (!stop.get()) {
+                  val hits = knowledge.search(piotr, ACME, "limit rozmiaru eksportu PDF")
+                      .filter { it.documentId == doc.id }
+                  if (hits.isEmpty()) anomalies += "pusty wynik"
+                  if (hits.map { it.documentVersion }.distinct().size > 1) anomalies += "mieszane wersje"
+              }
+          }
+      }
+      repeat(20) { i -> kb.updateAndWait(acmeAgent, doc.id, "Limit eksportu PDF to ${10 + i} MB.\n\n" + filler) }
+      stop.set(true); searchers.forEach { it.get() }
+      assertThat(anomalies).isEmpty()
+      assertThat(kb.document(doc.id).currentVersion).isEqualTo(21)
+  }
+
+  @Test
+  fun `usuniecie dokumentu zostawia zero chunkow`() {
+      val doc = kb.importAndWait(acmeAgent, ssoProcedure())
+      kb.delete(acmeAgent, doc.id)
+      assertThat(asOwner.count("SELECT count(*) FROM kb_chunks WHERE document_id = ?", doc.id)).isZero()  // z pominięciem RLS
+      assertThat(knowledge.search(piotr, ACME, "eskalacja SSO").map { it.documentId }).doesNotContain(doc.id)
+      assertThatThrownBy { kb.get(acmeAgent, doc.id) }.isInstanceOf(KbDocumentDeletedException::class.java)  // 410
+  }
+
+  @Test
+  fun `ten sam plik dwa razy nie tworzy nowej wersji`() {
+      val doc = kb.importAndWait(acmeAgent, pdfExportGuide())
+      val result = kb.update(acmeAgent, doc.id, pdfExportGuide().withTrailingWhitespace())
+      assertThat(result).isInstanceOf(IngestResult.Unchanged::class.java)
+      assertThat(asOwner.count("SELECT count(*) FROM kb_ingestion_jobs WHERE document_id = ?", doc.id)).isEqualTo(1)
+      assertThat(embeddingStub.calls).isEqualTo(doc.chunkCount)          // drugi raz: zero wywołań modelu
+  }
+</script>
+<p>Pierwszy test łapie DELETE-INSERT w osobnych transakcjach (pusty wynik) i wyszukiwanie w dwóch zapytaniach (mieszane wersje). Dodaj też: usunięcie w trakcie pracy workera, dwie równoczesne aktualizacje (wygrywa wyższa wersja), sync z pustą listą stron (zero usunięć) i każde sprawdzenie joba spójności na celowo zepsutych danych.</p>
+
+<h2>Przypadki brzegowe</h2>
+<ul>
+  <li><strong>Dwie równoczesne aktualizacje tego samego dokumentu.</strong> Ludzie: <code>If-Match</code> i 409 <code>kb-document-stale</code> dla drugiego. Synchronizacja i upload naraz: blokada przydziela kolejne numery, przełączenie przyjmuje tylko wyższą wersję, więc wygrywa ostatnia przyjęta, a nie szybciej policzona.</li>
+  <li><strong>Awaria w połowie reindeksu.</strong> Nic się nie dzieje z wyszukiwaniem, bo flaga dalej wskazuje v1. Backfill wznawia się od miejsca przerwania (warunek <code>NOT EXISTS</code> w <code>kb_chunks_v2</code>), a podwójny zapis pilnuje, żeby luka nie rosła. Nie przełączaj przy pokryciu 99,9%: brakujące chunki byłyby niewidoczne bez żadnego błędu.</li>
+  <li><strong>Dokument przeniesiony między tenantami</strong> (np. strona Confluence przeniesiona do przestrzeni innego klienta). Nie zmieniaj <code>tenant_id</code> na miejscu, bo chunki mają zdenormalizowany tenant i rozjazd to wyciek (sprawdzenie 6). Rozmowy, feedback i audyt należą do starego tenanta. Traktuj to jako tombstone (<code>deleted_reason = 'MOVED'</code>) plus nowy dokument w nowym tenancie. Dzięki cache embeddingi nic nie kosztują. To samo dotyczy zmiany <code>visibility</code>: aktualizacja dokumentu i jego chunków w jednej transakcji.</li>
+  <li><strong>Przywracanie usuniętego dokumentu.</strong> Chunki są skasowane, a treść źródłowa też, więc przywrócenie to nowy import tej samej treści do tego samego <code>id</code> jako nowa wersja (<code>POST /api/kb/documents/{id}/restore</code> z plikiem albo ponowna synchronizacja strony przywróconej z kosza Confluence). Cytowania w starych rozmowach znów działają. Dokumentu po erasure nie przywracamy: 409, bo treść nie może wrócić.</li>
+  <li><strong>Strona zarchiwizowana w Confluence.</strong> Domyślna lista zwraca strony <code>current</code> i <code>archived</code>. Zdecyduj jawnie, czy to ARCHIVED u nas (chunki zostają, poza wyszukiwaniem), czy usunięcie.</li>
+</ul>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Zaimplementuj <code>KbVersionSwitcher</code> i test „nigdy pusto, nigdy mieszanka”. Potem celowo zepsuj kod: usuń stare chunki w osobnej transakcji przed wstawieniem nowych i sprawdź, że test to wykrywa. Druga próba: wykonaj gałąź wektorową i pełnotekstową jako dwa zapytania.</li>
+  <li>Policz dla swojej bazy (albo przyjmij 10 000 dokumentów po 25 chunków, 5% zmian dziennie, zmiana dotyka 3 chunków): ile embeddingów dziennie przy pełnym przeliczeniu, przy hashu dokumentu i przy cache chunków. Zmierz przepustowość TEI na swoim sprzęcie i przelicz na czas.</li>
+  <li>Napisz test synchronizacji z Confluence, w którym stub API zwraca pustą listę stron. Sprawdź, że bezpiecznik zatrzymuje usuwanie, a metryka <code>delete_guard_tripped</code> rośnie.</li>
+  <li>Wypisz wszystkie miejsca w Twoim systemie, w których może zostać treść usuniętego dokumentu (tabele, cache, logi, trace, kopie). Dla każdego zapisz mechanizm usunięcia albo uzasadnienie, dlaczego go nie ma.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego aktualizacja dokumentu wstawia chunki nowej wersji obok starych, zamiast najpierw usunąć stare?</p>
+  <button>Bo Postgres nie pozwala usunąć i wstawić wierszy w jednej transakcji</button>
+  <button>Żeby zaoszczędzić miejsce w indeksie HNSW</button>
+  <button>Bo liczenie embeddingów trwa i może się nie udać; dopóki nowa wersja nie jest kompletna, wyszukiwanie korzysta ze starej, a przełączenie to krótka transakcja</button>
+  <p class="explain">Usunięcie przed liczeniem embeddingów daje okno bez wyników i dokument bez chunków po awarii. Jedna długa transakcja z wywołaniami modelu blokuje połączenia. Wzorzec „przygotuj obok, przełącz atomowo, posprzątaj” unika obu problemów.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Gałąź wektorowa i pełnotekstowa wyszukiwania są wykonywane jako dwa osobne zapytania w trybie READ COMMITTED. Jakie ryzyko to tworzy?</p>
+  <button>Między zapytaniami może nastąpić przełączenie wersji, więc kontekst dostanie chunki dwóch wersji tego samego dokumentu</button>
+  <button>Żadne, bo filtr <code>document_version = current_version</code> działa w obu zapytaniach</button>
+  <button>Zapytania zakleszczą się z workerem importu</button>
+  <p class="explain">Każde zapytanie w READ COMMITTED ma własny snapshot. Filtr jest poprawny w każdym z osobna, ale oba mogą widzieć różne <code>current_version</code>. Rozwiązanie to jedno zapytanie z CTE albo transakcja REPEATABLE READ.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Zespół chce przepiąć alias <code>helpdesk-embed</code> w LiteLLM na nowy, lepszy model embeddingów o tej samej liczbie wymiarów. Co się stanie?</p>
+  <button>Nic złego, skoro wymiar jest ten sam</button>
+  <button>Pgvector zgłosi błąd niezgodności typów</button>
+  <button>Jakość od razu się poprawi, bo zapytania będą lepiej zrozumiane</button>
+  <button>Wektory zapytań i dokumentów będą z różnych przestrzeni, więc wyszukiwanie zacznie zwracać przypadkowe chunki bez żadnego błędu</button>
+  <p class="explain">Wektory dwóch modeli są nieporównywalne nawet przy tym samym wymiarze. Zmiana modelu wymaga nowego aliasu, reindeksu blue/green, evalu i przełączenia flagą.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Dlaczego chunki usuwanego dokumentu kasujemy fizycznie, a nie oznaczamy jako usunięte?</p>
+  <button>Bo <code>DELETE</code> jest szybszy niż <code>UPDATE</code></button>
+  <button>Bo chunki czyta wiele ścieżek (wyszukiwanie, evale, raporty, ręczny SQL) i każda bez filtra przywróciłaby usuniętą treść; do tego martwe wektory zostają w grafie HNSW</button>
+  <button>Bo kontrakt zabrania kolumny <code>deleted_at</code> w <code>kb_chunks</code></button>
+  <p class="explain">Soft delete działa, gdy jest jedna ścieżka odczytu. W RAG treść, która „nie powinna istnieć”, wraca w odpowiedzi przy pierwszym zapytaniu bez filtra, a przy danych osobowych to naruszenie RODO. Tombstone zostaje tylko na poziomie dokumentu, bez treści.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Synchronizacja z Confluence nagle widzi 0 stron w przestrzeni, w której wczoraj było 800. Co powinien zrobić job?</p>
+  <button>Oznaczyć 800 dokumentów jako DELETED, bo źródło jest źródłem prawdy</button>
+  <button>Zignorować wynik i spróbować ponownie za tydzień</button>
+  <button>Przerwać usuwanie (bezpiecznik progu usunięć), zapisać metrykę i alert, a usunięcia potwierdzać tylko pojedynczo sprawdzonym statusem strony</button>
+  <p class="explain">Pusta lista to najczęściej utrata uprawnień albo błąd API, a nie usunięcie całej przestrzeni. Bezpiecznik zatrzymuje masowe usunięcia, a pojedyncze zniknięcia potwierdzamy statusem strony (kosz, usunięta, archiwum) przed utworzeniem tombstone.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
