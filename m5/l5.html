@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.5 Wznawianie po restarcie – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="5.5">
+<main>
+<p class="meta">Lekcja 5.5 · ok. 60 min</p>
+<h1>Wznawianie po restarcie: trwały workflow triage</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Spisać awarie procesu w tle i dobrać ochronę do każdej.</li>
+  <li>Zaprojektować checkpointy w <code>triage_steps</code>, maszynę stanów runu i wznowienie bez drugiego płacenia za model.</li>
+  <li>Uczynić każdy krok idempotentnym, a APPLY odpornym na powtórzenie i utratę dzierżawy.</li>
+  <li>Dobrać długość dzierżawy, przedłużanie i token ochronny; liczyć czas zegarem bazy.</li>
+  <li>Skonfigurować graceful shutdown (Spring Boot, Kubernetes), ponawianie zdarzeń Spring Modulith i klasyfikację błędów.</li>
+  <li>Zbudować obserwowalność i panel runów utkniętych, ocenić silniki workflow i przetestować awarie.</li>
+</ul></div>
+
+<p>Lekcja 5.1 zaprojektowała workflow: <code>TriageTrigger</code> wstawia run, <code>TriageWorker</code> przejmuje go przez <code>SKIP LOCKED</code>, <code>TriageWorkflow.advance</code> wykonuje jeden krok i zapisuje checkpoint. Tu sprawdzamy ten projekt pod obciążeniem awarii: co się dzieje w każdej chwili, w której proces może zginąć.</p>
+
+<h2>Co może się stać z procesem w tle</h2>
+<p>Czat ma człowieka, który kliknie „wyślij ponownie”. Triage nie ma nikogo: run, który zginie po cichu, oznacza zgłoszenie bez klasyfikacji, o którym nikt nie wie. Przy 2000 zgłoszeń dziennie i dwóch deployach w tygodniu przerwane runy to codzienność.</p>
+<table>
+  <tr><th>Awaria</th><th>Skutek bez ochrony</th><th>Ochrona</th></tr>
+  <tr><td>Restart podczas deployu (SIGTERM)</td><td>Runy w pamięci giną, nie wiadomo które</td><td>Stan w bazie; graceful shutdown: dokończ krok albo oddaj dzierżawę</td></tr>
+  <tr><td>OOM, SIGKILL, awaria węzła</td><td>Run „RUNNING” na zawsze</td><td>Dzierżawa wygasa, <code>claimNext</code> bierze RUNNING z wygasłym <code>locked_until</code></td></tr>
+  <tr><td>Utrata połączenia z bazą w trakcie kroku</td><td>Wynik modelu w pamięci, checkpointu brak</td><td>Krótkie ponowienie zapisu; w ostateczności powtórzenie kroku</td></tr>
+  <tr><td>Timeout LLM w połowie odpowiedzi</td><td>Wątek czeka, koszt nieznany</td><td>Timeout kroku, Retry z backoff, koszt zapisany niezależnie od checkpointu</td></tr>
+  <tr><td>Podwójne <code>TicketCreated</code></td><td>Dwa runy, dwie zmiany zgłoszenia</td><td><code>ON CONFLICT DO NOTHING</code>, <code>ux_triage_runs_live</code> (5.1)</td></tr>
+  <tr><td>Dwie instancje biorą ten sam run</td><td>Podwójny koszt, wyścig zapisów</td><td><code>SKIP LOCKED</code> przy przejęciu, token ochronny w <code>locked_by</code> przy każdym zapisie</td></tr>
+  <tr><td>Zawieszony worker (socket bez timeoutu)</td><td>Heartbeat przedłuża dzierżawę bez końca</td><td>Timeouty, heartbeat tylko do <code>max-step-duration</code></td></tr>
+  <tr><td>Pod usunięty przez Kubernetes</td><td>Jak deploy, ale bez zapowiedzi</td><td><code>preStop</code>, <code>terminationGracePeriodSeconds</code>, <code>SmartLifecycle</code></td></tr>
+  <tr><td>Failover bazy, węzeł chwilowo read-only</td><td>Każdy zapis błędem, worker spala próby</td><td>Błędy bazy jako przejściowe, pauza przejmowania</td></tr>
+  <tr><td>Nowy kod w trakcie runu</td><td>Stary checkpoint nieczytelny</td><td>Wersja formatu w <code>output</code>, <code>config_version</code> w runie</td></tr>
+</table>
+<div class="box tip"><span class="label">Zasada lekcji</span><p>Zakładaj, że proces może zginąć <strong>między dowolnymi dwiema instrukcjami</strong>. Dla każdego takiego punktu musisz umieć powiedzieć: co jest w bazie, kto to podejmie i ile to kosztuje. To <dfn data-t="crash-only">crash-only design</dfn>: zamknięcie awaryjne i normalne prowadzą do tego samego bezpiecznego stanu, więc ścieżka odtwarzania działa codziennie, a nie raz w roku.</p></div>
+
+<h2>Model trwałości: co zapisujemy po każdym kroku</h2>
+<p><dfn data-t="checkpoint">Checkpoint</dfn> to trwały zapis wyniku zakończonego kroku, od którego można wznowić pracę bez powtarzania wcześniejszych kroków. <code>triage_runs</code> mówi, <em>gdzie</em> jest proces (<code>status</code>, <code>current_step</code>), a <code>triage_steps</code>, <em>co</em> wyszło z każdego kroku. Oba zapisy idą w jednej transakcji, więc nie ma stanu „krok zapisany, run nieprzesunięty”.</p>
+<table>
+  <tr><th>Krok</th><th><code>triage_steps.output</code></th><th>Pola runu</th></tr>
+  <tr><td>LOAD</td><td><code>ticketVersion</code>, długości, SHA-256 tytułu i opisu (bez treści)</td><td><code>ticket_version</code></td></tr>
+  <tr><td>REDACT</td><td>Liczba encji wg typu, wersja redaktora, hash tekstu po redakcji</td><td>–</td></tr>
+  <tr><td>CLASSIFY</td><td><code>RawCompletion</code> z 5.2: surowa odpowiedź, <code>finishReason</code>, tokeny, <code>providerModel</code></td><td><code>provider_model</code></td></tr>
+  <tr><td>VALIDATE</td><td><code>TriageValidation</code> (Valid z flagami albo Invalid z błędami)</td><td><code>result</code></td></tr>
+  <tr><td>DECIDE</td><td><code>TriageAssessment</code> z 5.3</td><td><code>decision</code>, <code>decision_reasons</code></td></tr>
+  <tr><td>APPLY</td><td>Wersja zgłoszenia po zmianie</td><td><code>APPLIED</code>, <code>finished_at</code></td></tr>
+</table>
+<p>Dlaczego CLASSIFY zapisuje <strong>surową odpowiedź</strong>, a nie dopiero zwalidowany wynik?</p>
+<ul>
+  <li><strong>Koszt.</strong> Awaria w VALIDATE (np. Presidio niedostępne przy kontroli PII w streszczeniu) wznawia pracę od zapisanego tekstu. Dla <code>helpdesk-fast</code> to grosze, ale Globex na <code>helpdesk-local</code> to 3,9 s GPU dzielonego z KB, a restart wszystkich podów w imporcie 10 tys. zgłoszeń to tysiące zbędnych wywołań.</li>
+  <li><strong>Determinizm.</strong> Nawet przy <code>temperature: 0</code> model nie gwarantuje identycznej odpowiedzi. Bez zapisu wznowiony run mógłby dostać inną kategorię niż ta z logów i trace'ów pierwszej próby.</li>
+  <li><strong>Audyt.</strong> Masz dokładnie to, co napisał model, z <code>provider_model</code> (5.4), i możesz przepuścić stare odpowiedzi przez nowy walidator bez wywoływania modelu.</li>
+</ul>
+<p>Na trasie zewnętrznej model widział tekst po REDACT, a <code>summary</code> przechodzi kontrolę PII. Na trasie lokalnej Globexu model widział oryginał, więc retencja <code>triage_steps</code> musi być taka jak <code>triage_runs.result</code> (2.5, 2.7).</p>
+<div class="box warn"><span class="label">Jedyne okno podwójnej płatności</span><p>Między odpowiedzią z LiteLLM a commitem checkpointu jest kilka milisekund, w których awaria oznacza powtórzenie CLASSIFY. Wywołanie HTTP i transakcja to dwa systemy, więc okna nie da się zamknąć. Dlatego <code>UsageRecorder</code> (2.6) zapisuje koszt <em>niezależnie</em> od checkpointu, w osobnej transakcji zaraz po odpowiedzi: <code>llm_usage</code> pokazuje każde zapłacone wywołanie, także to, którego wynik przepadł.</p></div>
+
+<h2>Maszyna stanów runu</h2>
+<p>Run to <dfn data-t="state-machine">maszyna stanów</dfn> jak akcja asystenta w 3.5: każde przejście to warunkowy <code>UPDATE</code> sprawdzający stan źródłowy.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="cykl życia triage_runs">
+                claimNext (SKIP LOCKED)            checkpoint: Next
+  ┌─────────┐ ──────────────────────► ┌─────────┐ ◄─────────┐
+  │ PENDING │                         │ RUNNING │ ──────────┘
+  └─────────┘ ◄────────────────────── └─────────┘
+    │   ▲      Retry / oddanie dzierżawy   │  │  │
+    │   └─ wygasła dzierżawa: claimNext ───┘  │  └─► WAITING_REVIEW ─► APPLIED / REJECTED / EXPIRED (5.3)
+    │                                         └────► APPLIED | SKIPPED | FAILED
+    └── expire-after (24 h) ──► EXPIRED
+
+  stany końcowe: APPLIED, REJECTED, SKIPPED, FAILED, EXPIRED  (finished_at NOT NULL, locked_by NULL)
+</script>
+<table>
+  <tr><th>Przejście</th><th>Kto</th><th>Warunek</th></tr>
+  <tr><td>PENDING/RUNNING → RUNNING</td><td><code>claimNext</code></td><td><code>next_attempt_at &lt;= now()</code>, dzierżawa pusta lub wygasła, <code>attempt &lt; max</code></td></tr>
+  <tr><td>RUNNING → RUNNING (następny krok)</td><td><code>checkpoint</code></td><td><code>locked_by = :me AND status = 'RUNNING' AND current_step = :step</code></td></tr>
+  <tr><td>RUNNING → PENDING</td><td>Retry, <code>release</code></td><td><code>locked_by = :me AND status = 'RUNNING'</code></td></tr>
+  <tr><td>RUNNING → stan końcowy</td><td><code>finish</code></td><td><code>locked_by = :me AND status = 'RUNNING'</code></td></tr>
+  <tr><td>PENDING/RUNNING → EXPIRED, SKIPPED</td><td>job, admin</td><td>stan nie jest końcowy</td></tr>
+</table>
+<script type="text/x-code" data-lang="sql" data-title="TriageRunStore.checkpoint (jedna transakcja, app.tenant_ids = tenant runu)">
+  -- 1) przejście runu; najpierw UPDATE: blokuje wiersz i sprawdza token ochronny
+  UPDATE triage_runs
+     SET current_step = :nextStep, status = :status,          -- RUNNING | PENDING | stan końcowy
+         locked_by    = CASE WHEN :status = 'RUNNING' THEN locked_by END,
+         locked_until = CASE WHEN :status = 'RUNNING' THEN clock_timestamp() + :lease::interval END,
+         next_attempt_at = coalesce(clock_timestamp() + :delay::interval, next_attempt_at),
+         ticket_version = coalesce(:ticketVersion, ticket_version), result = coalesce(:result, result),
+         error_code = :errorCode, finished_at = CASE WHEN :terminal THEN clock_timestamp() END,
+         updated_at = clock_timestamp()
+   WHERE id = :runId AND locked_by = :me AND status = 'RUNNING' AND current_step = :step;
+  -- 0 wierszy → LeaseLostException → ROLLBACK
+
+  -- 2) dziennik kroku; konflikt PK = ten sam krok i próba już zapisane
+  INSERT INTO triage_steps (run_id, tenant_id, step, attempt, status, started_at, finished_at, output,
+                            input_tokens, output_tokens, error)
+  VALUES (:runId, :tenantId, :step, :attempt, :stepStatus, :startedAt, clock_timestamp(), :output::jsonb,
+          :inTok, :outTok, :error)
+  ON CONFLICT (run_id, step, attempt) DO NOTHING;
+</script>
+<p>Warunek <code>current_step = :step</code> wyklucza dwukrotne zapisanie tego samego kroku nawet przy błędzie w kodzie workera. Stany niemożliwe wyklucza też baza:</p>
+<script type="text/x-code" data-lang="sql" data-title="V56__triage_resilience.sql (numer przykładowy)">
+  ALTER TABLE triage_runs ADD CONSTRAINT ck_triage_runs_lease CHECK (
+      (status = 'RUNNING' AND locked_by IS NOT NULL AND locked_until IS NOT NULL)
+      OR (status <> 'RUNNING' AND locked_by IS NULL));
+  ALTER TABLE triage_runs ADD CONSTRAINT ck_triage_runs_final CHECK (
+      (status IN ('APPLIED','REJECTED','SKIPPED','FAILED','EXPIRED')) = (finished_at IS NOT NULL));
+  ALTER TABLE triage_runs ADD COLUMN trace_parent text NULL;          -- obserwowalność, niżej
+</script>
+
+<h2>Wznowienie od ostatniego zakończonego kroku</h2>
+<p>Wznowienie nie ma osobnej ścieżki kodu. Run przerwany w VALIDATE ma <code>status = 'RUNNING'</code>, <code>current_step = 'VALIDATE'</code> i wygasłą dzierżawę. <code>claimNext</code> traktuje go jak każdy inny, a <code>advance</code> woła handler bieżącego kroku, który czyta wejście z checkpointu, nie z pamięci:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/steps/ValidateStep.kt (fragment)">
+  override fun execute(run: TriageRun): StepOutcome {
+      // ostatnie OK z CLASSIFY (po naprawie z 5.2 – odpowiedź po naprawie)
+      val raw = steps.lastOk(run.id, TriageStep.CLASSIFY)?.read<RawCompletion>()
+          ?: return StepOutcome.Next(TriageStep.CLASSIFY)              // brak checkpointu: krok wstecz, nie wyjątek
+      return when (val v = validator.validate(raw, context.load(run), steps.repairsSoFar(run.id) > 0)) {
+          is TriageValidation.Valid -> StepOutcome.Next(TriageStep.DECIDE, output = v.toOutput())
+          is TriageValidation.Invalid -> TriageRepairPolicy.next(run, raw, v, steps)   // 5.2: jedna naprawa
+      }
+  }
+</script>
+<ul>
+  <li><strong>Handler nie trzyma stanu</strong> między wywołaniami. Pole beana z „ostatnim wynikiem” zginie przy restarcie, a w puli wątków pomiesza runy.</li>
+  <li><strong>Wszystko, co niedeterministyczne lub kosztowne, pochodzi z checkpointu.</strong> Lista zespołów czy trasa modelu to dane konfiguracyjne, można je odczytać ponownie.</li>
+  <li><strong>REDACT zapisuje tylko hash</strong> tekstu po redakcji. CLASSIFY po wznowieniu odtwarza tekst i porównuje hash; różnica (zmieniona treść albo redaktor) oznacza powrót do LOAD zamiast wysłania do modelu czegoś innego niż sprawdzone.</li>
+</ul>
+<script type="text/x-code" data-lang="plaintext" data-title="awaria po kroku CLASSIFY: oś czasu">
+  10:00:00.000  pod-a  claimNext → run R (attempt 1), LOAD, REDACT
+  10:00:01.290  pod-a  odpowiedź modelu; llm_usage; checkpoint CLASSIFY → current_step = VALIDATE
+  10:00:01.300  pod-a  ── OOM, pod zabity ──
+  10:02:01.300         dzierżawa wygasa (lease 2m od ostatniego checkpointu)
+  10:02:02.000  pod-b  claimNext → R (attempt 2), VALIDATE z output CLASSIFY → DECIDE → APPLY → APPLIED
+                       wywołania modelu: 1   opóźnienie: ~2 min (cena za brak sprzątania)
+</script>
+
+<h2>Idempotencja każdego kroku</h2>
+<p>Każdy krok może się wykonać więcej niż raz (przerwanie przed commitem checkpointu), czyli <dfn data-t="at-least-once">at-least-once</dfn>. <dfn data-t="idempotency">Idempotencja</dfn> oznacza, że powtórzenie daje ten sam efekt co jedno wykonanie. Problem jest tylko tam, gdzie krok zmienia coś poza <code>triage_runs</code>.</p>
+<table>
+  <tr><th>Krok</th><th>Skutek uboczny</th><th>Przy powtórzeniu</th><th>Ochrona</th></tr>
+  <tr><td>LOAD</td><td>brak</td><td>Może odczytać nowszą wersję zgłoszenia</td><td>Nowa <code>ticket_version</code> nadpisuje starą; pożądane</td></tr>
+  <tr><td>REDACT</td><td>Presidio</td><td>Ten sam wynik</td><td>Hash w checkpoincie</td></tr>
+  <tr><td>CLASSIFY</td><td>płatne wywołanie LLM</td><td>Drugi koszt, możliwy inny wynik</td><td>Checkpoint <code>RawCompletion</code>; <code>max-llm-calls-per-run</code> w <code>TriageGuard</code> liczy wpisy <code>llm_usage</code>, nie checkpointy</td></tr>
+  <tr><td>VALIDATE</td><td>Presidio</td><td>Ten sam wynik</td><td>–</td></tr>
+  <tr><td>DECIDE</td><td>wpis do kolejki przeglądu (5.3)</td><td>Druga pozycja w kolejce</td><td><code>triage_reviews.run_id</code> to PK → <code>ON CONFLICT DO NOTHING</code>, w transakcji checkpointu</td></tr>
+  <tr><td>APPLY</td><td>zmiana zgłoszenia, <code>ticket_events</code></td><td>Druga zmiana albo konflikt z własną zmianą</td><td>Wspólna transakcja z checkpointem, <code>expectedVersion</code>, sprawdzenie <code>ticket_events</code> dla <code>triageRunId</code>, indeks unikalny</td></tr>
+</table>
+<h3>APPLY w jednej transakcji ze zmianą zgłoszenia</h3>
+<p>W modularnym monolicie <code>ticket</code> i <code>assistant</code> dzielą bazę, więc zmiana zgłoszenia i checkpoint mogą się zatwierdzić atomowo. Jeśli dzierżawę przejął ktoś inny, warunkowy <code>UPDATE</code> runu zwróci 0 wierszy i wycofa także zmianę zgłoszenia. Efekt „dokładnie raz” dostajemy za darmo, bo nie ma drugiego systemu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/steps/ApplyStep.kt (odporna wersja)">
+  @Component
+  class ApplyStep(private val availability: AiAvailability, private val tickets: TicketApi) : TriageStepHandler {
+      override val step = TriageStep.APPLY
+      override val joinsCheckpointTx = true          // NOWE: advance wykona execute + checkpoint w jednej transakcji
+
+      override fun execute(run: TriageRun): StepOutcome {
+          val user = SystemUsers.triage(run.tenantId)
+          // 1) czy ten run już zastosował zmianę? (osobne transakcje, przyszła osobna usługa ticket)
+          tickets.findTriageApplied(user, run.ticketId, run.id)?.let {
+              return StepOutcome.Finish(RunStatus.APPLIED).withAppliedVersion(it.ticketVersion)
+          }
+          try { availability.requireTriageApplyAllowed() }
+          catch (e: TriageApplyDisabledException) { return StepOutcome.Finish(RunStatus.SKIPPED, e.code) }
+          val r = run.result ?: return StepOutcome.Finish(RunStatus.FAILED, "APPLY_WITHOUT_RESULT")
+          return try {
+              // fasada: TicketApi.classify z 5.1 (5.3 opakowuje ją w TriageApplier)
+              val view = tickets.classify(user, run.ticketId, WriteIntent.Classify(r.category, r.priority, r.team),
+                  expectedVersion = run.ticketVersion!!, actor = Actor.system(run.id))
+              StepOutcome.Finish(RunStatus.APPLIED).withAppliedVersion(view.version)
+          } catch (e: StaleTicketException) { StaleTriagePolicy.onStale(run) }
+            catch (e: TicketNotFoundException) { StepOutcome.Finish(RunStatus.SKIPPED, "TICKET_DELETED") }
+            catch (e: PolicyDeniedException) { StepOutcome.Finish(RunStatus.SKIPPED, "POLICY_DENIED") }
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="sql" data-title="V56 (cd.): drugi bezpiecznik w module ticket">
+  -- automatyczne zastosowanie przez run najwyżej raz; zmiany po przeglądzie (on_behalf_of, 5.3) osobno
+  CREATE UNIQUE INDEX ux_ticket_events_triage_auto ON ticket_events ((payload->>'triageRunId'))
+      WHERE type = 'TRIAGE_APPLIED' AND on_behalf_of IS NULL;
+</script>
+<p>Po co sprawdzać <code>ticket_events</code>, skoro transakcja jest wspólna? Bo bez tego bezpieczeństwo zależy od jednej adnotacji. Wystarczy <code>REQUIRES_NEW</code> w fasadzie albo wydzielenie modułu <code>ticket</code> do osobnej usługi, a powtórzony APPLY trafi na <code>StaleTicketException</code> wywołany <em>własną</em> zmianą. <code>StaleTriagePolicy</code> uzna ją za zmianę człowieka i run skończy się SKIPPED, choć zmiana została zastosowana. <code>findTriageApplied</code> rozpoznaje tę sytuację, a indeks łapie wyścig, którego sprawdzenie nie widzi.</p>
+
+<h2>Dzierżawy: długość, przedłużanie, utrata</h2>
+<p><dfn data-t="lease">Dzierżawa</dfn> z 4.2 to czasowe prawo do runu (<code>locked_until</code>). Jej długość to kompromis:</p>
+<table>
+  <tr><th>Lease</th><th>Odzysk po OOM</th><th>Ryzyko fałszywego przejęcia</th></tr>
+  <tr><td>30 s</td><td>≤ 30 s</td><td>Wysokie: CLASSIFY z timeoutem 30 s plus kolejka bulkheadu <code>triage-local</code></td></tr>
+  <tr><td>2 min (5.1)</td><td>≤ 2 min</td><td>Niskie przy krokach ≤ 60 s</td></tr>
+  <tr><td>15 min</td><td>do 15 min</td><td>Praktycznie zero, ale kwadrans bez triage po każdej awarii</td></tr>
+</table>
+<p>Najdłuższy krok: CLASSIFY z timeoutem wywołania 30 s (zadanie w tle może czekać dłużej niż czat, 1.5), na trasie lokalnej plus do 30 s oczekiwania w bulkheadzie <code>triage-local</code>. Razem ok. 60 s, połowa dzierżawy. Reguła: <strong>najdłuższy krok ≤ lease / 2</strong>, inaczej każde opóźnienie zamienia się w podwójne wykonanie.</p>
+<h3>Przedłużanie: heartbeat z limitem</h3>
+<p>Między krokami dzierżawę przedłuża checkpoint. W trakcie długiego kroku robi to <code>LeaseKeeper</code>: co <code>lease / 4</code> warunkowy <code>UPDATE</code>, czyli <dfn data-t="heartbeat">heartbeat</dfn> jak w SSE z 2.3, sygnał „żyję” w stałych odstępach.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/LeaseKeeper.kt">
+  fun <T> guard(run: TriageRun, step: () -> T): T {
+      val worker = Thread.currentThread(); val started = System.nanoTime(); val lost = AtomicBoolean(false)
+      val period = props.lease.dividedBy(4).toMillis()
+      val beat = scheduler.scheduleAtFixedRate({
+          if (Duration.ofNanos(System.nanoTime() - started) > props.maxStepDuration) {   // np. 90 s
+              metrics.stepOverrun(run.currentStep); worker.interrupt()                  // nie przedłużamy: wygaśnie
+          } else if (runs.extendLease(run.id, run.lockedBy, props.lease) == 0) {         // WHERE locked_by = :me
+              lost.set(true); metrics.leaseLost(run.currentStep); worker.interrupt()
+          }
+      }, period, period, TimeUnit.MILLISECONDS)
+      try { return step().also { if (lost.get()) throw LeaseLostException(run.id) } }
+      finally { beat.cancel(false); Thread.interrupted() }                               // czyścimy flagę przerwania
+  }
+</script>
+<ul>
+  <li><strong>Heartbeat bez limitu to pułapka.</strong> Wątek zawieszony na sockecie przedłużałby dzierżawę w nieskończoność. Po <code>max-step-duration</code> heartbeat przestaje przedłużać i przerywa wątek.</li>
+  <li><strong><code>interrupt()</code> nie przerywa blokującego I/O</strong> w klasycznym <code>java.net</code>. Pierwszą granicą są timeouty klienta HTTP i <code>statement_timeout</code> w bazie; heartbeat to druga linia.</li>
+  <li><strong>Wynik po utracie dzierżawy idzie do kosza</strong>: checkpoint zwróci 0 wierszy. Koszt jest już w <code>llm_usage</code>.</li>
+</ul>
+<h3>Token ochronny i zegar bazy</h3>
+<p><dfn data-t="fencing-token">Token ochronny</dfn> (fencing token) to wartość unikalna dla każdego przejęcia, sprawdzana przy każdym zapisie, żeby odrzucić spóźnionego poprzedniego właściciela. U nas to <code>locked_by</code>, pod warunkiem że jest unikalny <em>per przejęcie</em>: <code>"$podName/${UUID.randomUUID()}"</code>. Przy stałym <code>pod-a</code> stare i nowe przejęcie na tym samym podzie zapisywałyby sobie nawzajem checkpointy.</p>
+<p>Checkpoint celowo <strong>nie sprawdza</strong> <code>locked_until &gt; now()</code>. Dzierżawa wygasła, ale nikt jej nie przejął? Wynik jest poprawny i jedyny, więc go zapisujemy. Liczy się właściciel; zegar decyduje tylko, kiedy wolno <em>przejąć</em>.</p>
+<p><dfn data-t="clock-skew">Rozjazd zegarów</dfn> (clock skew) między maszynami to zwykle milisekundy, ale po migracji VM albo awarii NTP potrafi sięgnąć minut. Dlatego <strong>dzierżawy liczy baza</strong>, nigdy <code>Instant.now()</code> z aplikacji. W Postgresie <code>now()</code> to czas <em>początku transakcji</em>, a <code>clock_timestamp()</code> bieżący; przedłużenie z <code>now()</code> na końcu dłuższej transakcji skraca dzierżawę o czas jej trwania, stąd <code>clock_timestamp()</code> w checkpoincie i <code>extendLease</code>. Wstrzykiwany <code>Clock</code> z 1.1 zostaje dla logiki biznesowej (SLA, <code>due_at</code>), gdzie testy potrzebują stałego czasu.</p>
+
+<h2>Zdarzenia: rejestr publikacji i słuchacz, który padł</h2>
+<p>Run powstaje z <code>TicketCreated</code> przez <dfn data-t="event-publication-registry">rejestr publikacji zdarzeń</dfn> Spring Modulith (5.1). Momenty awarii:</p>
+<table>
+  <tr><th>Awaria w chwili</th><th>Co dalej</th></tr>
+  <tr><td>Przed commitem <code>TicketApi.create</code></td><td>Nic: nie ma zgłoszenia ani publikacji</td></tr>
+  <tr><td>Po commicie, przed słuchaczem</td><td>Publikacja niezakończona → ponowienie przy starcie albo jobem</td></tr>
+  <tr><td>Słuchacz padł przed <code>INSERT</code></td><td>Jak wyżej (w 2.x status FAILED)</td></tr>
+  <tr><td><code>INSERT</code> zatwierdzony, oznaczenie publikacji nie doszło</td><td>Ponowienie → <code>ON CONFLICT DO NOTHING</code>, metryka <code>duplicateEvent</code></td></tr>
+  <tr><td>Publikacja usunięta przez pomyłkę</td><td>Job uzgadniający (niżej)</td></tr>
+</table>
+<p>Słuchacz <code>@ApplicationModuleListener</code> działa we własnej transakcji, a publikacja jest oznaczana jako zakończona po jej udanym końcu. „INSERT jest, oznaczenia brak” to realny stan, więc idempotencja słuchacza jest obowiązkowa.</p>
+<p>W 1.x ponowienie przy starcie bierze <em>wszystkie</em> niezakończone publikacje, także obsługiwane właśnie przez inne repliki (pułapka z 5.1). Przy wielu replikach lepiej je wyłączyć i ponawiać jobem na jednej instancji, tylko dla publikacji starszych niż kilka minut:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageEventRecoveryJob.kt (Spring Modulith 1.1+)">
+  @Component
+  class TriageEventRecoveryJob(
+      private val incomplete: IncompleteEventPublications,   // od 1.1
+      private val locks: JobLocks,                            // pg_try_advisory_xact_lock – jedna instancja (3.5)
+  ) {
+      @Scheduled(fixedDelay = 60_000)
+      fun resubmit() = locks.runExclusive("event-resubmit") {
+          // obsługa trwa milisekundy; 5 min bez zakończenia = słuchacz padł albo instancja zginęła
+          incomplete.resubmitIncompletePublicationsOlderThan(Duration.ofMinutes(5))
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (produkcja, kilka replik)">
+  spring:
+    modulith:
+      events:
+        republish-outstanding-events-on-restart: false   # zamiast tego TriageEventRecoveryJob
+        completion-mode: UPDATE                          # zakończone zostają do diagnozy; sprzątanie jobem
+        # 2.x (sprawdź nazwy): staleness.processing → zawieszone PROCESSING oznaczane FAILED,
+        # potem FailedEventPublications.resubmit(ResubmissionOptions.defaults().withMinAge(...))
+</script>
+<p>W 2.x model jest dojrzalszy: statusy PUBLISHED, PROCESSING, COMPLETED, FAILED, RESUBMITTED, licznik <code>completionAttempts</code> zwiększany przed wywołaniem słuchacza (przetrwa awarię), monitor nieaktualności (<code>spring.modulith.events.staleness.*</code>) i <code>FailedEventPublications.resubmit(ResubmissionOptions)</code>. To nadal at-least-once, więc <code>ON CONFLICT</code> zostaje.</p>
+<p><strong>Ostatnia linia: job uzgadniający.</strong> Rejestr nie chroni przed błędem konfiguracji (słuchacz wyłączony profilem, publikacje usunięte ręcznie). Co 10 minut tani <code>SELECT</code> szuka zgłoszeń sprzed 10–60 minut w tenantach z <code>ai_triage_mode &lt;&gt; 'OFF'</code> bez runu LIVE i woła dla nich <code>TriageTrigger.on(...)</code>. Metryka <code>helpdesk.triage.reconciled</code> &gt; 0 to błąd w łańcuchu zdarzeń do zbadania.</p>
+
+<h2>Graceful shutdown: Spring Boot i workery</h2>
+<p><dfn data-t="graceful-shutdown">Graceful shutdown</dfn> to zamknięcie, w którym aplikacja przestaje przyjmować nową pracę, kończy rozpoczętą w wyznaczonym czasie i dopiero wtedy się wyłącza. <code>server.shutdown=graceful</code> (od Spring Boot 3.4 domyślne, wcześniej trzeba je ustawić) obejmuje serwer WWW: żądania w toku się kończą, nowe są odrzucane. Kontekst zamyka się fazami <code>SmartLifecycle</code>, każda z limitem <code>spring.lifecycle.timeout-per-shutdown-phase</code> (domyślnie 30 s; sprawdź w swojej wersji).</p>
+<p>Serwer WWW nie wie o wątkach workera: pula zostałaby zamknięta razem z kontekstem, a <code>DataSource</code> pod działającym krokiem. Worker uczestniczy więc w cyklu życia sam. Beany z wyższą fazą (<code>getPhase()</code>) zatrzymują się wcześniej, a <code>DataSource</code> jest niszczony po wszystkich fazach.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageWorker.kt (cykl życia, fragment)">
+  @Component
+  class TriageWorker(/* runs, workflow, props, metrics */) : SmartLifecycle {
+      private val accepting = AtomicBoolean(false)
+      private val inFlight = ConcurrentHashMap<UUID, Pair<Future<*>, String>>()   // runId → (zadanie, locked_by)
+
+      override fun start() = accepting.set(true)
+      override fun isRunning() = accepting.get() || inFlight.isNotEmpty()
+      override fun getPhase() = SmartLifecycle.DEFAULT_PHASE - 512               // przed serwerem WWW
+
+      @Scheduled(fixedDelayString = "\${helpdesk.triage.poll-interval:1s}")
+      fun poll() {
+          while (accepting.get() && inFlight.size < props.workers) {
+              val claim = "${props.podName}/${UUID.randomUUID()}"               // token ochronny per przejęcie
+              val run = runs.claimNext(claim, props.lease, props.perTenantConcurrency) ?: return
+              inFlight[run.id] = pool.submit { process(run) } to claim
+          }
+      }
+
+      override fun stop(callback: Runnable) {
+          accepting.set(false)                                                   // 1) żadnych nowych przejęć
+          val deadline = System.nanoTime() + props.drainTimeout.toNanos()        // np. 20 s < 30 s fazy
+          while (inFlight.isNotEmpty() && System.nanoTime() < deadline) Thread.sleep(100)   // 2) dokończ krok
+          inFlight.forEach { (runId, p) -> p.first.cancel(true); runs.release(runId, p.second) }   // 3) oddaj
+          pool.shutdown(); callback.run()
+      }
+      // process(): while (workflow.advance(run) && accepting.get()) run = reloadAndExtend(...);
+      // przy zamykaniu kończy na granicy kroku i woła runs.release(run.id, run.lockedBy)
+  }
+</script>
+<script type="text/x-code" data-lang="sql" data-title="TriageRunRepository.release – oddanie bez spalania próby">
+  UPDATE triage_runs
+     SET status = 'PENDING', locked_by = NULL, locked_until = NULL,
+         next_attempt_at = clock_timestamp(),      -- inna instancja może wziąć od razu
+         attempt = greatest(attempt - 1, 0),       -- oddanie przy zamykaniu nie jest nieudaną próbą
+         updated_at = clock_timestamp()
+   WHERE id = :runId AND locked_by = :me AND status = 'RUNNING';
+</script>
+<p>Bez <code>attempt - 1</code> każdy deploy zużywałby próbę runom w toku: pięć deployów w czasie awarii dostawcy i run kończy się FAILED, choć nigdy nie zawiódł. Wyzerowana dzierżawa sprawia, że nowa instancja przejmuje run od razu, a nie po 2 minutach.</p>
+<p><strong>Anulowanie wywołania LLM w toku</strong> oszczędza mniej, niż się wydaje. Dostawca zwykle przetworzył już wejście (w triage 1600 tokenów wejścia wobec 40 wyjścia), a to, czy po zerwaniu połączenia przestanie naliczać, zależy od dostawcy i LiteLLM (sprawdź). Przy p95 CLASSIFY ok. 1,2 s (Globex 3,9 s) <code>drainTimeout</code> 20 s pozwala dokończyć prawie wszystkie wywołania; przerywamy tylko ogon czekający na timeout. W czacie (2.3) było odwrotnie: „Zatrzymaj” ucina długą generację, płatną od tokenu wyjścia.</p>
+
+<h2>Kubernetes: preStop i terminationGracePeriodSeconds</h2>
+<p>Przy usuwaniu poda Kubernetes równolegle zdejmuje go z endpointów Service i wywołuje hook <code>preStop</code>; SIGTERM przychodzi po jego zakończeniu. Odliczanie <code>terminationGracePeriodSeconds</code> (domyślnie 30 s) startuje <strong>przed</strong> <code>preStop</code>, a po nim przychodzi SIGKILL.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="budżet zamykania poda">
+  t=0      Terminating: zdjęcie z endpointów (asynchronicznie) + preStop sleep 10 s
+  t=10     SIGTERM → Spring zamyka kontekst
+  t=10–30  faza TriageWorker: drainTimeout 20 s
+  t=30–40  faza serwera WWW (fazy idą po kolei), DataSource, koniec JVM
+  t=60     terminationGracePeriodSeconds → SIGKILL           zapas ≈ 20 s
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="k8s/helpdesk-deployment.yaml (fragment)">
+  spec:
+    strategy:
+      rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+    template:
+      spec:
+        terminationGracePeriodSeconds: 60
+        containers:
+          - name: helpdesk
+            env:
+              - { name: JAVA_TOOL_OPTIONS, value: "-XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=75" }
+              - { name: HELPDESK_TRIAGE_POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+              - { name: SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE, value: "30s" }
+            lifecycle:
+              preStop:
+                exec: { command: ["sh", "-c", "sleep 10"] }   # nowsze klastry mają akcję sleep – sprawdź wersję
+</script>
+<ul>
+  <li><strong><code>-XX:+ExitOnOutOfMemoryError</code></strong> zamienia OOM w szybkie zakończenie i restart kontenera. Bez niej JVM potrafi żyć z martwymi wątkami workera.</li>
+  <li><strong>OOM i SIGKILL omijają graceful shutdown.</strong> Ratuje wtedy tylko wygaśnięcie dzierżawy. Graceful shutdown skraca odzysk przy deployu z 2 min do sekund, dzierżawa gwarantuje odzysk zawsze.</li>
+  <li>Docker Compose daje domyślnie 10 s do SIGKILL, a IDE często zabija proces bez SIGTERM. Testuj na prawdziwym SIGTERM.</li>
+</ul>
+
+<h2>Utrata bazy, failover i zawieszony worker</h2>
+<p>CLASSIFY się skończył, odpowiedź jest w pamięci, a checkpoint rzuca wyjątek połączenia. Rezygnacja od razu to drugie wywołanie modelu, więc zapis ponawiamy w pamięci kilka razy, mieszcząc się w dzierżawie:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageRunStore.checkpointWithRetry i DbErrors">
+  fun checkpointWithRetry(run: TriageRun, outcome: StepOutcome, started: Instant) {
+      for (delay in listOf(200L, 1_000L, 3_000L, 8_000L, -1L)) {        // łącznie ~12 s ≪ lease 2 min
+          try { return checkpoint(run, outcome, started) }
+          catch (e: LeaseLostException) { throw e }
+          catch (e: DataAccessException) {
+              if (!DbErrors.isTransient(e) || delay < 0) throw e          // dzierżawa wygaśnie, krok się powtórzy
+              metrics.checkpointRetry(run.currentStep); Thread.sleep(delay + Random.nextLong(delay / 2))
+          }
+      }
+  }
+
+  object DbErrors {   // 08xxx połączenie, 25006 read-only po failoverze, 57P01 admin shutdown, 40001/40P01 konflikty
+      private val transient = setOf("25006", "57P01", "57P02", "57P03", "40001", "40P01")
+      fun isTransient(e: Throwable) = sqlState(e)?.let { it.startsWith("08") || it in transient } ?: (e is TransientDataAccessException)
+      fun sqlState(e: Throwable) = generateSequence(e) { it.cause }.filterIsInstance<SQLException>().firstOrNull()?.sqlState
+  }
+</script>
+<ul>
+  <li><strong>Failover.</strong> Część połączeń w puli Hikari może wskazywać stary węzeł; zapis kończy się kodem <code>25006</code>. Krok nie zawiódł, zawiodła baza. Sterownik PostgreSQL z wieloma hostami ma <code>targetServerType=primary</code>, usługi zarządzane przełączają DNS; ustaw rozsądne <code>maxLifetime</code> w Hikari.</li>
+  <li><strong>Pauza przejmowania.</strong> Gdy sam <code>claimNext</code> rzuca błąd bazy, <code>poll</code> wycofuje się z backoffem (do 30 s) i zgłasza health „degraded”, zamiast tworzyć <dfn data-t="retry-storm">burzę ponowień</dfn> z każdej repliki.</li>
+  <li><strong>Zawieszony worker</strong> żyje, ale nie robi postępu. Obrona warstwowa: timeouty klienta HTTP, <code>statement_timeout</code> (np. 10 s dla workera), <code>max-step-duration</code>, a w panelu „RUNNING bez zmiany <code>updated_at</code> od 10 min”. Zrzut wątków (<code>jcmd &lt;pid&gt; Thread.print</code>) pokaże, na czym wisi.</li>
+</ul>
+
+<h2>Retry: klasyfikacja błędów i poison message</h2>
+<p>5.1 rozróżnia tylko „przejściowy wyjątek → Retry”. Na produkcji potrzebne są klasy, które różnią się tym, czy powtórzenie ma sens i czy ma <em>zużywać próbę</em>:</p>
+<table>
+  <tr><th>Błąd</th><th>Klasa</th><th>Akcja</th></tr>
+  <tr><td>429 (<code>LlmRateLimitedException</code> z 1.5), 5xx, timeout, Presidio, błąd przejściowy bazy</td><td>przejściowy</td><td><code>Retry</code> z backoffem, ≥ <code>Retry-After</code>; zużywa próbę</td></tr>
+  <tr><td>Breaker <code>llm</code> otwarty, 401/403 z LiteLLM (zły klucz)</td><td>systemowy</td><td><code>Retry(countsAsAttempt = false)</code>; alert usługi</td></tr>
+  <tr><td>Za długi kontekst, wynik nieważny po naprawie (5.2)</td><td>trwały</td><td><code>Finish(FAILED)</code>; powtórzenie da to samo</td></tr>
+  <tr><td>Kill switch, polityka, zgłoszenie zamknięte lub usunięte</td><td>decyzja</td><td><code>Finish(SKIPPED)</code></td></tr>
+  <tr><td>Nieznany wyjątek (NPE, mapowanie)</td><td>błąd kodu</td><td><code>Retry</code> zużywający próbę; po <code>max-attempts</code> FAILED i alert</td></tr>
+</table>
+<p>Klasa systemowa jest kluczowa: zły klucz albo otwarty breaker to awaria <em>wszystkich</em> runów naraz. Gdyby próby się liczyły, godzinna awaria dostawcy zamieniłaby 2000 runów w FAILED i zalała kolejkę ręczną. Rozszerzamy <code>StepOutcome.Retry</code> z 5.1:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="StepOutcome.Retry (rozszerzenie), klasyfikator i backoff">
+  data class Retry(val errorCode: String,
+                   val countsAsAttempt: Boolean = true,   // NOWE: false dla awarii systemowych
+                   val notBefore: Duration? = null) : StepOutcome   // NOWE: np. Retry-After
+
+  fun classify(e: Throwable): StepOutcome = when (e) {
+      is LlmRateLimitedException -> Retry("LLM_RATE_LIMITED", notBefore = e.retryAfter)
+      is CallNotPermittedException -> Retry("LLM_BREAKER_OPEN", countsAsAttempt = false, notBefore = Duration.ofSeconds(30))
+      is LlmAuthException -> Retry("LLM_AUTH", countsAsAttempt = false, notBefore = Duration.ofMinutes(5))
+      is LlmBadRequestException -> Finish(RunStatus.FAILED, "TRIAGE_INPUT_REJECTED")
+      is TicketNotFoundException -> Finish(RunStatus.SKIPPED, "TICKET_DELETED")
+      is LlmUnavailableException, is TransientAiException, is PiiGuardUnavailableException -> Retry("TRANSIENT")
+      else -> Retry(if (DbErrors.isTransient(e)) "DB_TRANSIENT" else "UNEXPECTED")
+  }
+
+  /** Full jitter: losowo z [0, min(cap, base · 2^(n−1))], nie mniej niż Retry-After. */
+  fun backoff(attempt: Int, notBefore: Duration?, base: Duration = Duration.ofSeconds(10), cap: Duration = Duration.ofMinutes(10)): Duration {
+      val exp = base.multipliedBy(1L shl (attempt - 1).coerceIn(0, 16)).coerceAtMost(cap)
+      return maxOf(Duration.ofMillis(Random.nextLong(exp.toMillis() + 1)), notBefore ?: Duration.ZERO)
+  }
+</script>
+<p><dfn data-t="backoff">Backoff z jitterem</dfn> z 1.5 rozprasza ponowienia: bez losowości 2000 runów odrzuconych o 10:00 wróciłoby razem o 10:00:10, 10:00:30… Opóźnienie trafia do <code>next_attempt_at</code> (w SQL od <code>clock_timestamp()</code>), dzierżawa jest zwalniana, więc czekający run nie zajmuje wątku. Przy <code>countsAsAttempt = false</code> checkpoint robi <code>attempt - 1</code> jak <code>release</code>, a <code>claimNext</code> przy otwartym breakerze pomija runy z <code>current_step = 'CLASSIFY'</code>: nie ma sensu przejmować runu, żeby go oddać.</p>
+<h3>Poison message i pętla awarii</h3>
+<p><dfn data-t="poison-message">Poison message</dfn> to zadanie, które przy każdej próbie kończy się błędem albo awarią procesu i bez limitu blokowałoby kolejkę na zawsze. Zwykły przypadek łapie <code>max-attempts</code>: FAILED z <code>RETRIES_EXHAUSTED</code>, zgłoszenie w kolejce ręcznej, alert do właściciela triage (nie do dyżuru SLA). Trudniejszy to run, który <em>zabija workera</em>: 50 MB logów wklejonych w opis daje OOM w REDACT, przed checkpointem, więc <code>advance</code> nie widzi wyjątku. <code>claimNext</code> zwiększa jednak <code>attempt</code> przy każdym przejęciu i ma warunek <code>attempt &lt; :maxAttempts</code>:</p>
+<script type="text/x-code" data-lang="sql" data-title="TriageExpiryJob (co minutę, app.system_job)">
+  -- przejmowany max-attempts razy i za każdym razem porzucony = CRASH_LOOP
+  UPDATE triage_runs SET status = 'FAILED', error_code = 'CRASH_LOOP', locked_by = NULL, locked_until = NULL,
+         finished_at = clock_timestamp(), updated_at = clock_timestamp()
+   WHERE status = 'RUNNING' AND attempt >= :maxAttempts AND locked_until < clock_timestamp()
+  RETURNING id, tenant_id, current_step;                -- alert z krokiem, w którym ginie
+
+  -- bez triage dłużej niż expire-after (24 h): zgłoszenie i tak jest w zwykłej kolejce
+  UPDATE triage_runs SET status = 'EXPIRED', error_code = 'EXPIRED', locked_by = NULL, locked_until = NULL,
+         finished_at = clock_timestamp(), updated_at = clock_timestamp()
+   WHERE status IN ('PENDING','RUNNING') AND created_at < clock_timestamp() - :expireAfter::interval
+     AND (locked_until IS NULL OR locked_until < clock_timestamp());
+</script>
+<p>Pierwszą obroną są limity wejścia (opis przycinany w LOAD, jak <code>max-chunks-per-document</code> w 4.2); <code>CRASH_LOOP</code> łapie to, czego limity nie przewidziały.</p>
+
+<h2>Deploy z nową wersją kodu w trakcie runów</h2>
+<p>Przy rolling deployu przez kilka minut działają dwie wersje kodu, a run może zacząć się na starej i skończyć na nowej (albo odwrotnie przy wycofaniu).</p>
+<table>
+  <tr><th>Element</th><th>Ryzyko</th><th>Zasada</th></tr>
+  <tr><td>Format <code>triage_steps.output</code></td><td>Kod nie odczyta checkpointu innej wersji</td><td>Pole <code>"v"</code>, odczyt tolerancyjny, nowe pola opcjonalne</td></tr>
+  <tr><td>Nowy krok, nowa wartość enuma</td><td>Stary pod przejmuje run z nieznanym <code>current_step</code></td><td><code>claimNext ... AND current_step = ANY(:supportedSteps)</code></td></tr>
+  <tr><td>Konfiguracja</td><td>Run zaczęty na <code>triage/v1</code> kończony na v2</td><td><code>config_version</code> w runie (5.4); stare wersje w rejestrze, dopóki są runy w toku</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/StepOutputCodec.kt (fragment)">
+  fun <T : Any> read(json: JsonNode, type: KClass<T>): T {        // reader z FAIL_ON_UNKNOWN_PROPERTIES = false
+      val v = json["v"]?.asInt() ?: 1
+      val upgraded = when {                                         // migracja formatu przy odczycie, nie w bazie
+          type == RawCompletion::class && v == 1 -> (json as ObjectNode).apply { putIfAbsent("refusal", NullNode.instance) }
+          v > CURRENT.getValue(type) -> throw UnsupportedCheckpointException(type, v)   // nowszy niż znam: oddaj run
+          else -> json
+      }
+      return reader.treeToValue(upgraded, type.java)
+  }
+</script>
+<p><code>UnsupportedCheckpointException</code> to awaria systemowa (<code>countsAsAttempt = false</code>): stary pod oddaje run nowemu. To <dfn data-t="expand-contract">expand/contract</dfn>: najpierw wdrażasz kod, który <em>czyta</em> oba formaty, potem kod, który <em>pisze</em> nowy, a stary odczyt usuwasz, gdy w bazie nie ma runów w toku ze starym formatem. Konfiguracji nie podmieniamy w locie: jeśli wersja z <code>config_version</code> została wycofana z rejestru, run kończy się SKIPPED z <code>CONFIG_RETIRED</code>, bo ciche przejście na nową wersję zepsułoby porównania shadow i audyt (5.4).</p>
+
+<h2>Obserwowalność: metryki, trace, runy utknięte</h2>
+<table>
+  <tr><th>Metryka</th><th>Alert (przykład)</th></tr>
+  <tr><td><code>helpdesk.triage.runs{status}</code> (gauge z zapytania co 30 s)</td><td>FAILED &gt; 5% zakończonych w godzinie</td></tr>
+  <tr><td><code>helpdesk.triage.pending.oldest.age</code></td><td>&gt; 15 min przez 10 min: kolejka stoi albo workery nie żyją</td></tr>
+  <tr><td><code>helpdesk.triage.retries{step,error}</code></td><td>Wzrost <code>LLM_AUTH</code>, <code>LLM_BREAKER_OPEN</code> → alert usługi</td></tr>
+  <tr><td><code>helpdesk.triage.lease.lost{step}</code>, <code>…lease.released</code></td><td><code>lease.lost</code> &gt; 0 poza deployami: za krótki lease albo zawieszone kroki</td></tr>
+  <tr><td><code>helpdesk.triage.resumed{step}</code></td><td>Obserwacja: ile runów wznowiono i od którego kroku</td></tr>
+  <tr><td><code>helpdesk.triage.step.duration{step}</code> (<dfn data-t="histogram">histogram</dfn>)</td><td>p99 CLASSIFY &gt; lease / 2</td></tr>
+  <tr><td><code>helpdesk.triage.llm.calls.per.run</code></td><td>Średnia &gt; 1,1: powtórzenia po awariach albo naprawy</td></tr>
+</table>
+<p>Tagi mają niską <dfn data-t="cardinality">kardynalność</dfn>; <code>run_id</code> i <code>tenant_id</code> trafiają tylko do trace'ów i logów.</p>
+<h3>Trace przez kroki i restarty</h3>
+<p>Run po awarii trwa minuty i wykonują go różne pody, więc jeden span nadrzędny nie ma sensu (który proces miałby go zamknąć?). Każde wykonanie kroku to osobny trace z atrybutem <code>triage.run_id</code>, połączony z żądaniem, które utworzyło zgłoszenie, przez <dfn data-t="span-link">span link</dfn>: odnośnik do spanu powiązanego przyczynowo, który nie jest rodzicem. Kontekst w formacie <dfn data-t="traceparent">traceparent</dfn> zapisujemy w <code>triage_runs.trace_parent</code> przy INSERT w słuchaczu (o ile kontekst dotarł do wątku <code>@Async</code>; po ponowieniu publikacji go nie ma i to jest w porządku).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageTracing.kt (OpenTelemetry API; sprawdź w swojej wersji)">
+  fun <T> step(run: TriageRun, body: () -> T): T {
+      val builder = tracer.spanBuilder("triage.step ${run.currentStep}").setNoParent()
+          .setAttribute("triage.run_id", run.id.toString())
+          .setAttribute("triage.attempt", run.attempt.toLong())
+          .setAttribute("helpdesk.config.version", run.configVersion)
+      run.traceParent?.let { tp ->                              // W3CTraceContextPropagator.getInstance()
+          val ctx = propagator.extract(Context.root(), mapOf("traceparent" to tp), MapGetter)
+          Span.fromContext(ctx).spanContext.takeIf { it.isValid }?.let { builder.addLink(it) }
+      }
+      val span = builder.startSpan()
+      return try { span.makeCurrent().use { body() } }
+             catch (e: Throwable) { span.recordException(e); span.setStatus(StatusCode.ERROR); throw e }
+             finally { span.end() }
+  }
+</script>
+<p>W Tempo czy Jaegerze wyszukujesz po <code>triage.run_id</code> i widzisz kroki z różnych podów; próba przerwana OOM nie ma spanu, co samo jest informacją. Spany <code>gen_ai.*</code> z 1.4 są dziećmi spanu kroku. Micrometer Tracing też obsługuje linki.</p>
+<h3>Panel „runy utknięte” i akcje admina</h3>
+<script type="text/x-code" data-lang="sql" data-title="TriageAdminQueries.stuck (ADMIN)">
+  SELECT id, ticket_id, tenant_id, status, current_step, attempt, error_code, locked_by, updated_at,
+         CASE WHEN status = 'PENDING'               THEN 'NOT_PICKED_UP'
+              WHEN locked_until < clock_timestamp() THEN 'LEASE_EXPIRED_NOT_TAKEN'
+              ELSE 'NO_PROGRESS' END AS reason
+    FROM triage_runs
+   WHERE (status = 'PENDING' AND next_attempt_at < clock_timestamp() - interval '15 minutes')
+      OR (status = 'RUNNING' AND locked_until < clock_timestamp() - interval '5 minutes')
+      OR (status = 'RUNNING' AND updated_at  < clock_timestamp() - interval '10 minutes')
+   ORDER BY created_at LIMIT 200;
+</script>
+<table>
+  <tr><th>Endpoint</th><th>Działanie</th></tr>
+  <tr><td><code>GET /api/admin/triage/runs?state=stuck|failed&amp;tenantId=…</code></td><td>Lista z powodem i kodem błędu; szczegóły <code>GET …/{runId}</code> z krokami (bez treści) i linkiem do trace; 404 <code>triage-run-not-found</code></td></tr>
+  <tr><td><code>POST /api/admin/triage/runs/{runId}/retry</code></td><td>FAILED/EXPIRED → PENDING, <code>attempt = 0</code>, krok po ostatnim OK checkpoincie albo LOAD (<code>fromStart: true</code>); inny stan → 409 <code>triage-run-not-retryable</code></td></tr>
+  <tr><td><code>POST /api/admin/triage/runs/{runId}/cancel</code></td><td>PENDING/RUNNING → SKIPPED <code>CANCELLED_BY_ADMIN</code>, <code>locked_by = NULL</code></td></tr>
+</table>
+<p>Akcje wymagają roli ADMIN i pola <code>reason</code>, a trafiają do <code>assistant_audit</code> (3.6) jako <code>AuditEvent</code> (<code>TRIAGE_RUN_RETRIED</code>, <code>TRIAGE_RUN_CANCELLED</code>). Anulowanie RUNNING nie musi zatrzymywać workera: zdjęty <code>locked_by</code> sprawi, że jego checkpoint dostanie <code>LeaseLostException</code>. Ponowienie EXPIRED po godzinach przechodzi przez LOAD i <code>StaleTriagePolicy</code>, więc nie nadpisze klasyfikacji człowieka.</p>
+
+<h2>Własny workflow czy silnik workflow</h2>
+<p>Zbudowaliśmy mały silnik <dfn data-t="durable-execution">trwałego wykonania</dfn> (durable execution): proces, którego postęp jest zapisywany tak, że po awarii wykonanie wznawia się od miejsca przerwania. Gotowe narzędzia robią to ogólniej:</p>
+<table>
+  <tr><th>Narzędzie</th><th>Model</th><th>Mocne strony</th><th>Koszt</th></tr>
+  <tr><td>Własny na Postgresie</td><td>Tabela runów, kroki, dzierżawy</td><td>Zero nowej infrastruktury, transakcja ze zmianą domeny, RLS</td><td>Timery, kompensacje, wersjonowanie i panel piszesz sam</td></tr>
+  <tr><td>Temporal</td><td>Kod workflow odtwarzany z historii zdarzeń; aktywności z retry i timeoutami</td><td>Procesy dni i miesięcy, timery, sygnały, sagi, wiele usług</td><td>Klaster lub chmura; kod workflow musi być deterministyczny; wersjonowanie workflow to osobna umiejętność</td></tr>
+  <tr><td>Camunda</td><td>BPMN: proces jako diagram, zadania użytkownika</td><td>Procesy biznesowe z ludźmi, czytelne dla analityków</td><td>Osobny silnik; wersje 7 i 8 różnią się architekturą i licencją (sprawdź)</td></tr>
+  <tr><td>Spring Statemachine</td><td>Biblioteka maszyn stanów z opcjonalnym zapisem stanu</td><td>Złożone przejścia, strażnicy</td><td>Nie jest kolejką ani silnikiem wznawiania; dzierżawy i ponowienia po Twojej stronie</td></tr>
+  <tr><td>Spring Batch</td><td>Joby z krokami i partiami, restart od kroku</td><td>Wsad, np. przeliczenie 40 tys. historycznych zgłoszeń</td><td>Nie pasuje do pojedynczych zdarzeń w czasie rzeczywistym</td></tr>
+</table>
+<p>Własny workflow wystarcza, gdy kroków jest kilka i są liniowe, proces mieści się w jednym serwisie i jednej bazie, trwa sekundy do minut, a czekanie na człowieka da się wyrazić stanem (WAITING_REVIEW) i jobem wygaszającym. Silnik zaczyna się opłacać przy <strong>procesach trwających dni</strong> z wieloma timerami („przypomnij po 3 dniach, eskaluj po 5”), przy <strong>kompensacjach</strong>, czyli <dfn data-t="saga">sadze</dfn> (ciągu lokalnych transakcji w różnych systemach, w którym błąd późniejszego kroku uruchamia akcje cofające wcześniejsze), przy <strong>wielu usługach</strong> z własnymi bazami (tracisz wspólną transakcję z APPLY) albo dziesiątkach procesów, dla których ręczny panel i wersjonowanie kosztują więcej niż silnik. Triage jest daleko od tej granicy; reklamacja z korektą faktury w ERP, zwrotem płatności i powiadomieniem klienta byłaby po drugiej stronie.</p>
+
+<h2>Testy: zabij worker, dwa workery, shutdown, chaos</h2>
+<p>Każdy wiersz tabeli awarii powinien mieć test. Awarię procesu symuluje wstrzykiwany punkt, który rzuca <code>Error</code>, nie <code>Exception</code>: nie łapie go żaden <code>catch</code> w workflow, tak jak nic nie złapie SIGKILL.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageResumeIT.kt">
+  @SpringBootTest(properties = ["helpdesk.triage.lease=2s", "helpdesk.triage.max-step-duration=1s"])
+  @Testcontainers
+  class TriageResumeIT(/* trigger, worker, runs, tickets, crash: CrashPoints (profil testowy) */) {
+      @MockitoBean lateinit var classifier: TriageClassifier
+
+      @Test
+      fun `awaria po checkpoincie CLASSIFY - wznowienie bez drugiego wywolania modelu`() {
+          val t = tickets.createInAutoMode(ACME, "Faktura za październik naliczona podwójnie")
+          whenever(classifier.classify(any(), any())).thenReturn(hd3001Response())
+          crash.after(TriageStep.CLASSIFY)                      // SimulatedCrash : Error po commicie checkpointu
+          trigger.on(TicketCreated(t.id, ACME, NOW))
+          assertThrows<SimulatedCrash> { worker.drainOnceForTest() }
+          assertThat(runs.liveRun(t.id)!!.currentStep).isEqualTo(TriageStep.VALIDATE)
+
+          crash.clear()
+          await().atMost(Duration.ofSeconds(10)).untilAsserted {   // lease 2 s, potem przejęcie
+              worker.drainOnceForTest()
+              assertThat(runs.liveRun(t.id)!!.status).isEqualTo(RunStatus.APPLIED)
+          }
+          verify(classifier, times(1)).classify(any(), any())
+      }
+
+      @Test
+      fun `dwa workery i wygasla dzierzawa - jedna zmiana zgloszenia`() {
+          val t = tickets.createInAutoMode(ACME); val gate = CountDownLatch(1)
+          whenever(classifier.classify(any(), any())).thenAnswer { gate.await(); hd3001Response() }
+          trigger.on(TicketCreated(t.id, ACME, NOW))
+          val a = runs.claimForTest("pod-a/1")!!
+          val futureA = CompletableFuture.supplyAsync { runCatching { worker.processForTest(a) } }
+          runs.expireLeaseForTest(a.id)
+          val b = runs.claimForTest("pod-b/1")!!
+          gate.countDown(); worker.processForTest(b)
+
+          assertThat(futureA.get().exceptionOrNull()).isInstanceOf(LeaseLostException::class.java)
+          assertThat(tickets.events(t.id).count { it.type == "TRIAGE_APPLIED" }).isEqualTo(1)
+      }
+  }
+</script>
+<p>Dopisz: <strong>graceful shutdown</strong> (własny kontekst przez <code>SpringApplicationBuilder</code>, atrapa modelu dłuższa niż <code>drainTimeout</code>, <code>context.close()</code>; run ma być PENDING, bez <code>locked_by</code>, z <code>attempt = 0</code>) i <strong>podwójne zdarzenie</strong> (obsługa, potem <code>resubmitIncompletePublications { true }</code> i jeszcze raz <code>trigger.on</code>; dokładnie jeden run LIVE, uzupełnienie testu z 5.1).</p>
+<h3>Test chaosu z Toxiproxy</h3>
+<p><dfn data-t="chaos-testing">Testy chaosu</dfn> celowo wprowadzają awarie infrastruktury i sprawdzają, czy system dochodzi do poprawnego stanu. Moduł Testcontainers <code>toxiproxy</code> stawia proxy TCP między aplikacją a Postgresem, sterowane z testu:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageChaosIT.kt (Testcontainers Toxiproxy; sprawdź API swojej wersji)">
+  companion object {
+      val network: Network = Network.newNetwork()
+      @Container @JvmStatic val postgres = PostgreSQLContainer(PG_IMAGE).withNetwork(network).withNetworkAliases("postgres")
+      @Container @JvmStatic val toxiproxy = ToxiproxyContainer("ghcr.io/shopify/toxiproxy:2.5.0").withNetwork(network)
+      lateinit var pg: Proxy
+
+      @DynamicPropertySource @JvmStatic
+      fun props(r: DynamicPropertyRegistry) {
+          pg = ToxiproxyClient(toxiproxy.host, toxiproxy.controlPort).createProxy("pg", "0.0.0.0:8666", "postgres:5432")
+          r.add("spring.datasource.url") { "jdbc:postgresql://${toxiproxy.host}:${toxiproxy.getMappedPort(8666)}/${postgres.databaseName}" }
+      }
+  }
+
+  @Test
+  fun `zerwane polaczenie z baza w chwili checkpointu CLASSIFY - run konczy sie APPLIED`() {
+      whenever(classifier.classify(any(), any())).thenAnswer {
+          pg.toxics().bandwidth("cut-down", ToxicDirection.DOWNSTREAM, 0)    // baza „znika” po odpowiedzi modelu
+          pg.toxics().bandwidth("cut-up", ToxicDirection.UPSTREAM, 0)
+          scheduler.schedule({ pg.toxics().get("cut-down").remove(); pg.toxics().get("cut-up").remove() }, 4, SECONDS)
+          hd3001Response()
+      }
+      val t = tickets.createInAutoMode(ACME); trigger.on(TicketCreated(t.id, ACME, NOW))
+      await().atMost(Duration.ofSeconds(30)).until { runs.liveRun(t.id)?.status == RunStatus.APPLIED }
+      verify(classifier, atMost(2)).classify(any(), any())                   // 1, gdy ponowienie zapisu zdążyło
+  }
+</script>
+<p>Warianty: toxic <code>latency</code> 3 s (czy działają <code>statement_timeout</code> i <code>max-step-duration</code>), zerwanie w trakcie transakcji APPLY (zgłoszenie nie może się zmienić bez checkpointu), <code>25006</code> przez <code>default_transaction_read_only</code> na roli testowej. Raz na kwartał <dfn data-t="game-day">game day</dfn> na stagingu: <code>kubectl delete pod</code> w trakcie importu 2000 zgłoszeń, potem porównanie liczby runów zakończonych z liczbą zgłoszeń i wywołań w <code>llm_usage</code> z liczbą runów.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Zachowanie</th></tr>
+  <tr><td>Zgłoszenie usunięte w trakcie runu</td><td>LOAD lub APPLY: <code>TicketNotFoundException</code> → SKIPPED <code>TICKET_DELETED</code>. Przy usunięciu na żądanie RODO (2.5) run i <code>triage_steps</code> usuwa ten sam proces co dane zgłoszenia.</td></tr>
+  <tr><td>Tenant przełączony na OFF w trakcie</td><td><code>TriageGuard</code> czyta bieżący tryb przed każdym krokiem: run kończy się SKIPPED przed CLASSIFY albo przed APPLY. Wcześniej zastosowana zmiana zostaje; przeglądy wygasa 5.3 (<code>MODE_CHANGED</code>).</td></tr>
+  <tr><td>Skok zegara poda, zmiana strefy lub czasu letniego</td><td>Dzierżawy, <code>next_attempt_at</code> i <code>expire-after</code> liczy baza na <code>timestamptz</code>; backoff to <code>Duration</code> dodawana w SQL.</td></tr>
+  <tr><td>Failover na węzeł z przesuniętym zegarem</td><td>Sekundy przy lease 2 min bez znaczenia; minuty mogą zmienić długość dzierżaw, ale token w <code>locked_by</code> nie dopuści do podwójnego zapisu, najwyżej do podwójnego wywołania modelu.</td></tr>
+  <tr><td>Baza tylko do odczytu</td><td><code>25006</code>: Retry przejściowy, <code>poll</code> z backoffem, health „degraded”. Wyniki modelu z tego okna przepadają; koszt widać w <code>llm_usage</code> albo w metrykach LiteLLM.</td></tr>
+  <tr><td>Odpowiedź modelu po utracie dzierżawy</td><td>Checkpoint → 0 wierszy → wynik odrzucony; <code>lease.lost{step="CLASSIFY"}</code>, podwójny koszt widoczny w <code>llm.calls.per.run</code>.</td></tr>
+  <tr><td>Restart wszystkich podów naraz</td><td>Nowe zgłoszenia idą od razu; przerwane runy wracają po wygaśnięciu dzierżaw (≤ 2 min), z priorytetem importu i limitem per tenant z 5.1.</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Dla każdej linijki <code>TriageWorkflow.advance</code> i <code>ApplyStep.execute</code> zapisz: co jest w bazie, jeśli proces zginie zaraz po niej, kto podejmie run i ile będzie wywołań modelu. Znajdź miejsce, gdzie odpowiedź brzmi „dwa”.</li>
+  <li>Zaimplementuj <code>CrashPoints</code> i test „zabij po CLASSIFY”. Potem przenieś zapis <code>llm_usage</code> do transakcji checkpointu i sprawdź, czego przy awarii nie widać w kosztach.</li>
+  <li>Ustaw lease 5 s, atrapę modelu 8 s i uruchom dwa workery; zmierz <code>lease.lost</code> i wywołania modelu, potem dodaj <code>LeaseKeeper</code>. Na koniec zawieś atrapę na zawsze i sprawdź, że <code>max-step-duration</code> uwalnia run.</li>
+  <li>Złóż budżet zamykania dla swojego klastra (<code>preStop</code>, fazy Springa, <code>drainTimeout</code>, <code>terminationGracePeriodSeconds</code>) i zweryfikuj go SIGTERM-em w trakcie importu, licząc runy oddane (<code>lease.released</code>) i wznowione po wygaśnięciu (<code>resumed</code>).</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego CLASSIFY zapisuje w checkpoincie surową odpowiedź modelu, a nie tylko zwalidowany wynik?</p>
+  <button>Bo walidator wymaga tekstu w bazie, nie w pamięci</button>
+  <button>Bo surowa odpowiedź jest krótsza niż <code>TriageResult</code></button>
+  <button>Bo awaria w późniejszym kroku wznawia pracę z zapisanej odpowiedzi: bez drugiego płatnego wywołania, z tym samym wynikiem i z materiałem do audytu</button>
+  <button>Bo dostawca LLM wymaga przechowywania odpowiedzi</button>
+  <p class="explain">Wywołanie modelu jest kosztowne i niedeterministyczne. Checkpoint sprawia, że wznowienie od VALIDATE nie płaci drugi raz i nie dostaje innej kategorii, a odrzucone odpowiedzi można przeanalizować.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Worker A stracił dzierżawę, run przejął B. A dostaje odpowiedź modelu i zapisuje checkpoint. Co chroni przed podwójnym zapisem?</p>
+  <button>Warunek <code>locked_by = :me</code> w <code>UPDATE</code>: <code>locked_by</code> jest unikalny per przejęcie, więc A dostaje 0 wierszy i <code>LeaseLostException</code></button>
+  <button>Porównanie <code>Instant.now()</code> z <code>locked_until</code> w aplikacji A</button>
+  <button>Klucz główny <code>triage_steps</code></button>
+  <button>Nic; ostatni zapis wygrywa i to jest akceptowalne</button>
+  <p class="explain">To token ochronny. Zegar aplikacji może się rozjechać, a klucz <code>triage_steps</code> zawiera numer próby, więc oba wpisy by przeszły. Liczy się właściciel zapisany w wierszu.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Breaker <code>llm</code> jest otwarty od 40 minut. Jak powinny zachowywać się runy triage?</p>
+  <button>Każda próba zużywa licznik; po pięciu runy kończą się FAILED</button>
+  <button>Runy Globexu przełączają się na model zewnętrzny</button>
+  <button>Runy kończą się od razu SKIPPED</button>
+  <button>Czekają w PENDING z <code>next_attempt_at</code> w przyszłości, bez zużywania prób; <code>claimNext</code> nie przejmuje runów na CLASSIFY, a alert idzie na poziomie usługi</button>
+  <p class="explain">Awaria systemowa dotyczy wszystkich runów, więc nie może spalać ich prób, inaczej zamieni tysiące runów w FAILED. Fallback na zewnętrzny model jest dla Globexu zabroniony.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Co robi <code>TriageWorker.stop()</code>, gdy krok nie skończy się w <code>drainTimeout</code>?</p>
+  <button>Czeka bez limitu, bo przerwanie kosztuje</button>
+  <button>Przerywa krok i oddaje dzierżawę (<code>PENDING</code>, <code>locked_by = NULL</code>, <code>attempt − 1</code>), by inna instancja przejęła run od razu i bez spalania próby</button>
+  <button>Oznacza run jako FAILED</button>
+  <button>Nic; dzierżawa i tak wygaśnie</button>
+  <p class="explain">Czekanie bez limitu kończy się SIGKILL, a pozostawiona dzierżawa opóźnia triage o jej długość. Oddanie z cofnięciem licznika sprawia, że deploy nie zużywa prób.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Kiedy warto zastąpić własny workflow na Postgresie silnikiem w rodzaju Temporal lub Camunda?</p>
+  <button>Gdy proces ma więcej niż trzy kroki</button>
+  <button>Gdy w procesie jest wywołanie LLM</button>
+  <button>Gdy proces trwa dni z wieloma timerami, wymaga kompensacji (sagi) albo obejmuje wiele usług z własnymi bazami</button>
+  <button>Zawsze, bo własny workflow nie może być trwały</button>
+  <p class="explain">Triage to kilka liniowych kroków w jednej bazie, trwających sekundy. Silnik opłaca się przy długich procesach, timerach, kompensacjach i wielu usługach.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

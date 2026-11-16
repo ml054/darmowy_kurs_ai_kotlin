@@ -54,5 +54,5 @@ window.COURSE = {
     ]}
   ],
   // Moduły już wygenerowane (pozostałe pokazywane jako "wkrótce").
-  available: [1, 2, 3, 4]
+  available: [1, 2, 3, 4, 5, 6]
 };

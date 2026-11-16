@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.1 Workflow czy agent – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="5.1">
+<main>
+<p class="meta">Lekcja 5.1 · ok. 60 min</p>
+<h1>Workflow czy agent: projekt automatycznego triage</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć, co się zmienia, gdy AI pracuje w tle, bez człowieka, który czyta każdą odpowiedź.</li>
+  <li>Poznać spektrum rozwiązań: od zwykłego kodu, przez workflow z krokami LLM, po agenta i układy wieloagentowe.</li>
+  <li>Wybrać architekturę według kryteriów, a dla triage uzasadnić wybór workflow liczbami: koszt, p95, odtwarzalność.</li>
+  <li>Zaprojektować workflow triage: wyzwalacz ze Spring Modulith, kroki, tabele <code>triage_runs</code> i <code>triage_steps</code>, worker.</li>
+  <li>Ograniczyć proces w tle: aktor systemowy, <code>TriagePolicy</code>, kill switch <code>TRIAGE_APPLY</code>, tryby tenanta, budżety.</li>
+  <li>Rozpoznać antywzorce i przetestować workflow deterministycznie.</li>
+</ul></div>
+
+<h2>AI bez człowieka przy klawiaturze</h2>
+<p>Do tej pory AI w HelpDesk działało na żądanie człowieka. Piotr pyta czat i czyta odpowiedź (M2), zatwierdza propozycje zmian (M3), agent prosi o sugerowaną odpowiedź z bazy wiedzy (M4). W każdym z tych przypadków człowiek widzi wynik, zanim cokolwiek się stanie. W module 5 pojawia się nowy rodzaj użycia: <strong>proces w tle</strong>. Każde nowe zgłoszenie przechodzi automatyczny <dfn data-t="triage">triage</dfn>, czyli wstępną klasyfikację: kategoria, priorytet, zespół, krótkie streszczenie dla agenta, język i flaga „wymaga człowieka”. Robi to system, kiedy klient kliknie „Wyślij”, o 3 w nocy też.</p>
+<p>Przykład, który przewija się przez cały moduł: <strong>HD-3001</strong> w Acme, „Faktura za październik naliczona podwójnie”. Oczekiwany wynik to <code>BILLING</code> / <code>HIGH</code> / zespół <code>ACME-BILLING</code>. Dziś robi to ręcznie dyżurny pierwszej linii i zajmuje mu to 1–3 minuty na zgłoszenie.</p>
+<table>
+  <tr><th>Cecha</th><th>Czat (M2–M3)</th><th>Triage w tle (M5)</th></tr>
+  <tr><td>Kto widzi wynik</td><td>Użytkownik, od razu, w każdej turze</td><td>Nikt, dopóki ktoś nie otworzy zgłoszenia</td></tr>
+  <tr><td>Wykrycie błędu</td><td>Użytkownik dopytuje albo odrzuca propozycję</td><td>Dopiero gdy zgłoszenie trafi do złego zespołu albo przekroczy SLA</td></tr>
+  <tr><td>Potwierdzenie</td><td>Karta „Zatwierdź / Odrzuć” (3.5)</td><td>Brak, chyba że świadomie je zaprojektujesz (5.3)</td></tr>
+  <tr><td>Wolumen</td><td>Setki tur dziennie, rozłożone w czasie</td><td>2000 zgłoszeń dziennie, a przy imporcie 10 tys. w minutę</td></tr>
+  <tr><td>Kumulacja błędów</td><td>Jeden błąd psuje jedną rozmowę</td><td>Ten sam błąd powtarza się w każdym zgłoszeniu danego typu</td></tr>
+  <tr><td>Tożsamość</td><td>Użytkownik (asystent działa w jego imieniu)</td><td>Konto techniczne systemu</td></tr>
+</table>
+<p>Najważniejsza różnica to <strong>kumulacja błędów</strong>. Model z trafnością 91% (zmierzoną w 1.6 dla <code>helpdesk-fast</code>) przy 2000 zgłoszeń dziennie myli się ok. 180 razy dziennie. W czacie pomyłkę ktoś zauważa od razu. W triage jest cicha: zgłoszenie o podwójnej fakturze ląduje w <code>ACME-DEV</code>, leży tam dwie godziny i przekracza SLA, a w logach nie ma błędu.</p>
+<p>Druga różnica to <dfn data-t="accountability">rozliczalność</dfn>, czyli możliwość wskazania, kto i na jakiej podstawie podjął decyzję. W M3 zmianę zatwierdzał Piotr. Gdy triage sam ustawi priorytet, odpowiada organizacja, która włączyła automat, więc musi umieć odtworzyć, która konfiguracja, model i dane wejściowe dały wynik (audyt, 3.6).</p>
+<div class="box tip"><span class="label">Zasada modułu</span><p>Proces w tle projektujesz tak, jakby nikt nigdy nie przeczytał jego wyniku. Każdy wynik jest zapisany i walidowany, ma właściciela i termin, a każda zmiana w systemie przechodzi przez te same fasady, uprawnienia i kill switch co działania ludzi i asystenta.</p></div>
+
+<h2>Spektrum: od kodu do wielu agentów</h2>
+<p>Między zwykłym <code>if</code> a autonomicznym agentem jest kilka poziomów. Każdy kolejny daje więcej elastyczności i więcej kosztu, opóźnienia oraz nieprzewidywalności.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="spektrum rozwiązań">
+  0. Kod deterministyczny     reguły, słowa kluczowe, tabela decyzyjna      ← zero LLM
+  1. Jedno wywołanie LLM      prompt + structured output, kod waliduje
+  2. Workflow z krokami LLM   kod ustala kolejność; LLM wykonuje wąskie kroki
+       • prompt chaining      krok A → walidacja → krok B
+       • routing              klasyfikacja wybiera dalszą ścieżkę/prompt/model
+       • równoległość         podzadania naraz (sekcje) albo kilka prób (głosowanie)
+  3. Agent z pętlą narzędzi   model sam wybiera kolejne narzędzia, aż uzna, że skończył
+  4. Wiele agentów            orkiestrator deleguje do agentów-specjalistów
+                              ───────────────────────────────────────────────►
+                              rośnie: elastyczność, koszt, p95, trudność testów
+</script>
+<p>Rozróżnienie, z którego warto korzystać, opisał Anthropic w artykule „Building effective agents” (grudzień 2024). <dfn data-t="llm-workflow">Workflow</dfn> to system, w którym LLM i narzędzia są wywoływane według ścieżek z góry zapisanych w kodzie. <dfn data-t="agent">Agent</dfn> to system, w którym model sam kieruje swoim procesem i wyborem narzędzi. Artykuł opisuje wzorce workflow: <em>prompt chaining</em>, <em>routing</em>, <em>parallelization</em>, <em>orchestrator-workers</em> (centralny LLM dzieli zadanie między wykonawców) i <em>evaluator-optimizer</em> (jeden LLM generuje, drugi ocenia). Główna rada: zacznij od najprostszego rozwiązania i dokładaj złożoność tylko wtedy, gdy pomiar pokazuje poprawę, bo systemy agentowe płacą kosztem i opóźnieniem za lepszy wynik w zadaniach otwartych.</p>
+<p><dfn data-t="prompt-chaining">Prompt chaining</dfn> to podział zadania na kolejne wywołania, w którym wynik jednego kroku jest wejściem następnego, a między krokami kod może sprawdzić wynik. <dfn data-t="llm-routing">Routing</dfn> to krok klasyfikujący, którego wynik kod wykorzystuje do wyboru dalszej ścieżki: innego promptu, modelu albo obsługi. Układ <dfn data-t="multi-agent">wieloagentowy</dfn> to kilka agentów z własnymi promptami i narzędziami, koordynowanych przez agenta-orkiestratora albo przez wymianę wiadomości.</p>
+<div class="box warn"><span class="label">„Agent” w ofercie dostawcy</span><p>Frameworki nazywają agentem niemal wszystko. Pytaj o jedno: <strong>kto decyduje o kolejnym kroku, kod czy model?</strong> Od tego zależą testy, koszty i zabezpieczenia.</p></div>
+
+<h2>Wzorce workflow na przykładach z HelpDesk</h2>
+<table>
+  <tr><th>Wzorzec</th><th>Przykład w HelpDesk</th><th>Kto decyduje o przebiegu</th></tr>
+  <tr><td>Kod / jedno wywołanie</td><td><code>security@</code> zawsze do <code>GLOBEX-SEC</code>; <code>KB_ANSWER</code> z 4.4</td><td>Kod</td></tr>
+  <tr><td>Prompt chaining</td><td>Triage: redakcja PII → klasyfikacja → walidacja → (raz) naprawa z błędami walidacji</td><td>Kod</td></tr>
+  <tr><td>Routing</td><td>Tenant wybiera model (Acme: <code>helpdesk-fast</code>, Globex: <code>helpdesk-local</code>); kategoria <code>BILLING</code> uruchamia dodatkową ekstrakcję numeru faktury</td><td>Kod na podstawie wyniku LLM</td></tr>
+  <tr><td>Równoległość (głosowanie)</td><td>Dwie niezależne próby dla kandydatów na <code>CRITICAL</code>; niezgodność → przegląd (5.3)</td><td>Kod</td></tr>
+  <tr><td>Agent</td><td>Czat z narzędziami (M2–M3): pytania są otwarte, liczby kroków nie da się przewidzieć</td><td>Model, w limitach z 3.2</td></tr>
+  <tr><td>Wiele agentów</td><td>W HelpDesk brak uzasadnienia: zadania są wąskie, a koszt koordynacji i debugowania wysoki</td><td>Modele</td></tr>
+</table>
+<p>Ważny niuans: routing „kategorią z LLM” to nadal workflow. Model daje <em>dane</em> (kategorię z zamkniętej listy), a kod, po walidacji, wybiera ścieżkę. Model nie decyduje „teraz wywołaj APPLY”. Ta granica wraca w antywzorcach.</p>
+
+<h2>Kryteria wyboru</h2>
+<table>
+  <tr><th>Kryterium</th><th>Workflow z krokami LLM</th><th>Agent z pętlą narzędzi</th></tr>
+  <tr><td>Kroki</td><td>Znane z góry, stała kolejność</td><td>Nieznane, zależne od tego, co agent znajdzie</td></tr>
+  <tr><td>Przewidywalność</td><td>Ta sama ścieżka za każdym razem; zmienia się tylko treść wyniku kroku</td><td>Ścieżka różni się między uruchomieniami, także dla tych samych danych</td></tr>
+  <tr><td>Koszt</td><td>Stała liczba wywołań, łatwa do policzenia z góry</td><td>Zmienny; historia rośnie z każdą rundą, więc koszt rośnie szybciej niż liniowo (1.6)</td></tr>
+  <tr><td>Latencja</td><td>Suma znanych kroków; p95 ≈ p95 jednego wywołania + kod</td><td>Wiele wywołań po kolei; ogon rozkładu długi (rundy p99)</td></tr>
+  <tr><td>Testowalność</td><td>Każdy krok osobno, z atrapą modelu, deterministycznie</td><td>Głównie testy całościowe i evale trajektorii</td></tr>
+  <tr><td>Audyt</td><td>Wiersz na krok: wejście, wyjście, tokeny, wersja</td><td>Trajektoria do odtworzenia z trace'ów i <code>assistant_audit</code></td></tr>
+  <tr><td>Odporność na <dfn data-t="prompt-injection">prompt injection</dfn></td><td>Treść może zepsuć wynik kroku, ale nie zmieni kolejności kroków; walidacja odrzuca wartości spoza listy</td><td>Treść zgłoszenia steruje kolejnymi rundami (3.4); każde narzędzie to potencjalna akcja atakującego</td></tr>
+  <tr><td>Kiedy wybrać</td><td>Zadanie powtarzalne, wynik o znanym kształcie, duży wolumen, praca w tle</td><td>Zadanie otwarte, człowiek w pętli, niski wolumen, wartość z eksploracji</td></tr>
+</table>
+<p>Pytanie kontrolne: <strong>czy umiem narysować diagram kroków?</strong> Jeśli tak, to workflow, a agent zapłaci za „odkrywanie” tego, co już wiesz. Jeśli nie („zbadaj, dlaczego klientowi nie działa eksport”), agent ma sens, w granicach wyznaczonych przez workflow wokół niego.</p>
+
+<h2>Decyzja dla triage: liczby</h2>
+<p>Porównujemy dwa projekty triage dla HD-3001 na <code>helpdesk-fast</code> (ceny ilustracyjne z 1.6: wejście 0,40 USD, wyjście 1,60 USD za mln tokenów; sprawdź aktualny cennik).</p>
+<p><strong>Workflow</strong>: kod ładuje zgłoszenie i listę zespołów tenanta, jedno wywołanie ze <dfn data-t="structured-output">structured output</dfn> (wynik zgodny ze schematem JSON, 5.2). Wejście 1600 tokenów, wyjście 40 tokenów, jak w benchmarku z 1.6.</p>
+<p><strong>Agent</strong>: model dostaje narzędzia <code>getTicket</code>, <code>listComments</code>, <code>listTeams</code>, <code>searchSimilarTickets</code>, <code>searchKnowledgeBase</code>, <code>setTriage</code> i sam decyduje, co sprawdzić. Typowa trajektoria to 4 wywołania.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="koszt jednego triage (ilustracyjnie)">
+  WORKFLOW (1 wywołanie)
+    1 600 × 0,40/1e6 + 40 × 1,60/1e6                          = 0,000704 USD
+    z cache prefiksu (1.6)                                     = 0,000315 USD
+
+  AGENT (4 rundy; prefiks P = system prompt 2 000 + 6 narzędzi × ~180 ≈ 3 100 tok)
+    runda 1: P + zadanie 50                                    = 3 150 wej.,  60 wyj.
+    runda 2: + 60 + wyniki getTicket/listComments 1 200        = 4 410 wej.,  50 wyj.
+    runda 3: + 50 + wyniki listTeams/searchSimilar 900         = 5 360 wej.,  40 wyj.
+    runda 4: + 40 + wynik searchKnowledgeBase 300 → setTriage  = 5 740 wej.,  80 wyj.
+    razem 18 660 wej. × 0,40/1e6 + 230 wyj. × 1,60/1e6         = 0,007832 USD  (≈ 11×)
+    z cache prefiksu (4 × 3 100 tok po 0,04)                   = 0,003368 USD  (≈ 11×)
+
+  MIESIĄC (2 000 zgłoszeń/dzień × 30)
+    workflow: 42,24 USD (18,91 z cache)     agent: 469,92 USD (202,08 z cache)
+</script>
+<table>
+  <tr><th>Wymiar</th><th>Workflow</th><th>Agent</th></tr>
+  <tr><td>Wywołania LLM na zgłoszenie</td><td>1 (najwyżej 2 z naprawą, 5.2)</td><td>2–8, mediana 4</td></tr>
+  <tr><td>p95 czasu triage</td><td>ok. 1,2 s (0,88 s modelu z 1.6 + Presidio i baza)</td><td>4–6 s (ilustracyjnie: 4 rundy po kolei, rosnące wejście)</td></tr>
+  <tr><td>Globex, <code>helpdesk-local</code></td><td>p95 3,9 s, 1 wywołanie na GPU</td><td>4× więcej pracy GPU dzielonego z KB (4.6); słaby tool calling modelu lokalnego (1.6)</td></tr>
+  <tr><td>Odtwarzalność</td><td>Ten sam prompt bajt w bajt; ponowny eval daje ten sam przebieg</td><td>Inna trajektoria przy powtórzeniu; trudno porównać wersje</td></tr>
+</table>
+<p>Rozstrzyga to, że wszystko, co agent „odkrywa” (komentarze, zespoły, podobne zgłoszenia), jest <strong>zawsze potrzebne i zawsze to samo</strong>, więc kod pobierze to w LOAD. Pętla nie wnosi informacji, a dokłada koszt, opóźnienie, zmienność i powierzchnię ataku: <code>setTriage</code> w rękach modelu czytającego treść klienta to droga do „ustaw CRITICAL” z wstrzykniętego polecenia.</p>
+<div class="box tip"><span class="label">Decyzja</span><p>Triage to <strong>workflow z krokami LLM</strong>: kolejność kroków jest stała, kod decyduje, model wykonuje wąskie zadanie klasyfikacji ze schematem. <strong>Agent z pętlą narzędzi zostaje w czacie</strong> (M2–M3), gdzie pytania są otwarte, człowiek czyta każdą odpowiedź, a zapis wymaga potwierdzenia. Decyzję zapisz w ADR razem z liczbami i warunkiem jej zmiany (np. eval pokaże, że kontekst zbierany przez agenta wyraźnie poprawia trafność).</p></div>
+
+<h2>Projekt workflow: kroki i przepływ</h2>
+<script type="text/x-code" data-lang="plaintext" data-title="przepływ triage">
+  ticket: TicketApi.create ── INSERT tickets + publishEvent(TicketCreated) w 1 transakcji
+            │ po commicie (event_publication)
+  assistant: TriageTrigger (@ApplicationModuleListener) ── tryb, AI, trasa → INSERT triage_runs PENDING
+            │ poll: SKIP LOCKED + dzierżawa
+  TriageWorker → TriageWorkflow.advance(run): jeden krok na wywołanie
+
+   LOAD ──► REDACT ──► CLASSIFY ──► VALIDATE ──► DECIDE ──┬─► APPLY ──► APPLIED
+   kod      kod +      LLM          kod          kod      ├─► REVIEW ─► WAITING_REVIEW (5.3)
+            Presidio   (5.2)        (5.2)        (5.3)    └─► SKIP ───► SKIPPED
+
+   każdy krok → wiersz w triage_steps (checkpoint, 5.5)
+   błąd przejściowy → retry z backoff; po max-attempts → FAILED
+   FAILED / EXPIRED / SKIPPED → zgłoszenie zostaje w zwykłej kolejce ręcznej
+</script>
+<table>
+  <tr><th>Krok</th><th>Co robi</th><th>LLM</th><th>Błąd → skutek</th><th>Lekcja</th></tr>
+  <tr><td>LOAD</td><td><code>TicketApi</code> jako użytkownik systemowy: tytuł, opis, pierwszy komentarz klienta, <code>ticket_version</code>, aktywne zespoły</td><td>nie</td><td>Brak zgłoszenia → SKIPPED</td><td>5.1</td></tr>
+  <tr><td>REDACT</td><td>Redakcja <dfn data-t="pii">PII</dfn> (Presidio) dla trasy zewnętrznej; dla <code>helpdesk-local</code> krok pusty</td><td>nie</td><td>Presidio niedostępne → retry (<dfn data-t="fail-closed">fail closed</dfn>, 2.7)</td><td>2.7</td></tr>
+  <tr><td>CLASSIFY</td><td>Prompt <code>triage/v1</code>, structured output → <code>TriageResult</code></td><td>tak</td><td>Timeout, 429, 5xx → retry z backoff</td><td>5.2</td></tr>
+  <tr><td>VALIDATE</td><td>Schemat, Bean Validation, reguły biznesowe; najwyżej jedna naprawa</td><td>tylko naprawa</td><td>Nadal źle → FAILED</td><td>5.2</td></tr>
+  <tr><td>DECIDE</td><td><code>TriageDecision { AUTO_APPLY, REVIEW, SKIP }</code> wg trybu tenanta i sygnałów pewności liczonych w kodzie</td><td>nie</td><td>–</td><td>5.3</td></tr>
+  <tr><td>APPLY</td><td>Zmiana zgłoszenia przez fasadę z <code>Actor.system(runId)</code> i <code>expectedVersion</code></td><td>nie</td><td>Wersja nieaktualna → SKIPPED albo ponowny LOAD; kill switch → SKIPPED</td><td>5.1, 5.5</td></tr>
+</table>
+<p>Jedyny krok z LLM jest otoczony kodem z obu stron. Model nie widzi bazy, nie ma narzędzi i niczego nie zmienia: zwraca dane, które kod sprawdza.</p>
+<div class="box warn"><span class="label">Triage nigdy nie blokuje obsługi</span><p>Zgłoszenie od początku jest w zwykłej kolejce, tak jak przed wprowadzeniem AI. Triage tylko je wzbogaca. Gdy cokolwiek zawiedzie (model, Presidio, walidacja, kill switch), run kończy się statusem FAILED, SKIPPED albo EXPIRED, a człowiek klasyfikuje zgłoszenie ręcznie. To <em>fail open</em> dla procesu i jednocześnie fail closed dla danych.</p></div>
+
+<h2>Wyzwalacz: TicketCreated i rejestr publikacji zdarzeń</h2>
+<p><dfn data-t="domain-event">Zdarzenie domenowe</dfn> to komunikat o fakcie biznesowym, który już się wydarzył („zgłoszenie utworzone”), publikowany przez moduł-właściciela danych. Inne moduły na nie reagują, a właściciel nie musi o nich wiedzieć. Moduł <code>ticket</code> nie zależy więc od <code>assistant</code>, czego pilnuje test architektury z 1.1.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket/TicketEvents.kt (publiczne API modułu ticket)">
+  enum class TicketSource { WEB, EMAIL, API, IMPORT }
+
+  /** Tylko identyfikatory: zdarzenie ląduje w tabeli event_publication, więc bez treści i PII. */
+  data class TicketCreated(
+      val ticketId: UUID,
+      val tenantId: UUID,
+      val occurredAt: Instant,
+      val source: TicketSource = TicketSource.WEB,     // rozszerzenie: import masowy (przypadki brzegowe)
+  )
+
+  // TicketApi.create(...), w tej samej transakcji co INSERT zgłoszenia:
+  //   events.publishEvent(TicketCreated(t.id, t.tenantId, clock.instant(), cmd.source))
+</script>
+<p>Zwykły <code>@EventListener</code> z <code>@Async</code> zgubiłby triage bez śladu przy restarcie między commitem a obsługą zdarzenia. Spring Modulith ma <dfn data-t="event-publication-registry">rejestr publikacji zdarzeń</dfn> (Event Publication Registry): w transakcji publikującej zapisuje w tabeli <code>event_publication</code> wpis dla każdego słuchacza transakcyjnego i oznacza go jako zakończony po udanej obsłudze. To <dfn data-t="outbox">transactional outbox</dfn> z 3.5 wbudowany we framework.</p>
+<p><code>@ApplicationModuleListener</code> to skrót dla słuchacza asynchronicznego (<code>@Async</code>), wywoływanego po commicie (<code>@TransactionalEventListener</code>) we własnej transakcji (<code>REQUIRES_NEW</code>). Wyjątek zostawia publikację niezakończoną do ponowienia. Gwarancja to <dfn data-t="at-least-once">at-least-once</dfn>: zdarzenie nie zginie, ale może przyjść dwa razy, więc słuchacz musi być idempotentny.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageTrigger.kt">
+  @Component
+  class TriageTrigger(
+      private val tenants: TenantSettingsApi,
+      private val availability: AiAvailability,
+      private val router: ModelRouter,
+      private val modes: TriageModePolicy,           // tryb efektywny (niżej)
+      private val configs: TriageConfigProvider,     // TriageConfigVersion (5.2, 5.4)
+      private val runs: TriageRunRepository,
+      private val metrics: TriageMetrics,
+  ) {
+      @ApplicationModuleListener
+      fun on(e: TicketCreated) {
+          val route = router.route(e.tenantId, AiTask.TRIAGE)           // ai_enabled=false → Disabled
+          if (route !is ModelRoute.Use) return metrics.notStarted((route as ModelRoute.Disabled).reason)
+          val status = availability.status(e.tenantId)                  // TEMPORARILY_UNAVAILABLE: run powstaje
+          if (status == AiStatus.DISABLED_GLOBALLY || status == AiStatus.DISABLED_FOR_TENANT)
+              return metrics.notStarted("AI_DISABLED")
+          val mode = modes.effective(tenants.get(e.tenantId).aiTriageMode, route)   // nowe pole TenantSettings
+          if (mode == TriageMode.OFF) return metrics.notStarted("MODE_OFF")
+
+          val inserted = runs.insertPending(
+              ticketId = e.ticketId, tenantId = e.tenantId,
+              mode = if (mode == TriageMode.SHADOW) RunMode.SHADOW else RunMode.LIVE,
+              configVersion = configs.current(route).label, modelAlias = route.alias,
+              priority = if (e.source == TicketSource.IMPORT) 10 else 100,
+          )
+          if (!inserted) metrics.duplicateEvent()                        // to samo zdarzenie drugi raz
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="sql" data-title="TriageRunRepository.insertPending">
+  -- wywoływane po TenantSession.bindJob(tenantId): RLS na tenanta zdarzenia
+  INSERT INTO triage_runs (id, ticket_id, tenant_id, mode, status, current_step, attempt,
+                           next_attempt_at, config_version, model_alias, priority, created_at, updated_at)
+  VALUES (:id, :ticketId, :tenantId, :mode, 'PENDING', 'LOAD', 0,
+          now(), :configVersion, :modelAlias, :priority, now(), now())
+  ON CONFLICT DO NOTHING          -- oba indeksy unikalne z V50; 0 wierszy = duplikat
+</script>
+<p>Słuchacz <strong>nie wywołuje modelu</strong>, tylko robi szybki <code>INSERT</code>. Wywołanie LLM w słuchaczu blokowałoby pulę <code>@Async</code>, nie miałoby dzierżawy, limitów ani checkpointów, ponowienie po restarcie wołałoby model drugi raz, a 10 tys. zdarzeń z importu trafiłoby do LiteLLM naraz. Rejestr publikacji pilnuje, żeby zdarzenie nie zginęło, a <code>triage_runs</code> decyduje, jak i kiedy proces się wykona.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (Spring Modulith 1.x / Spring Boot 3)">
+  spring:
+    modulith:
+      events:
+        jdbc:
+          schema-initialization:
+            enabled: false                            # tabelę event_publication tworzy Flyway
+        republish-outstanding-events-on-restart: true # niezakończone publikacje po starcie instancji
+        completion-mode: DELETE                       # od 1.3; domyślne UPDATE wymaga sprzątania
+</script>
+<div class="box bug"><span class="label">Pułapka: ponowienie przy starcie a wiele instancji</span><p>Opcja <code>republish-outstanding-events-on-restart</code> przy starcie każdej instancji ponawia <em>wszystkie</em> niezakończone publikacje, także te, które właśnie obsługuje inna instancja. Przy trzech replikach i rolling deployu to samo <code>TicketCreated</code> przychodzi więc kilka razy. Bez <code>ON CONFLICT DO NOTHING</code> dostałbyś trzy triage jednego zgłoszenia. Ponawianie (<code>IncompleteEventPublications</code>, a w 2.x także statusy publikacji i <code>FailedEventPublications</code>) omawia 5.5. Schemat tabeli i nazwy właściwości sprawdź w dokumentacji swojej wersji Spring Modulith.</p></div>
+
+<h2>Tabele triage_runs i triage_steps (V50)</h2>
+<p>Stan procesu jest w bazie, nie w pamięci. <code>triage_runs</code> to jeden przebieg triage dla zgłoszenia, a <code>triage_steps</code> to dziennik kroków, z którego można wznowić pracę (5.5) i odtworzyć decyzję (audyt).</p>
+<script type="text/x-code" data-lang="sql" data-title="V50__triage_workflow.sql (numer przykładowy)">
+  ALTER TABLE tenants ADD COLUMN ai_triage_mode text NOT NULL DEFAULT 'OFF'
+      CHECK (ai_triage_mode IN ('OFF','SHADOW','SUGGEST','AUTO'));
+
+  CREATE TABLE triage_runs (
+      id               uuid PRIMARY KEY,
+      ticket_id        uuid NOT NULL,
+      tenant_id        uuid NOT NULL REFERENCES tenants(id),
+      mode             text NOT NULL CHECK (mode IN ('LIVE','SHADOW')),
+      status           text NOT NULL CHECK (status IN ('PENDING','RUNNING','WAITING_REVIEW','APPLIED',
+                                                       'REJECTED','SKIPPED','FAILED','EXPIRED')),
+      current_step     text NOT NULL CHECK (current_step IN ('LOAD','REDACT','CLASSIFY','VALIDATE','DECIDE','APPLY')),
+      attempt          int  NOT NULL DEFAULT 0,
+      next_attempt_at  timestamptz NOT NULL DEFAULT now(),
+      locked_by        text NULL,
+      locked_until     timestamptz NULL,
+      priority         smallint NOT NULL DEFAULT 100,      -- rozszerzenie: import = 10
+      config_version   text NOT NULL,                      -- TriageConfigVersion.label
+      model_alias      text NOT NULL,
+      provider_model   text NULL,                          -- gen_ai.response.model (5.4)
+      result           jsonb NULL,                         -- TriageResult po walidacji (5.2)
+      decision         text NULL CHECK (decision IN ('AUTO_APPLY','REVIEW','SKIP')),
+      decision_reasons jsonb NULL,
+      ticket_version   bigint NULL,                        -- ustawiane w LOAD
+      error_code       text NULL,
+      created_at       timestamptz NOT NULL,
+      updated_at       timestamptz NOT NULL,
+      finished_at      timestamptz NULL
+  );
+  CREATE UNIQUE INDEX ux_triage_runs_ticket_cfg ON triage_runs (ticket_id, config_version, mode);
+  CREATE UNIQUE INDEX ux_triage_runs_live ON triage_runs (ticket_id) WHERE mode = 'LIVE';  -- jeden LIVE na zgłoszenie
+  CREATE INDEX ix_triage_runs_ready ON triage_runs (priority DESC, next_attempt_at)
+      WHERE status IN ('PENDING','RUNNING');
+  CREATE INDEX ix_triage_runs_tenant_active ON triage_runs (tenant_id) WHERE locked_until IS NOT NULL;
+
+  CREATE TABLE triage_steps (
+      run_id        uuid NOT NULL REFERENCES triage_runs(id),
+      tenant_id     uuid NOT NULL,                         -- zdenormalizowane pod RLS
+      step          text NOT NULL,
+      attempt       int  NOT NULL,
+      status        text NOT NULL CHECK (status IN ('OK','RETRY','FAILED','SKIPPED')),
+      started_at    timestamptz NOT NULL, finished_at timestamptz NULL,
+      output        jsonb NULL,                            -- bez nieocenzurowanej treści zgłoszenia
+      input_tokens  int NULL, output_tokens int NULL, error text NULL,
+      PRIMARY KEY (run_id, step, attempt)
+  );
+
+  ALTER TABLE triage_runs  ENABLE ROW LEVEL SECURITY;  ALTER TABLE triage_runs  FORCE ROW LEVEL SECURITY;
+  ALTER TABLE triage_steps ENABLE ROW LEVEL SECURITY;  ALTER TABLE triage_steps FORCE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON triage_runs USING (
+      current_setting('app.system_job', true) = 'on'      -- tylko przejęcie runu przez workera
+      OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+  CREATE POLICY tenant_isolation ON triage_steps USING (
+      tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+  GRANT SELECT, INSERT, UPDATE ON triage_runs, triage_steps TO helpdesk_app;   -- bez DELETE
+
+  -- SYSTEM z on_behalf_of po akceptacji przeglądu (5.3); CHECK z V30 tego nie dopuszczał
+  ALTER TABLE ticket_events DROP CONSTRAINT ck_ticket_events_assistant;
+  ALTER TABLE ticket_events ADD CONSTRAINT ck_ticket_events_actor CHECK (
+      (actor_type = 'ASSISTANT' AND actor_id = '00000000-0000-4000-8000-0000000a551e'
+          AND on_behalf_of IS NOT NULL AND assistant_action_id IS NOT NULL)
+      OR (actor_type = 'SYSTEM' AND assistant_action_id IS NULL)
+      OR (actor_type = 'USER' AND on_behalf_of IS NULL AND assistant_action_id IS NULL)) NOT VALID;
+  ALTER TABLE ticket_events VALIDATE CONSTRAINT ck_ticket_events_actor;
+  -- + 'triage' w CHECK feature_group tabeli tenant_ai_feature_budgets (4.6)
+</script>
+<ul>
+  <li><strong>Dwie unikalności.</strong> <code>(ticket_id, config_version, mode)</code> z kontraktu chroni przed duplikatem zdarzenia. Tyle że po deployu z nową konfiguracją ponowione <code>TicketCreated</code> miałoby inne <code>config_version</code> i przeszłoby przez ten indeks. <dfn data-t="partial-index">Indeks częściowy</dfn> <code>ux_triage_runs_live</code> dopuszcza więc jeden run LIVE na zgłoszenie, a runy SHADOW kandydatów (5.4) dalej mogą powstawać obok.</li>
+  <li><strong>RLS w dwóch fazach.</strong> Przejęcie runu z kolejki wszystkich tenantów to krótka transakcja z <code>app.system_job</code> (jak 3.6 i 4.2), która dotyka tylko <code>triage_runs</code>. Każdy krok działa już w transakcji z <code>app.tenant_ids</code> równym tenantowi runu. Błąd w kroku nie zapisze więc niczego do cudzego tenanta. Nie używamy <code>app.bypass_rls</code>.</li>
+  <li><strong><code>output</code> bez treści.</strong> LOAD zapisuje <code>ticket_version</code>, długości i hash, nie tytuł i opis. Kopia nieocenzurowanego opisu w dzienniku byłaby kolejnym miejscem z PII, z własną retencją i prawem do usunięcia (2.5, 2.7).</li>
+</ul>
+
+<h2>TriageWorker i TriageWorkflow.advance w zarysie</h2>
+<p>Worker działa jak <code>KbIngestionWorker</code> z 4.2: krótka transakcja przejmuje run (<dfn data-t="skip-locked">FOR UPDATE SKIP LOCKED</dfn>, czyli pomijanie wierszy zablokowanych przez inne instancje), a praca dzieje się poza nią, pod <dfn data-t="lease">dzierżawą</dfn> (<code>locked_until</code>), przedłużaną po każdym kroku.</p>
+<script type="text/x-code" data-lang="sql" data-title="TriageRunRepository.claimNext (z app.system_job)">
+  WITH next AS (
+      SELECT r.id FROM triage_runs r
+       WHERE r.status IN ('PENDING','RUNNING')            -- RUNNING z wygasłą dzierżawą = przerwany
+         AND r.next_attempt_at <= now()
+         AND (r.locked_until IS NULL OR r.locked_until < now())
+         AND (SELECT count(*) FROM triage_runs a           -- sprawiedliwość: limit per tenant (przybliżony)
+               WHERE a.tenant_id = r.tenant_id AND a.locked_until > now()) < :perTenantConcurrency
+       ORDER BY r.priority DESC, r.next_attempt_at
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED)
+  UPDATE triage_runs r
+     SET status = 'RUNNING', attempt = r.attempt + 1, locked_by = :workerId,
+         locked_until = now() + :lease::interval, updated_at = now()
+    FROM next WHERE r.id = next.id
+  RETURNING r.*;
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageWorkflow.kt (zarys)">
+  enum class TriageStep { LOAD, REDACT, CLASSIFY, VALIDATE, DECIDE, APPLY }
+  enum class TriageDecision { AUTO_APPLY, REVIEW, SKIP }
+  enum class RunMode { LIVE, SHADOW }
+
+  sealed interface StepOutcome {
+      data class Next(val step: TriageStep, val output: Map<String, Any?> = emptyMap()) : StepOutcome
+      data class Finish(val status: RunStatus, val errorCode: String? = null) : StepOutcome   // APPLIED, SKIPPED, FAILED
+      data object WaitForReview : StepOutcome                                                 // WAITING_REVIEW (5.3)
+      data class Retry(val errorCode: String) : StepOutcome
+  }
+
+  interface TriageStepHandler {
+      val step: TriageStep
+      fun execute(run: TriageRun): StepOutcome      // idempotentny: może się wykonać drugi raz (5.5)
+  }
+
+  @Component
+  class TriageWorkflow(handlers: List<TriageStepHandler>, private val guard: TriageGuard,
+                       private val store: TriageRunStore, private val props: TriageProperties, private val clock: Clock) {
+      private val byStep = handlers.associateBy { it.step }
+          .also { check(it.keys == TriageStep.entries.toSet()) { "Brak handlera kroku" } }
+
+      /** Wykonuje JEDEN krok i zapisuje checkpoint. true = jest następny krok do wykonania teraz. */
+      fun advance(run: TriageRun): Boolean {
+          // ai.enabled, tryb tenanta, budżet, max-llm-calls-per-run, run-token-budget
+          guard.stopReason(run)?.let { store.finish(run, RunStatus.SKIPPED, it); return false }
+          val started = clock.instant()
+          val outcome = try { byStep.getValue(run.currentStep).execute(run) }
+                        catch (e: TransientAiException) { StepOutcome.Retry(e.code) }   // timeout, 429, 5xx, Presidio
+          val effective = if (outcome is StepOutcome.Retry && run.attempt >= props.maxAttempts)
+              StepOutcome.Finish(RunStatus.FAILED, "RETRIES_EXHAUSTED") else outcome
+          store.checkpoint(run, effective, started)   // triage_steps + triage_runs w 1 transakcji, WHERE locked_by = :me
+          return effective is StepOutcome.Next
+      }
+  }
+
+  // TriageWorker.poll() (@Scheduled): claimNext → w puli wątków: while (workflow.advance(run)) run = reloadAndExtend(run)
+  // LeaseLostException (run przejął inny worker) → metryka, koniec; FAILED → zgłoszenie zostaje w kolejce ręcznej
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml">
+  helpdesk:
+    triage:
+      workers: 4                        # wątki na instancję
+      per-tenant-concurrency: 2         # import jednego tenanta nie zajmie wszystkich
+      max-runs-per-tenant-per-hour: 600
+      lease: 2m
+      max-attempts: 5                   # backoff z jitterem 10 s … 10 min
+      max-llm-calls-per-run: 2          # CLASSIFY + jedna naprawa (5.2)
+      run-token-budget: 6000
+      expire-after: 24h                 # PENDING dłużej → EXPIRED
+      max-mode-on-local-route: SUGGEST
+</script>
+<p>Wznawianie, przejmowanie wygasłych dzierżaw, graceful shutdown i idempotencję APPLY opisuje 5.5. <code>TriageResult</code>, prompt <code>triage/v1</code> i walidację opisuje 5.2, a <code>TriageScorer.decide</code> i kolejkę przeglądu 5.3. Tutaj liczy się kształt: <strong>jeden krok na wywołanie <code>advance</code>, stan w bazie, kod wybiera następny krok</strong>.</p>
+
+<h2>Aktor systemowy i TriagePolicy</h2>
+<p>Triage nie działa w niczyim imieniu. Zmianę zgłoszenia zapisuje konto techniczne <code>triage@system</code> (<dfn data-t="service-account">service account</dfn>, czyli tożsamość systemu bez logowania i hasła) o stałym UUID <code>00000000-0000-4000-8000-00000000a1a6</code>. Rozszerzamy <code>Actor</code> z 3.1:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="identity/Actor.kt (rozszerzenie)">
+  data class Actor(
+      val type: ActorType, val userId: UUID, val actionId: UUID? = null,
+      val runId: UUID? = null,          // NOWE: run joba systemowego (triage_runs.id)
+      val reviewerId: UUID? = null,     // NOWE: kto zatwierdził wynik w przeglądzie (5.3)
+  ) {
+      init {
+          require((type == ActorType.ASSISTANT) == (actionId != null)) { "actionId tylko dla ASSISTANT" }
+          require(runId == null || type == ActorType.SYSTEM) { "runId tylko dla SYSTEM" }
+          require(reviewerId == null || type == ActorType.SYSTEM) { "reviewerId tylko dla SYSTEM" }
+      }
+      val recordedActorId: UUID get() = if (type == ActorType.ASSISTANT) ASSISTANT_ACCOUNT_ID else userId
+      val onBehalfOf: UUID? get() = when (type) {
+          ActorType.ASSISTANT -> userId; ActorType.SYSTEM -> reviewerId; ActorType.USER -> null
+      }
+      companion object {
+          val TRIAGE_ACCOUNT_ID: UUID = UUID.fromString("00000000-0000-4000-8000-00000000a1a6")
+          fun system(runId: UUID, reviewerId: UUID? = null) =
+              Actor(ActorType.SYSTEM, TRIAGE_ACCOUNT_ID, runId = runId, reviewerId = reviewerId)
+          // ASSISTANT_ACCOUNT_ID, user(...) i assistant(...) bez zmian
+      }
+  }
+
+  object SystemUsers {
+      /** Techniczny CurrentUser zawężony do JEDNEGO tenanta runu; nigdy ADMIN (ADMIN omija RLS). */
+      fun triage(tenantId: UUID) = CurrentUser(Actor.TRIAGE_ACCOUNT_ID, setOf(tenantId), setOf(Role.AGENT))
+  }
+</script>
+<p>Fasada z 3.3 sprawdza <code>actor.userId == user.userId</code>, więc para <code>SystemUsers.triage(tenantId)</code> + <code>Actor.system(runId)</code> przechodzi, a <code>TicketEventRecorder</code> zapisuje <code>actor_type = SYSTEM</code>, <code>actor_id</code> = konto triage i <code>payload</code> z <code>triageRunId</code> oraz <code>configVersion</code>. Po akceptacji w przeglądzie (5.3) zdarzenie ma też <code>on_behalf_of</code> = przeglądający.</p>
+<p>Rola <code>AGENT</code> daje bazę uprawnień domeny, a zawęża ją port <code>ActorPolicy</code> z 3.3, wołany przez fasadę dla każdego aktora innego niż USER. Triage zmienia trzy pola naraz, więc dostaje jedną intencję i jedną metodę fasady: trzy osobne wywołania podbiłyby <code>tickets.version</code> trzy razy i drugie dostałoby konflikt.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ticket: nowa intencja i metoda fasady">
+  // w sealed interface WriteIntent (3.3): kompilator wymusi obsługę w TicketPermissions.check i politykach
+  data class Classify(val category: TicketCategory, val priority: TicketPriority, val teamCode: String) : WriteIntent
+
+  @Transactional
+  fun classify(user: CurrentUser, id: UUID, change: WriteIntent.Classify, expectedVersion: Long,
+               actor: Actor = Actor.user(user)): TicketView
+  // loadVisible → authorize(user, actor, snapshot, change).orThrow() → wersja → zespół aktywny w support_teams
+  // → jedna zmiana encji, jedno zdarzenie TRIAGE_APPLIED: payload {category, priority, team, before{…}, triageRunId, configVersion}
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriagePolicy.kt">
+  @Component
+  class TriagePolicy : ActorPolicy {
+      override val actorType = ActorType.SYSTEM
+
+      override fun check(user: CurrentUser, actor: Actor, ticket: TicketSnapshot, intent: WriteIntent): Decision {
+          if (actor.userId != Actor.TRIAGE_ACCOUNT_ID || actor.runId == null)
+              return deny("Nieznany job systemowy")                  // fail closed dla innych jobów SYSTEM
+          if (user.tenantIds != setOf(ticket.tenantId)) return deny("Triage działa w jednym tenancie")
+          return when (intent) {
+              is WriteIntent.Classify -> when {
+                  intent.priority == TicketPriority.CRITICAL -> deny("CRITICAL tylko jako sugestia do przeglądu")
+                  ticket.priority == TicketPriority.CRITICAL -> deny("Triage nie obniża CRITICAL")
+                  else -> Decision.Allowed
+              }
+              is WriteIntent.ChangeStatus -> deny("Triage nie zmienia statusu")
+              is WriteIntent.AddComment -> deny("Triage nie dodaje komentarzy; streszczenie jest w panelu triage")
+              is WriteIntent.Assign -> deny("Triage nie przypisuje osób, tylko zespół")
+              is WriteIntent.ChangePriority -> deny("Priorytet tylko razem z klasyfikacją (Classify)")
+          }
+      }
+      private fun deny(msg: String) = Decision.Denied(DenyCode.POLICY, msg)
+  }
+</script>
+<p>Dlaczego te granice: CRITICAL budzi dyżur i ma 30-minutowe SLA (1.1), więc fałszywy alarm o 3 w nocy kosztuje, a obniżony incydent ukrywa problem. Status opisuje pracę ludzi. Publiczny komentarz widzi klient (ryzyko z 3.4). Rozkład pracy na osoby to decyzja lidera zespołu, do kolejki wystarcza zespół.</p>
+<p>Reguły są w kodzie, jak w <code>AssistantActionPolicy</code>: pomyłka w konfiguracji nie może dać automatowi więcej praw. Drugi job systemowy (np. przeliczanie SLA) dostanie własne konto i politykę, a wybór polityki trzeba będzie rozszerzyć z <code>actorType</code> o konto aktora. Do tego czasu pierwsza linia odmawia nieznanym jobom.</p>
+<h3>Kill switch TRIAGE_APPLY</h3>
+<p>Kill switch akcji z 3.2 (<code>ai.actions.enabled</code>, <code>tenants.ai_actions_enabled</code>) dotyczy asystenta czatu i nie zatrzymuje triage. Dla triage dokładamy typ <code>TRIAGE_APPLY</code> w <code>ai.actions.disabled_types</code>. Wstrzymuje on <em>zapis</em>, a obliczenia trwają, więc wyniki dalej powstają do analizy, jak w SHADOW.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="AiAvailability (dopisane) i krok APPLY">
+  // parseTypes z 3.2 musi znać "TRIAGE_APPLY" (spoza AssistantActionType), inaczej zaloguje błąd literówki
+  fun requireTriageApplyAllowed() {                                   // bez cache, tuż przed zapisem
+      if (!readSetting("ai.enabled").toBoolean()) throw TriageApplyDisabledException("AI_DISABLED")
+      if ("TRIAGE_APPLY" in rawTypes(readSetting("ai.actions.disabled_types"))) throw TriageApplyDisabledException("KILL_SWITCH")
+  }
+
+  @Component
+  class ApplyStep(private val availability: AiAvailability, private val tickets: TicketApi) : TriageStepHandler {
+      override val step = TriageStep.APPLY
+      override fun execute(run: TriageRun): StepOutcome {
+          try { availability.requireTriageApplyAllowed() }
+          catch (e: TriageApplyDisabledException) { return StepOutcome.Finish(RunStatus.SKIPPED, e.code) }
+          val r = run.result ?: error("APPLY bez wyniku")
+          return try {
+              tickets.classify(SystemUsers.triage(run.tenantId), run.ticketId,
+                  WriteIntent.Classify(r.category, r.priority, r.team),
+                  expectedVersion = run.ticketVersion!!, actor = Actor.system(run.id))
+              StepOutcome.Finish(RunStatus.APPLIED)
+          } catch (e: StaleTicketException) {
+              StaleTriagePolicy.onStale(run)        // przypadki brzegowe: ponowny LOAD albo SKIPPED
+          } catch (e: PolicyDeniedException) {
+              StepOutcome.Finish(RunStatus.SKIPPED, "POLICY_DENIED")   // np. zgłoszenie zmieniono na CRITICAL
+          }
+      }
+  }
+</script>
+<p>Przy wyłączonym <code>ai.enabled</code> słuchacz nie tworzy runów, <code>TriageGuard</code> zatrzymuje runy w toku, a PENDING starsze niż <code>expire-after</code> job zamienia w EXPIRED.</p>
+
+<h2>Tryby tenanta: OFF, SHADOW, SUGGEST, AUTO</h2>
+<p>Kolumna <code>tenants.ai_triage_mode</code> mówi, ile zaufania tenant daje automatowi. To <dfn data-t="feature-flag">feature flag</dfn> per tenant z czterema stopniami, przełączany bez deployu.</p>
+<table>
+  <tr><th>Tryb</th><th>Run</th><th>Kto widzi wynik</th><th>Zmienia zgłoszenie</th><th>Decyzja</th></tr>
+  <tr><td>OFF</td><td>brak</td><td>–</td><td>nie</td><td>– (domyślny)</td></tr>
+  <tr><td>SHADOW</td><td><code>SHADOW</code></td><td>Nikt w UI, tylko raporty: pomiar na prawdziwym ruchu (<dfn data-t="shadow-mode">shadow mode</dfn>, 5.4)</td><td>nie</td><td>Liczona „na sucho”, run kończy się SKIPPED</td></tr>
+  <tr><td>SUGGEST</td><td>LIVE</td><td>Agent w panelu zgłoszenia, zatwierdza jednym kliknięciem (<dfn data-t="hitl">human-in-the-loop</dfn>, 5.3)</td><td>po akceptacji</td><td>Zawsze REVIEW</td></tr>
+  <tr><td>AUTO</td><td>LIVE</td><td>Agent widzi wynik i historię zmiany</td><td>tak, gdy AUTO_APPLY</td><td><code>TriageScorer</code>: AUTO_APPLY albo REVIEW (5.3)</td></tr>
+</table>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageModePolicy.kt">
+  enum class TriageMode { OFF, SHADOW, SUGGEST, AUTO }      // TenantSettings.aiTriageMode
+
+  @Component
+  class TriageModePolicy(private val props: TriageProperties) {
+      /** Model lokalny (Globex) najwyżej SUGGEST: 82,8% trafności z 1.6 to za mało na automat. */
+      fun effective(tenantMode: TriageMode, route: ModelRoute.Use): TriageMode =
+          if (!route.external && tenantMode > props.maxModeOnLocalRoute) props.maxModeOnLocalRoute else tenantMode
+  }
+</script>
+<p>Tryby są etapami wdrożenia (5.4): SHADOW → SUGGEST → AUTO po spełnieniu kryteriów zapisanych przed startem. Rollback to zmiana wartości w kolumnie, bez deployu. Runy w toku kończą według trybu zapisanego w runie (przejście na OFF zatrzymuje je przed APPLY), a zastosowane zmiany zostają. Limit trybu dla trasy lokalnej siedzi w kodzie: administrator, który ustawi Globexowi AUTO, dostanie SUGGEST i ostrzeżenie w panelu. Panel zgłoszenia w React dostaje wyłącznie runy LIVE. Wynik SHADOW nigdy nie trafia do API dla agentów, tylko do raportów.</p>
+
+<h2>Gdzie agent jednak ma sens w procesie</h2>
+<p>Workflow wyznacza agentom miejsce. Dobry kandydat to „<strong>zbadaj zgłoszenie i zaproponuj rozwiązanie</strong>”: kroków nie da się narysować (raz historia klienta, raz podobne zgłoszenia, raz trzy artykuły KB), wartość bierze się z eksploracji, a wynik czyta człowiek.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="granica: workflow wyznacza ramę, agent eksploruje, człowiek decyduje">
+  triage (workflow)          badanie (agent, na żądanie)               człowiek
+  needsHuman = true   ──►    „Zbadaj” w panelu (Piotr)          ──►    czyta raport,
+                             narzędzia tylko do odczytu:               sam decyduje
+                             getTicket, listComments,                  o zmianach
+                             searchTickets, searchKnowledgeBase
+                             wynik: InvestigationReport (szkic, cytowania KB)
+</script>
+<p>Trzy decyzje projektowe wyznaczają granicę:</p>
+<ul>
+  <li><strong>Kiedy uruchomić, decyduje człowiek albo kod, nie model.</strong> Agent startuje na kliknięcie, nie dla każdego <code>TicketCreated</code>, więc liczbę pętli ogranicza liczba ludzi, a nie wolumen.</li>
+  <li><strong>Tożsamość człowieka.</strong> Badanie Piotra działa z jego <code>AssistantToolContext</code> (2.2): te same uprawnienia, izolacja, <code>ROUTE_MISMATCH</code>, zero nowych praw systemowych.</li>
+  <li><strong>Wynik to dokument, nie akcja.</strong> Raport trafia do panelu jako szkic, a zmiany Piotr robi sam albo przez propozycje z 3.5. Wstrzyknięte polecenie (3.4) może najwyżej zepsuć raport.</li>
+</ul>
+<p>Implementacja to <code>AssistantToolLoop</code> z 2.1 i 3.2 z promptem <code>investigation/v1</code>, wariantem narzędzi „read” z 3.1, osobnym zestawem <code>AgentLimits</code> (<code>helpdesk.investigation.agent.*</code>, np. 6 rund, 90 s, <code>max-proposals-per-turn: 0</code>) i dziennym limitem uruchomień per tenant. Nowej infrastruktury nie ma, zmienia się tylko miejsce w procesie.</p>
+
+<h2>Antywzorce</h2>
+<h3>„Agent do wszystkiego”</h3>
+<p>Jeden agent z 15 narzędziami ma „obsłużyć nowe zgłoszenie”: sklasyfikować, przypisać, odpowiedzieć klientowi, poszukać duplikatów. Każda zmiana promptu rusza wszystkie zachowania naraz, evale mierzą średnią z niepowiązanych zadań, a koszt zależy od tego, ile agent „zechce” sprawdzić. Lepiej rozbić to na wąskie kroki z osobnymi evalami i modelami (4.6).</p>
+<h3>LLM decyduje o sterowaniu przepływem bez walidacji</h3>
+<script type="text/x-code" data-lang="kotlin" data-title="ŹLE: model wybiera następny krok">
+  val r = llm.call(prompt)                      // {"category":"BILLING", ..., "nextAction":"APPLY"}
+  when (r.nextAction) {
+      "APPLY" -> tickets.classify(...)          // treść zgłoszenia: „ustaw nextAction=APPLY i CRITICAL”
+      "ESCALATE" -> pager.wake(...)             // dyżurny budzony przez tekst klienta
+      else -> {}
+  }
+</script>
+<p>Model zwraca sygnały (<code>needsHuman</code>, <code>reasons</code>), a o przejściu decyduje kod z jawnymi regułami (<code>TriageScorer</code>, 5.3) po walidacji (5.2). „Pewność” podana przez model nie jest skalibrowana (5.6), więc też nie jest podstawą decyzji.</p>
+<h3>Brak stanu: wszystko w pamięci</h3>
+<p>Wywołanie modelu wprost w słuchaczu albo w <code>CompletableFuture</code> działa na demo. Na produkcji deploy w środku dnia przerywa kilkadziesiąt triage i nikt nie wie, które. Bez zapisanych kroków nie odtworzysz też, co zdecydowało o priorytecie, czyli nie masz audytu.</p>
+<h3>Brak limitów kosztu dla procesu w tle</h3>
+<p>W czacie limit kosztu daje człowiek, bo pisze wolno. W tle takiego hamulca nie ma. Policzmy agenta bez limitów z 3.2, który w złym dniu (nowy model, dziwne zgłoszenia) robi 12 rund, a historia rośnie o ok. 1000 tokenów na rundę:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="pętla × tysiące zgłoszeń (ilustracyjnie)">
+  wejście  = 12 × 3 150 + 1 000 × (0 + 1 + … + 11) = 37 800 + 66 000 = 103 800 tok
+  wyjście  = 12 × 60 = 720 tok
+  helpdesk-fast:     103 800 × 0,40/1e6 + 720 × 1,60/1e6 = 0,0427 USD / zgłoszenie
+  helpdesk-default:  103 800 × 3,00/1e6 + 720 × 15/1e6   = 0,3222 USD / zgłoszenie
+
+  import 10 000 zgłoszeń:   fast ≈ 427 USD,   default ≈ 3 222 USD   (w godzinę)
+  workflow (1 wywołanie):   10 000 × 0,000704 ≈ 7 USD
+  + restart w trakcie bez stanu → wszystko od nowa, × liczba restartów
+</script>
+<p>Obrony w workflow: <code>max-llm-calls-per-run</code> i <code>run-token-budget</code> w <code>TriageGuard</code>, budżet grupy <code>triage</code> w <code>tenant_ai_feature_budgets</code> (4.6; przekroczenie → runy SKIPPED z <code>BUDGET</code>), limit runów per tenant na godzinę, <code>feature = 'triage'</code> w <code>llm_usage</code> (2.6) z alertem na koszt godzinowy i, poza aplikacją, klucz wirtualny LiteLLM z własnym budżetem (1.3).</p>
+<div class="box bug"><span class="label">Scenariusz do zapamiętania</span><p>„Agent triage” startuje w piątek. W weekend import z CRM synchronizuje 40 tys. historycznych zgłoszeń jako nowe. Agent bez limitu rund i budżetu mieli je dwa dni, a rundy zakończone błędem 429 ponawia od początku. W poniedziałek rachunek z weekendu przekracza budżet miesięczny, a historyczne zgłoszenia mają zmienione priorytety. Każdy element tej lekcji (słuchacz bez LLM, priorytet importu, limity per tenant, budżet, checkpointy, polityka) zatrzymałby ten scenariusz w innym miejscu.</p></div>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Zachowanie</th></tr>
+  <tr><td>Zgłoszenie edytowane w trakcie triage</td><td>LOAD zapisuje <code>ticket_version</code>, APPLY woła fasadę z <code>expectedVersion</code>. Przy <code>StaleTicketException</code> <code>StaleTriagePolicy</code> przegląda <code>ticket_events</code> od tej wersji. Człowiek zmienił kategorię, priorytet lub zespół → SKIPPED (<code>TICKET_CHANGED_BY_HUMAN</code>), nigdy nie nadpisujemy człowieka; wynik zostaje w runie do porównań (5.6, 5.7). Doszedł tylko komentarz albo poprawka opisu (komentarz też podbija wersję, 3.5) → jeden powrót do LOAD, bo nowa treść może zmienić klasyfikację; drugi konflikt → SKIPPED.</td></tr>
+  <tr><td>Import masowy: 10 tys. zgłoszeń naraz</td><td>Słuchacz robi 10 tys. szybkich <code>INSERT</code>. Runy importu mają <code>priority = 10</code>, więc zgłoszenia z WWW tego tenanta je wyprzedzają, a <code>per-tenant-concurrency: 2</code> zostawia workery innym tenantom. Rachunek: 10 000 × 0,9 s / 2 wątki ≈ 75 min, ale limit 600 runów/h rozciąga import na ok. 17 h. Historyczne zgłoszenia z gotową kategorią najlepiej pominąć już w imporcie.</td></tr>
+  <tr><td>Tenant z <code>ai_enabled = false</code></td><td><code>ModelRouter</code> zwraca <code>Disabled("AI_DISABLED")</code>, run nie powstaje, metryka <code>notStarted{reason}</code>. Wyłączenie w trakcie: <code>TriageGuard</code> kończy runy przed CLASSIFY jako SKIPPED.</td></tr>
+  <tr><td>Globex (<code>helpdesk-local</code>)</td><td>REDACT pusty, tryb najwyżej SUGGEST, p95 3,9 s, GPU dzielone z KB (4.6). Osobny <dfn data-t="bulkhead">bulkhead</dfn> <code>triage-local</code> (np. 2 równoległe wywołania) chroni zapytania KB przed importem. Nigdy fallbacku na model zewnętrzny (1.6).</td></tr>
+  <tr><td>Zgłoszenie zamknięte przed LOAD</td><td>LOAD → SKIPPED (<code>TICKET_NOT_OPEN</code>).</td></tr>
+  <tr><td>LiteLLM zwraca 429 przez godzinę</td><td>Retry z backoff, po <code>max-attempts</code> FAILED, zgłoszenia w kolejce ręcznej; alert na odsetek FAILED budzi właściciela triage, nie dyżur SLA.</td></tr>
+</table>
+
+<h2>Testy: atrapa modelu, polityka, idempotencja</h2>
+<p>Workflow testujesz jak zwykły kod, bo kolejność kroków jest deterministyczna. Model zastępuje atrapa interfejsu <code>TriageClassifier</code> (implementację ze Spring AI pokazuje 5.2), a jakość samego modelu mierzą evale (3.7, 5.6).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageWorkflowIT.kt">
+  @SpringBootTest
+  @Testcontainers
+  class TriageWorkflowIT(
+      @Autowired val trigger: TriageTrigger, @Autowired val worker: TriageWorker,
+      @Autowired val runs: TriageRunTestRepository, @Autowired val tickets: TicketTestFixtures,
+  ) {
+      @MockitoBean lateinit var classifier: TriageClassifier     // Spring Boot 3.4+; wcześniej @MockBean
+      @MockitoBean lateinit var scorer: TriageScorer             // decyzja z 5.3 poza zakresem testu
+
+      @Test
+      fun `HD-3001 w trybie AUTO przechodzi wszystkie kroki i zmienia zgloszenie przez fasade`() {
+          tickets.setTriageMode(ACME, TriageMode.AUTO)
+          val t = tickets.create(ACME, "Faktura za październik naliczona podwójnie", "Na fakturze FV/10/2026 …")
+          whenever(classifier.classify(any(), any())).thenReturn(classifierJson(   // stały JSON zgodny ze schematem 5.2
+              """{"category":"BILLING","priority":"HIGH","team":"ACME-BILLING","language":"pl",
+                  "summary":"Podwójne naliczenie faktury.","needsHuman":false,"reasons":["faktura"]}"""))
+          whenever(scorer.decide(any(), any(), any())).thenReturn(TriageDecision.AUTO_APPLY)
+
+          trigger.on(TicketCreated(t.id, ACME, NOW))
+          worker.drainForTest()                                   // synchronicznie, bez @Scheduled
+
+          val run = runs.liveRun(t.id)!!
+          assertThat(run.status).isEqualTo(RunStatus.APPLIED)
+          assertThat(runs.steps(run.id).map { it.step }).containsExactly(
+              TriageStep.LOAD, TriageStep.REDACT, TriageStep.CLASSIFY, TriageStep.VALIDATE, TriageStep.DECIDE, TriageStep.APPLY)
+          val after = tickets.staffView(t.id)
+          assertThat(after.category to after.priority).isEqualTo(TicketCategory.BILLING to TicketPriority.HIGH)
+          assertThat(after.status).isEqualTo(TicketStatus.NEW)            // status nietknięty
+          val event = tickets.events(t.id).single { it.type == "TRIAGE_APPLIED" }
+          assertThat(event.actorType to event.actorId).isEqualTo("SYSTEM" to Actor.TRIAGE_ACCOUNT_ID)
+          assertThat(event.payload["triageRunId"].asText()).isEqualTo(run.id.toString())
+          verify(classifier, times(1)).classify(any(), any())             // jedno wywołanie modelu
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="TriagePolicyTest.kt">
+  class TriagePolicyTest {
+      private val policy = TriagePolicy()
+      private val user = SystemUsers.triage(ACME)
+      private val actor = Actor.system(runId = UUID.randomUUID())
+      private val ticket = snapshot(tenantId = ACME, status = TicketStatus.NEW, priority = TicketPriority.NORMAL)
+
+      @ParameterizedTest @EnumSource(TicketStatus::class)
+      fun `triage nigdy nie zmienia statusu`(target: TicketStatus) =
+          assertThat(policy.check(user, actor, ticket, WriteIntent.ChangeStatus(target))).isInstanceOf(Decision.Denied::class.java)
+
+      @Test
+      fun `CRITICAL tylko przez przeglad, klasyfikacja HIGH dozwolona`() {
+          val critical = WriteIntent.Classify(TicketCategory.TECHNICAL, TicketPriority.CRITICAL, "ACME-DEV")
+          assertThat(policy.check(user, actor, ticket, critical)).isInstanceOf(Decision.Denied::class.java)
+          assertThat(policy.check(user, actor, ticket, critical.copy(priority = TicketPriority.HIGH))).isEqualTo(Decision.Allowed)
+      }
+
+      @Test
+      fun `fasada odrzuca zmiane statusu przez aktora triage`(@Autowired tickets: TicketApi) {   // wariant IT
+          assertThrows<PolicyDeniedException> {
+              tickets.changeStatus(user, HD_3001, TicketStatus.IN_PROGRESS, null, actor)
+          }
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageTriggerIdempotencyIT.kt">
+  @Test
+  fun `to samo zdarzenie wielokrotnie, rownolegle i po zmianie konfiguracji, daje jeden run LIVE`() {
+      val e = TicketCreated(HD_3001, ACME, NOW)
+      val pool = Executors.newFixedThreadPool(2)
+      listOf(pool.submit { trigger.on(e) }, pool.submit { trigger.on(e) }).forEach { it.get() }
+      configs.overrideForTest("triage/v2|helpdesk-fast|schema-v1|cfg-0000beef")    // deploy w międzyczasie
+      trigger.on(e)                                                   // ponowienie po restarcie
+      assertThat(runs.countFor(HD_3001, RunMode.LIVE)).isEqualTo(1)   // ux_triage_runs_live
+  }
+</script>
+<p>Dopisz jeszcze: słuchacz nigdy nie woła <code>TriageClassifier</code> (<code>verifyNoInteractions</code>), Globex z AUTO dostaje decyzję REVIEW, a <code>TRIAGE_APPLY</code> w <code>disabled_types</code> daje SKIPPED z <code>KILL_SWITCH</code> bez zmiany zgłoszenia. Pełny przepływ przez rejestr publikacji sprawdzisz testem modułu (<code>@ApplicationModuleTest</code> z API <code>Scenario</code>; sprawdź w dokumentacji swojej wersji).</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Policz koszt miesięczny workflow i agenta dla wolumenu ze swojego systemu, w wariancie z 4 i z 8 rundami agenta. Zapisz wynik i decyzję jako ADR razem z warunkiem, który kazałby ją zmienić.</li>
+  <li>Napisz migrację V50 i oba testy idempotencji wyzwalacza. Usuń indeks <code>ux_triage_runs_live</code> i sprawdź, który test teraz nie przechodzi i dlaczego.</li>
+  <li>Dopisz do <code>TriagePolicyTest</code> test macierzowy: każda intencja <code>WriteIntent</code> × każdy priorytet bieżący (z CRITICAL). Dodaj nową intencję i zobacz, że kompilator i test wymuszają decyzję w polityce.</li>
+  <li>W teście z atrapą modelu opóźniającą odpowiedź o 900 ms zasymuluj import 2000 zgłoszeń Acme i w tym czasie utwórz 5 zgłoszeń przez WWW. Zmierz czas do APPLIED dla zgłoszeń z WWW przy <code>per-tenant-concurrency</code> 2 i 4.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="1">
+  <p class="q">Co odróżnia workflow z krokami LLM od agenta?</p>
+  <button>Workflow używa tańszego modelu</button>
+  <button>W workflow o kolejności kroków decyduje kod, w agencie model wybiera kolejne kroki i narzędzia</button>
+  <button>Agent zawsze używa wielu modeli naraz</button>
+  <p class="explain">Rozróżnienie dotyczy sterowania, nie modelu. Prompt chaining czy routing to nadal workflow, bo ścieżki są zapisane w kodzie, a model daje tylko dane.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Dlaczego agent z narzędziami nie wnosi wartości w triage HelpDesk?</p>
+  <button>Wszystko, co agent mógłby „odkryć” (komentarze, zespoły, podobne zgłoszenia), jest zawsze potrzebne i kod pobiera to w LOAD, a pętla dokłada koszt (ok. 11×), opóźnienie i zmienność</button>
+  <button>Agenci nie obsługują structured output</button>
+  <button>Spring AI nie pozwala używać narzędzi w zadaniach w tle</button>
+  <p class="explain">Gdy kroki są znane z góry, eksploracja niczego nie dodaje. Workflow z jednym wywołaniem jest tańszy, szybszy, odtwarzalny i odporniejszy na prompt injection.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="2">
+  <p class="q">Dlaczego <code>TriageTrigger</code> (<code>@ApplicationModuleListener</code>) tylko wstawia wiersz do <code>triage_runs</code>, zamiast od razu wywołać model?</p>
+  <button>Bo słuchacz Spring Modulith nie może korzystać z HTTP</button>
+  <button>Bo rejestr publikacji zdarzeń usuwa zdarzenia starsze niż sekunda</button>
+  <button>Bo zdarzenia przychodzą co najmniej raz, a wywołanie LLM w słuchaczu nie ma dzierżawy, limitów, checkpointów ani priorytetów; ponowienie po restarcie wywołałoby model ponownie</button>
+  <p class="explain">Rejestr publikacji gwarantuje, że zdarzenie nie zginie. Wykonaniem procesu (kolejność, limity, ponowienia, sprawiedliwość między tenantami) zarządza trwały stan w <code>triage_runs</code> i worker.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Triage dla Globex w trybie AUTO, który administrator ustawił w panelu. Co się dzieje?</p>
+  <button>Triage stosuje wyniki automatycznie, bo tryb tenanta ma pierwszeństwo</button>
+  <button>Tryb efektywny to SUGGEST: trasa lokalna ma w kodzie limit trybu, więc wynik trafia do przeglądu</button>
+  <button>Triage używa modelu zewnętrznego, bo AUTO wymaga lepszej trafności</button>
+  <p class="explain"><code>TriageModePolicy</code> obcina tryb dla <code>helpdesk-local</code> do <code>max-mode-on-local-route</code>. Model lokalny miał 82,8% trafności w 1.6, a fallback na model zewnętrzny jest dla Globex zabroniony.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="3">
+  <p class="q">Klient dopisał komentarz 10 sekund po utworzeniu zgłoszenia, a triage jest właśnie w kroku APPLY. Co jest właściwe?</p>
+  <button>Zastosować wynik bez sprawdzania wersji, bo komentarz nie zmienia kategorii</button>
+  <button>Oznaczyć run jako FAILED i wysłać alert</button>
+  <button>Nadpisać zgłoszenie, a komentarz przenieść do historii</button>
+  <button>Po konflikcie wersji sprawdzić, co się zmieniło: zmiana pól klasyfikacji przez człowieka → SKIPPED, sam komentarz → jeden ponowny LOAD z nową treścią</button>
+  <p class="explain">Komentarz podbija <code>tickets.version</code>. Triage nigdy nie nadpisuje człowieka, ale nowa treść może zmienić klasyfikację, więc liczymy ją jeszcze raz, najwyżej raz.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

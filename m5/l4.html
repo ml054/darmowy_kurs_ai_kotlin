@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.4 Shadow mode, rollout, rollback – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="5.4">
+<main>
+<p class="meta">Lekcja 5.4 · ok. 60 min</p>
+<h1>Shadow mode, rollout, rollback</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć błąd produkcyjny #2, czyli cichą podmianę modelu, i poznać wszystkie drogi, którymi model albo konfiguracja zmieniają się bez commita.</li>
+  <li>Zbudować cztery niezależne obrony: przypięty snapshot, zapis faktycznego modelu z alertem, codzienny canary eval i sygnały jakości z przeglądów.</li>
+  <li>Uruchomić nową konfigurację triage w shadow mode, tak żeby niczego nie zmieniała, i porównać ją z produkcją oraz z decyzjami ludzi.</li>
+  <li>Przeprowadzić rollout SHADOW → SUGGEST → AUTO ze stabilnym przypisaniem i kryteriami zapisanymi przed startem.</li>
+  <li>Cofnąć zmianę bez deployu, wiedząc, co dzieje się z runami w toku i ze zmianami już zastosowanymi.</li>
+</ul></div>
+
+<h2>Błąd produkcyjny #2: cicha podmiana modelu</h2>
+<p>W 1.3 administrator sam zmienił model pod aliasem. Tutaj zespół nie zrobił niczego: nie ma commita, deployu ani kogo zapytać, co zmienił.</p>
+<div class="box bug"><span class="label">Błąd produkcyjny #2: cicha podmiana modelu</span>
+<p><strong>Tło.</strong> Acme ma triage w trybie AUTO od września (720 zgłoszeń w dzień roboczy, ok. 70% stosowanych automatycznie). W <code>litellm.yaml</code> alias <code>helpdesk-fast</code> wskazywał na <code>vendor/fast-mini</code>, czyli alias dostawcy bez daty. Wpis został z prototypu; reguła CI z 1.3 sprawdzała tylko <code>model_info.id</code>. Nazwy modeli są fikcyjne.</p>
+<p><strong>Co się stało.</strong> We wtorek o 06:12 dostawca przesunął <code>vendor/fast-mini</code> ze snapshotu <code>fast-mini-2026-03-02</code> na <code>fast-mini-2026-10-06</code>. Nowy model inaczej rozumiał granicę BILLING/ACCOUNT, więc pytania o faktury na konto firmowe lądowały w ACCOUNT. Trafność kategorii, mierzona później na próbce przeglądów kontrolnych, spadła z 91% do 78%.</p>
+<p><strong>Dlaczego nikt nie zauważył.</strong> Nic się nie zepsuło: zero błędów, ten sam format, a część wskaźników nawet się poprawiła. Po ośmiu dniach kierowniczka działu rozliczeń zapytała, dlaczego jej kolejka jest taka cicha.</p></div>
+<table>
+  <tr><th>Dzień</th><th>Co widać w systemie</th><th>Interpretacja w tamtej chwili</th></tr>
+  <tr><td>D0 wt 06:12</td><td><code>llm_usage.provider_model</code> zmienia wartość, p95 spada z 1,9 s do 1,7 s</td><td>Nikt nie patrzy na tę kolumnę</td></tr>
+  <tr><td>D1–D3</td><td>AUTO_APPLY rośnie z 71% do 76%, kolejka przeglądu maleje (mniej <code>needsHuman</code>)</td><td>„Triage się uczy”</td></tr>
+  <tr><td>D2–D7</td><td>Korekty BILLING/ACCOUNT w próbce AUDIT, ok. 25 etykiet dziennie</td><td>Nikt nie widzi sumy; <code>CategoryAccuracyStats</code> (5.3) liczy z 30 dni</td></tr>
+  <tr><td>D3–D8</td><td>Zespół ACCOUNT ręcznie przerzuca faktury, 37 zgłoszeń przekracza SLA</td><td>Przerzucenie nie jest liczone jako korekta triage (5.7)</td></tr>
+  <tr><td>D8</td><td>Eskalacja. SQL po <code>triage_runs</code>: skok ACCOUNT od wtorku; w <code>llm_usage</code> nowy model</td><td>Diagnoza w 40 minut, bo dane były</td></tr>
+  <tr><td>D8 +1 h</td><td>PR ze snapshotem <code>fast-mini-2026-03-02</code>, Acme AUTO → SUGGEST</td><td>Ok. 650 zgłoszeń do przejrzenia</td></tr>
+</table>
+<p>Dlaczego żaden alarm nie zadziałał? Każdy istniejący alert pilnował innej klasy awarii:</p>
+<table>
+  <tr><th>Sygnał</th><th>Wartość w incydencie</th><th>Dlaczego milczał</th></tr>
+  <tr><td>Błędy 5xx, breaker (1.5)</td><td>0</td><td>Model działał poprawnie technicznie</td></tr>
+  <tr><td>Latencja p95</td><td>Lepsza</td><td>Alert reaguje tylko na wzrost</td></tr>
+  <tr><td>Walidacja (5.2)</td><td>0,3% → 0,4%</td><td><dfn data-t="structured-output">Structured output</dfn> w trybie strict gwarantuje format, nie treść: <code>"ACCOUNT"</code> to poprawna wartość enuma</td></tr>
+  <tr><td>Fallback (1.5)</td><td>0%</td><td>Odpowiadał ten sam alias, ten sam dostawca</td></tr>
+  <tr><td>Bramka CI (3.7)</td><td>Nie uruchomiona</td><td>Brak PR. Evale triage były tylko na PR-ach dotykających <code>prompts/triage</code></td></tr>
+  <tr><td><code>config_version</code> (5.2)</td><td>Bez zmian</td><td>Etykieta opisuje to, co wybrała aplikacja (prompt, alias), a nie to, co dostawca podstawił pod alias</td></tr>
+  <tr><td>Kolejka przeglądu (5.3)</td><td>Krótsza</td><td>Mniej przypadków niepewnych wyglądało na sukces</td></tr>
+</table>
+<p>Jakości modelu nie zmierzysz sygnałami technicznymi. Potrzebne są sygnały o tym, <em>który</em> model odpowiada i <em>jak dobrze</em>.</p>
+
+<h2>Wszystkie drogi cichej zmiany</h2>
+<p><dfn data-t="model-drift">Cicha zmiana modelu</dfn> to każda zmiana zachowania funkcji AI, która nie przeszła przez pull request z evalami: zmienia się model, jego parametry albo wejście, a kod aplikacji zostaje taki sam. Podmiana pod aliasem dostawcy to tylko jedna z dróg:</p>
+<table>
+  <tr><th>Droga</th><th>Przykład w HelpDesk</th><th>Widać w <code>provider_model</code>?</th><th>Główna obrona</th></tr>
+  <tr><td>Dostawca podmienia model pod aliasem</td><td><code>*-latest</code>, <code>vendor/fast-mini</code>; Azure z automatyczną aktualizacją wersji</td><td>Zwykle tak, nie u każdego</td><td>Snapshot, oczekiwane modele, canary eval</td></tr>
+  <tr><td>Zmiana <code>litellm.yaml</code> bez PR</td><td>Edycja w UI proxy, ręczny <code>kubectl edit</code></td><td>Tylko gdy zmienił się model</td><td>Konfiguracja jako kod, kontrola rozjazdu</td></tr>
+  <tr><td>Fallback trwający dniami (1.5)</td><td>Ruch na <code>helpdesk-default-backup</code>; triage: <code>context_window_fallbacks</code> na <code>helpdesk-default</code></td><td>Tak</td><td>Alert na fallback trwający godzinami</td></tr>
+  <tr><td>Pula z różnymi wersjami</td><td>Dwa regiony Azure, jeden zaktualizowany</td><td>Tak, dwie wartości naprzemiennie</td><td>Oczekiwane modele</td></tr>
+  <tr><td>Model lokalny: obraz, <code>pull</code>, <dfn data-t="quantization">kwantyzacja</dfn></td><td>Globex: <code>ollama pull qwen2.5:14b</code> ściąga nowe wagi pod tym samym tagiem</td><td>Nie: nazwa to tag</td><td>Digest/rewizja w konfiguracji, canary eval</td></tr>
+  <tr><td>Prompt bez nowej wersji</td><td>Edycja <code>v1.st</code>, przykładów few-shot, reguł słów kluczowych</td><td>Nie</td><td>Hash w <code>config_version</code> (2.4, 5.2)</td></tr>
+  <tr><td>Zmiana wejścia</td><td>Nowe recognizery Presidio (2.7), LOAD dołącza drugi komentarz</td><td>Nie</td><td>Wersja redaktora w hashu, canary eval</td></tr>
+  <tr><td>Zmiana sędziego (5.6)</td><td>Nowy model sędziego: oceny <code>summary</code> rosną bez zmiany triage</td><td>Tak, w runach sędziego</td><td>Snapshot sędziego, kalibracja</td></tr>
+</table>
+<p>Zapis faktycznego modelu łapie połowę dróg, druga połowa nie zostawia śladu w metadanych. Dlatego obrony są cztery.</p>
+
+<h2>Obrona 1: snapshot i konfiguracja proxy jako kod</h2>
+<p>Zasada z 1.6 i 2.4: w LiteLLM przypinasz <dfn data-t="model-snapshot">snapshot</dfn>, czyli wersję z datą, którą dostawca może tylko wycofać, ale nie podmienić. Elastyczność daje Twój <dfn data-t="alias">alias</dfn>. Po incydencie wpis wygląda tak:</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm/litellm.yaml (fragment, nazwy fikcyjne)">
+model_list:
+  - model_name: helpdesk-fast
+    litellm_params:
+      model: vendor/fast-mini-2026-03-02          # SNAPSHOT z datą, nigdy alias dostawcy
+      api_key: os.environ/VENDOR_API_KEY
+    model_info: { id: fast-vendor-v3, base_model: vendor/fast-mini-2026-03-02 }
+
+  - model_name: helpdesk-fast-candidate           # kandydat do shadow (dalej w lekcji)
+    litellm_params: { model: vendor/fast-mini-2026-10-06, api_key: os.environ/VENDOR_API_KEY }
+    model_info: { id: fast-vendor-v4-candidate }
+
+  - model_name: helpdesk-local
+    litellm_params:
+      model: hosted_vllm/qwen2.5-14b-awq-r5f1e2c   # nazwa serwowana zawiera rewizję wag
+      api_base: http://vllm:8000/v1
+    model_info: { id: local-vllm-r5f1e2c }
+
+general_settings:
+  store_model_in_db: false     # modele tylko z pliku; UI proxy nie dodaje wdrożeń (sprawdź nazwę opcji w swojej wersji)
+</script>
+<p>Walidacja w CI z 1.3 dostaje dwie reguły: nazwa modelu dostawcy kończy się datą (wyjątki z uzasadnieniem w <code>litellm/allowed-undated.txt</code>), a każda zmiana <code>litellm_params.model</code> zmienia w tym samym PR listę oczekiwanych modeli (obrona 2). Data w nazwie nie wystarczy tam, gdzie wersja jest atrybutem wdrożenia:</p>
+<ul>
+  <li><strong>Azure OpenAI</strong>: wdrożenie ma <code>versionUpgradeOption</code> (<code>OnceNewDefaultVersionAvailable</code>, <code>OnceCurrentVersionExpired</code>, <code>NoAutoUpgrade</code>). Według dokumentacji pierwsza opcja przenosi wdrożenie na nową wersję domyślną w ciągu dwóch tygodni i według dokumentacji Terraform jest domyślna. Dla triage ustaw <code>NoAutoUpgrade</code> w IaC, a datę wycofania wersji wpisz do kalendarza, bo po niej wdrożenie przestaje działać. Sprawdź zachowanie w dokumentacji swojej wersji API.</li>
+  <li><strong>vLLM</strong>: <code>--revision &lt;commit&gt;</code> przypina wagi z Hugging Face, a rewizja w <code>--served-model-name</code> sprawia, że zmiana wag zmienia pole <code>model</code> w odpowiedzi. Obraz przypinasz po digeście.</li>
+  <li><strong>Ollama</strong>: tag jest ruchomy jak alias dostawcy. <code>GET /api/tags</code> zwraca <code>digest</code> i <code>details.quantization_level</code>. Oczekiwany digest trzymasz w konfiguracji i sprawdzasz cyklicznie.</li>
+</ul>
+<p>Snapshot chroni przed dostawcą, nie przed własnym zespołem. Stąd <dfn data-t="gitops">GitOps</dfn> z 1.3 (jedyna droga zmiany proxy to PR) i codzienna kontrola rozjazdu: zadanie pobiera listę wdrożeń z działającego proxy (<code>/model/info</code>, sprawdź format w swojej wersji) i porównuje pary <code>model_name → model, model_info.id</code> z plikiem z <code>main</code>. Różnica oznacza zmianę z pominięciem repozytorium.</p>
+<div class="box warn"><span class="label">Pułapka: snapshot nie zamraża wszystkiego</span><p>Wokół snapshotu zmieniają się filtry treści, domyślne parametry API i liczenie tokenów. Dlatego obrony 3 i 4 mierzą jakość bezpośrednio, a nie tylko nazwę modelu.</p></div>
+
+<h2>Obrona 2: faktyczny model w każdym runie i detektor zmiany</h2>
+<p><code>llm_usage.provider_model</code> (2.6) i <code>triage_runs.provider_model</code> (5.2, <code>TriageModelCall</code>) zapisują pole <code>model</code> z odpowiedzi, czyli <code>gen_ai.response.model</code> ze spanu (1.4). W incydencie dane leżały w bazie od pierwszej minuty. Brakowało oczekiwania: listy modeli, które <em>powinny</em> odpowiadać pod aliasem.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml – oczekiwane modele (zmieniane w tym samym PR co litellm.yaml)">
+helpdesk:
+  ai:
+    expected-models:
+      helpdesk-fast:           { primary: [fast-mini-2026-03-02] }
+      helpdesk-fast-candidate: { primary: [fast-mini-2026-10-06] }
+      helpdesk-default:
+        primary:  [claude-sonnet-4-5-20250929]       # przykład; obie pozycje puli to ten sam snapshot
+        fallback: [gpt-4.1-2025-04-14]               # helpdesk-default-backup (1.5)
+      helpdesk-local:          { primary: [qwen2.5-14b-awq-r5f1e2c] }
+    drift:
+      window: 15m
+      fallback-alert-share: 0.20       # udział fallbacku…
+      fallback-alert-after: 6h         # …utrzymany tyle czasu = „fallback trwający dniami”
+      quality-recent: 3d               # etykiety BLIND/AUDIT: okno bieżące i referencyjne
+      quality-reference: 28d
+      min-labels: 40
+      auto-degrade: true               # AUTO → SUGGEST dla tenantów na dotkniętym aliasie
+</script>
+<p>Detektor działa co 5 minut na <code>llm_usage</code> (czat, KB, triage) i na etykietach z 5.3. Logika jest w czystej funkcji <code>detect</code>, testowalnej bez bazy:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/ai/drift/ModelDriftDetector.kt">
+sealed interface DriftSignal {
+    data class UnexpectedModel(val alias: String, val providerModel: String, val calls: Long) : DriftSignal
+    data class FallbackPersistent(val alias: String, val share: Double, val since: Instant) : DriftSignal
+    data class QualityDrop(val tenantCode: String, val alias: String, val providerModel: String,
+                           val recent: ClosedFloatingPointRange<Double>, val reference: ClosedFloatingPointRange<Double>,
+                           val recentLabels: Int) : DriftSignal
+}
+data class ModelObservation(val alias: String, val providerModel: String, val calls: Long)
+data class LabelWindow(val tenantCode: String, val alias: String, val providerModel: String, val correct: Int, val total: Int)
+
+@Component
+class ModelDriftDetector(
+    private val queries: DriftQueries,          // SQL niżej
+    private val props: DriftProperties,         // helpdesk.ai.expected-models + helpdesk.ai.drift
+    private val sink: DriftSink,                // metryki, audyt, TriageAutoDegrade
+    private val clock: Clock,
+) {
+    @Scheduled(fixedDelayString = "PT5M")
+    fun run() {
+        val now = clock.instant(); val r = props.qualityRecent
+        sink.publish(detect(queries.observed(now.minus(props.window), now),
+            queries.fallbackShareAbove(props.fallbackAlertShare, since = now.minus(Duration.ofDays(3))),
+            queries.labels(now.minus(r), now), queries.labels(now.minus(r + props.qualityReference), now.minus(r)), now))
+    }
+
+    fun detect(observed: List<ModelObservation>, fallbackSince: Map<String, Pair<Instant, Double>>,
+               recent: List<LabelWindow>, reference: List<LabelWindow>, now: Instant): List<DriftSignal> = buildList {
+        observed.forEach { o ->
+            val exp = props.expectedModels[o.alias]
+            if (exp == null || (o.providerModel !in exp.primary && o.providerModel !in exp.fallback))
+                add(DriftSignal.UnexpectedModel(o.alias, o.providerModel, o.calls))
+        }
+        fallbackSince.forEach { (alias, v) ->
+            if (Duration.between(v.first, now) >= props.fallbackAlertAfter) add(DriftSignal.FallbackPersistent(alias, v.second, v.first))
+        }
+        val ref = reference.groupBy { it.tenantCode to it.alias }
+            .mapValues { (_, ws) -> Stats.wilson(ws.sumOf { it.correct }, ws.sumOf { it.total }) }
+        recent.filter { it.total >= props.minLabels }.forEach { w ->           // np. 40 etykiet
+            val before = ref[w.tenantCode to w.alias] ?: return@forEach
+            val now95 = Stats.wilson(w.correct, w.total)                        // Wilson z 3.7
+            if (now95.endInclusive < before.start)                              // przedziały rozłączne
+                add(DriftSignal.QualityDrop(w.tenantCode, w.alias, w.providerModel, now95, before, w.total))
+        }
+    }
+}
+</script>
+<script type="text/x-code" data-lang="sql" data-title="DriftQueries – zapytania detektora">
+-- observed: które modele faktycznie odpowiadały w oknie
+SELECT model_alias AS alias, provider_model, count(*) AS calls
+  FROM llm_usage WHERE occurred_at >= :from AND occurred_at < :to AND outcome <> 'ERROR'
+ GROUP BY 1, 2;
+
+-- labels: trafność kategorii na NIEOBCIĄŻONYCH etykietach (BLIND/AUDIT, 5.3)
+SELECT t.code AS tenant_code, r.model_alias AS alias, l.provider_model,
+       count(*) FILTER (WHERE l.model_category = l.human_category) AS correct,
+       count(*) AS total
+  FROM triage_review_labels l
+  JOIN triage_runs r ON r.id = l.run_id
+  JOIN tenants t     ON t.id = l.tenant_id
+ WHERE l.label_source IN ('BLIND','AUDIT') AND l.decided_at >= :from AND l.decided_at < :to
+ GROUP BY 1, 2, 3;
+</script>
+<p>Detektor czyta etykiety wielu tenantów, więc działa z <code>app.system_job</code> jak worker z 5.1. <code>DriftSink</code> ustawia gauge <code>helpdesk.ai.model.unexpected{alias, provider_model}</code> i <code>helpdesk.ai.model.fallback.share{alias}</code>, zapisuje audyt, a przy sygnale na aliasie triage przełącza jego tenantów z AUTO na SUGGEST. Kontrakt 5.3 pozwala automatowi tylko na ten kierunek: zaufanie zmniejsza sam, zwiększa tylko człowiek. To „automatyczny rollback” zapowiadany w 2.4. <dfn data-t="cardinality">Kardynalność</dfn> jest niska: par alias–model jest kilkanaście.</p>
+<p>W incydencie <code>UnexpectedModel</code> pojawiłby się o 06:15, a <code>QualityDrop</code> w D3: 59/75 = 78,7% z przedziałem Wilsona [68,1; 86,4], rozłącznym z [88,7; 92,9] dla 637/700 z 28 dni. Jeden dzień (20/25, [60,9; 91,1]) nie wystarcza: tyle trwa wykrycie spadku o 13 p.p. z etykiet.</p>
+<p>Sygnał „nowa wartość” da się też zbudować w Prometheusie na metryce Spring AI z 1.4, dla wszystkich aliasów:</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts/helpdesk-ai-drift.rules.yml (Prometheus)">
+groups:
+  - name: helpdesk-ai-drift
+    rules:
+      - alert: AiProviderModelNew                 # para alias–model, której nie było przez 7 dni
+        expr: |
+          group by (gen_ai_request_model, gen_ai_response_model) (
+            increase(gen_ai_client_operation_seconds_count[30m]) > 0)
+          unless
+          group by (gen_ai_request_model, gen_ai_response_model) (
+            increase(gen_ai_client_operation_seconds_count[7d] offset 30m) > 0)
+        labels: { severity: ticket }
+        annotations: { runbook_url: "https://git.example/helpdesk/runbooks/triage-rollback.md" }
+      - alert: AiProviderModelUnexpected          # spoza helpdesk.ai.expected-models
+        expr: max by (alias, provider_model) (helpdesk_ai_model_unexpected) == 1
+        for: 5m
+        labels: { severity: page }                # triage w AUTO zmienia zgłoszenia co minutę
+      - alert: AiFallbackPersistent               # 1.5 łapie skok, ten alert łapie stan trwały
+        expr: max by (alias) (helpdesk_ai_model_fallback_share) > 0.20
+        for: 6h
+        labels: { severity: ticket }
+</script>
+<p>Pierwsza reguła wymaga retencji ponad 7 dni i po zmianie nazw atrybutów OTel (1.4) zamilknie bez ostrzeżenia, więc dodaj <code>promtool test rules</code>. <code>AiFallbackPersistent</code> uzupełnia <code>LlmFallbackRateHigh</code> z 1.5: tamten łapie skok w 15 minut, ten stan, w którym 25% ruchu od trzech dni idzie na backup.</p>
+
+<h2>Obrona 3: canary eval na produkcyjnym aliasie</h2>
+<p><dfn data-t="canary-eval">Canary eval</dfn> to zaplanowany, codzienny przebieg <dfn data-t="eval">evali</dfn> na <em>produkcyjnym</em> aliasie i przez produkcyjne proxy, porównany z <dfn data-t="baseline">baseline</dfn>. To ta sama logika co bramka z 3.7, tylko z innym wyzwalaczem: bramka pyta, czy zmiana w kodzie pogorszyła wynik, a canary eval pyta, czy pogorszył go ktoś inny. Łapie drogi niewidoczne w <code>provider_model</code>: ruchomy tag Ollamy, zmianę filtrów, nowy obraz vLLM.</p>
+<script type="text/x-code" data-lang="yaml" data-title=".github/workflows/triage-canary.yml">
+name: triage-canary
+on:
+  schedule:
+    - cron: "15 5 * * *"            # codziennie 05:15 UTC, przed szczytem zgłoszeń
+  workflow_dispatch: {}             # ręcznie: po zmianie obrazu vLLM, po alercie AiProviderModelNew
+concurrency: { group: triage-canary, cancel-in-progress: false }
+jobs:
+  canary:
+    runs-on: [self-hosted, helpdesk-internal]   # musi dosięgnąć produkcyjnego proxy i helpdesk-local
+    timeout-minutes: 30
+    environment: production-canary              # sekret dostępny tylko temu workflow
+    steps:
+      - uses: actions/checkout@v4                 # + setup-java jak w 3.7
+      - name: Baseline zaakceptowanej konfiguracji
+        run: git fetch origin evals-baseline && git show origin/evals-baseline:triage/baseline.json > build-baseline.json
+      - name: Evale triage na aliasach produkcyjnych (k = 1, temperatura 0)
+        env:
+          LLM_BASE_URL: ${{ vars.LITELLM_PROD_URL }}
+          LLM_EVAL_API_KEY: ${{ secrets.LLM_CANARY_API_KEY }}   # klucz wirtualny: tylko aliasy produkcyjne, budżet 2 USD/dzień
+        run: ./gradlew evalTest -PevalSuite=triage-canary
+      - name: Bramka w trybie canary
+        run: ./gradlew evalGate -PevalGateMode=canary -PevalBaseline=build-baseline.json -PevalReport=build/reports/evals/triage.json
+      - name: Alert przy BLOCK
+        if: failure()
+        run: gh issue create --title "Canary triage: regresja $(date -u +%F)" --label ai-drift --body-file build/reports/evals/triage.md
+        env: { GH_TOKEN: "${{ github.token }}" }
+</script>
+<p>Zbiór to <code>evals/triage/cases.yaml</code> z 5.2 (ok. 100 przypadków), uzupełniany korektami z przeglądów (5.3); przypadki Globexu idą na <code>helpdesk-local</code> kluczem local-only. Przebieg kosztuje grosze (100 × ok. 0,0007 USD, ceny ilustracyjne). Ważniejszy jest runner w sieci wewnętrznej: canary idzie tą samą drogą co produkcja (pułapka z 5.2). Tryb <code>canary</code> w <code>EvalGate</code> z 3.7 różni się od <code>pr</code> w trzech miejscach:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="evals/gate/EvalGate.kt – tryb canary (różnice)">
+// mode == "canary": ten sam zbiór, ta sama konfiguracja, inny powód zmiany
+if (mode == "canary" && base != null) {
+    // 1. Inny model niż w baseline to NIE jest przebieg nieważny (jak w PR), tylko główne znalezisko.
+    if (base.providerModels != cur.providerModels)
+        f += Finding("model", GateVerdict.BLOCK, "Model zmienił się bez PR: ${base.providerModels} → ${cur.providerModels}")
+    // 2. Bez dogrywki: canary nie ma autora, który poczeka. Próg istotności jak w 3.7 (McNemar na parach).
+    val p = Stats.mcnemarOneSided(lost.size, gained)
+    if (dropPp > maxDropPp && p < alpha) f += Finding("spadek", GateVerdict.BLOCK, "−%.1f p.p., p = %.4f".format(dropPp, p))
+    else if (dropPp > maxDropPp) f += Finding("spadek", GateVerdict.INCONCLUSIVE, "obserwuj jutro: −%.1f p.p.".format(dropPp))
+    // 3. Baseline się NIE aktualizuje. Zmienia go tylko merge zaakceptowanej konfiguracji (3.7).
+}
+</script>
+<p>W incydencie canary w D1 o 05:15 zobaczyłby 78/100 wobec 91/100: 14 utraconych, 1 zyskany, McNemar p = 0,0005, czyli BLOCK. Detektor nie widzi zmiany wag pod tagiem, a canary widzi ją dopiero rano, więc potrzebne są obie obrony.</p>
+<div class="box warn"><span class="label">Pułapka: zbiór, którego model się „nauczył” albo który się zestarzał</span><p>Przypadki canary nie mogą trafiać do przykładów few-shot (5.2), bo zawyżają wynik. Zbiór bez nowego produktu nie wykryje spadku tam, gdzie jest najbardziej prawdopodobny, więc raz w miesiącu porównaj jego rozkład kategorii z produkcją.</p></div>
+
+<h2>Obrona 4: sygnały z ludzi i z rozkładu</h2>
+<p>Canary mierzy stały zbiór, a produkcja zmienia się codziennie. Dwa sygnały nie wymagają etykiet:</p>
+<script type="text/x-code" data-lang="sql" data-title="udział kategorii LIVE per dzień, 28 dni">
+SELECT tenant_id, date_trunc('day', created_at) AS dzien, result->>'category' AS category,
+       round(100.0 * count(*) / sum(count(*)) OVER (PARTITION BY tenant_id, date_trunc('day', created_at)), 1) AS pct
+  FROM triage_runs
+ WHERE mode = 'LIVE' AND result IS NOT NULL AND created_at >= now() - interval '28 days'
+ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+</script>
+<p>W incydencie BILLING spadł w Acme z 22% do 14%, a ACCOUNT wzrósł z 15% do 23% już w D0 po południu. Rozkład zmienia się jednak też bez udziału modelu (kampania fakturowa, awaria SSO u klienta), więc to sygnał <code>ticket</code> z progiem kilku p.p. i minimalnym wolumenem, porównywany z tym samym dniem tygodnia. Drugi sygnał to udział <code>needsHuman</code> i REVIEW: w incydencie spadł, co uznano za sukces. Nagła zmiana bez zmiany konfiguracji jest podejrzana, także „na lepsze”.</p>
+<p>Trafność na BLIND/AUDIT jest nieobciążona, ale przychodzi wolno. Odsetek korekt w BEFORE_APPLY przychodzi szybciej, ale ma <dfn data-t="selection-bias">błąd selekcji</dfn>: nadaje się do trendu w ramach jednej konfiguracji, nie do porównywania konfiguracji. Pełny zestaw metryk jakości buduje lekcja 5.7.</p>
+<table>
+  <tr><th>Obrona</th><th>Kiedy wykryłaby incydent</th><th>Czego nie widzi</th></tr>
+  <tr><td>Snapshot w proxy</td><td>Incydentu by nie było</td><td>Zmian poza repozytorium, tagów lokalnych</td></tr>
+  <tr><td>Oczekiwane modele + alert</td><td>D0, 06:15</td><td>Zmian bez zmiany pola <code>model</code></td></tr>
+  <tr><td>Rozkład kategorii</td><td>D0 po południu (słaby)</td><td>Spadków bez zmiany rozkładu</td></tr>
+  <tr><td>Canary eval</td><td>D1, 05:15</td><td>Problemów spoza zbioru</td></tr>
+  <tr><td>Trafność BLIND/AUDIT</td><td>D3</td><td>Niczego, ale wolno</td></tr>
+  <tr><td>Skargi ludzi</td><td>D8 (stan faktyczny)</td><td>Prawie wszystkiego</td></tr>
+</table>
+
+<h2>Shadow mode: kandydat liczony obok produkcji</h2>
+<p>Shadow mode służy do zmiany chcianej: nowego modelu, promptu, schematu. W <dfn data-t="shadow-mode">shadow mode</dfn> kandydat, czyli nowa <code>TriageConfigVersion</code> (5.2), liczy wynik na prawdziwym ruchu równolegle z produkcją, a wynik tylko zapisujemy: niczego nie zmienia, nikomu się nie pokazuje.</p>
+<p>Nie myl tego z trybem tenanta SHADOW z 5.1, w którym tenant bez triage dostaje run SHADOW z <em>produkcyjną</em> konfiguracją. Tutaj tenant w SUGGEST albo AUTO ma normalny run LIVE i dodatkowo run SHADOW z <em>kandydatem</em>. Indeks <code>(ticket_id, config_version, mode)</code> z 5.1 pozwala na oba, a <code>ux_triage_runs_live</code> pilnuje jednego LIVE. Konfigurację runu wybiera <code>TriageConfigResolver</code>, który zastępuje <code>configs.current(route)</code> w <code>TriageTrigger</code>:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/rollout/TriageConfigResolver.kt">
+data class TriagePlan(
+    val live: TriageConfigVersion,
+    val liveMaxMode: TriageMode,                 // limit etapu rolloutu (AUTO = bez limitu)
+    val shadows: List<TriageConfigVersion>,
+)
+
+@Component
+class TriageConfigResolver(
+    private val production: TriageConfigProvider,     // 5.1: configs.current(route)
+    private val candidates: TriageCandidateRegistry,  // etykiety zbudowane przy starcie przez TriageConfigFactory (5.2)
+    private val rollout: TriageRolloutSettings,       // system_settings 'triage.rollout', cache 15 s + LISTEN/NOTIFY (3.2)
+    private val shadowBudget: ShadowBudget,
+    private val tenants: TenantSettingsApi,
+) {
+    fun resolve(tenantId: UUID, ticketId: UUID, route: ModelRoute.Use): TriagePlan {
+        val prod = production.current(route)
+        val code = tenants.get(tenantId).code
+        val entries = rollout.entriesFor(code)
+            .mapNotNull { e -> candidates.find(e.configVersion)?.let { it to e } }
+            .filter { (cfg, _) -> candidates.compatible(cfg, route) }       // Globex: tylko aliasy self-hosted
+            .filter { (cfg, e) -> RolloutBucket.of(cfg.label, ticketId) < e.percent }
+
+        val live = entries.firstOrNull { (_, e) -> e.maxMode != TriageMode.SHADOW }   // walidacja: max 1 na tenanta
+        val shadows = entries.filter { (_, e) -> e.maxMode == TriageMode.SHADOW }
+            .map { it.first }
+            .filter { shadowBudget.tryAcquire(tenantId, it.label) }                   // limit % i USD na dobę
+
+        return TriagePlan(
+            live = live?.first ?: prod,
+            liveMaxMode = live?.second?.maxMode ?: TriageMode.AUTO,
+            shadows = shadows,
+        )
+    }
+}
+
+object RolloutBucket {
+    /** 0–99. Stabilny między restartami, replikami i wersjami JVM; ten sam schemat co PromptSelector z 2.4. */
+    fun of(configLabel: String, ticketId: UUID): Int =
+        Canonical.sha256("$configLabel:$ticketId").take(8).toLong(16).rem(100).toInt()
+}
+</script>
+<p><code>candidates.compatible</code> to warunek bezpieczeństwa: shadow też wysyła treść do dostawcy, więc kandydat na aliasie zewnętrznym nie może liczyć dla Globexu. Na trasie lokalnej kandydat musi mieć alias z <code>helpdesk.ai.self-hosted-aliases</code> (4.1). Trigger zapisuje run LIVE z <code>plan.live</code> i <code>maxMode = plan.liveMaxMode</code>, a dla każdego <code>plan.shadows</code> run SHADOW z <code>priority = helpdesk.triage.shadow.priority</code> (1, zawsze po LIVE i imporcie).</p>
+<script type="text/x-code" data-lang="sql" data-title="V57__triage_rollout.sql (numer przykładowy)">
+ALTER TABLE triage_runs
+    ADD COLUMN max_mode   text NULL CHECK (max_mode IN ('SHADOW','SUGGEST','AUTO')),
+    ADD COLUMN input_hash text NULL;          -- LOAD: sha256 wejścia modelu po redakcji (porównanie LIVE–SHADOW)
+CREATE INDEX ix_triage_runs_cfg_time ON triage_runs (config_version, created_at);
+-- llm_usage.feature: nowa wartość 'triage-shadow' (feature_group 'triage', poza TenantBudgetGuard)
+</script>
+<p>Efektywny tryb w DECIDE to minimum z trybu tenanta, <code>run.max_mode</code> i limitu trasy z <code>TriageModePolicy</code> (5.1): kandydat na etapie SUGGEST nie zastosuje niczego sam nawet u tenanta w AUTO.</p>
+
+<h2>Shadow nie może niczego zmienić</h2>
+<p>Najgroźniejszy błąd to shadow, który jednak coś robi, np. wysyła drugi, sprzeczny e-mail „Twoje zgłoszenie trafiło do działu rozliczeń”. <dfn data-t="side-effect">Skutki uboczne</dfn> blokujemy w trzech warstwach:</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/steps/DecideStep.kt i ApplyStep.kt (fragmenty)">
+// DECIDE: SHADOW liczy decyzję tak, jakby był AUTO (5.3), zapisuje ją i kończy run.
+override fun execute(run: TriageRun): StepOutcome {
+    val assessment = scorer.assess(run, results.of(run), effectiveMode(run))
+    store.saveDecision(run, assessment)                          // decision, decision_reasons
+    if (run.mode == RunMode.SHADOW) {
+        metrics.shadowDecision(run.configVersion, assessment.decision)   // osobna metryka, nie helpdesk.triage.decisions
+        return StepOutcome.Finish(RunStatus.SKIPPED)             // nigdy WaitForReview, nigdy Next(APPLY)
+    }
+    return when (assessment.decision) { /* LIVE jak w 5.3 */ }
+}
+
+// APPLY: druga warstwa. Nie ufamy, że DECIDE zawsze zadziała jak trzeba.
+override fun execute(run: TriageRun): StepOutcome {
+    check(run.mode == RunMode.LIVE) { "Run SHADOW ${run.id} dotarł do APPLY" }   // IllegalStateException → FAILED + alert
+    guard.requireNotRevoked(run.configVersion)                   // rollback awaryjny, dalej w lekcji
+    // ... zastosowanie przez TicketApi.classify(...) z expectedVersion (5.1 / 5.3)
+}
+</script>
+<p>Trzecia warstwa to test z sekcji o testach. Shadow ponadto:</p>
+<ul>
+  <li><strong>nie pisze do zgłoszenia</strong>: żadnego <code>TicketApi.classify</code>, wpisu w <code>ticket_events</code> ani zdarzenia domenowego, na które reagują powiadomienia,</li>
+  <li><strong>nie trafia do przeglądu</strong> i <strong>nie zasila</strong> <code>CategoryAccuracyStats</code> ani <code>helpdesk.triage.decisions</code>, inaczej kandydat zjadałby pojemność kolejki z 5.3 i zmieniał progi produkcji,</li>
+  <li><strong>ma tę samą redakcję PII</strong> (2.7), bo wysyła te same dane; kandydat u innego dostawcy wymaga umowy powierzenia,</li>
+  <li><strong>nie obciąża budżetu tenanta</strong>: <code>llm_usage.feature = 'triage-shadow'</code>,</li>
+  <li><strong>nie podlega <code>StaleTriagePolicy</code></strong> (5.1), bo niczego nie stosuje.</li>
+</ul>
+<div class="box warn"><span class="label">Pułapka: shadow widzi inny stan zgłoszenia</span><p>Run SHADOW wykonuje się minuty po LIVE, gdy kategoria może już być ustawiona, a komentarz dopisany. Gdyby LOAD dołączał bieżącą kategorię, kandydat przepisywałby wynik LIVE i zgodność byłaby sztucznie wysoka. Dlatego wejście triage nie zawiera pól, które triage ustawia, a LOAD zapisuje <code>input_hash</code> (sha256 tekstu po redakcji). Porównanie bierze tylko pary z tym samym hashem; dużo różnych hashy znaczy, że LOAD zależy od czegoś zmiennego.</p></div>
+
+<h2>ShadowComparison: zgodność z produkcją i z ludźmi</h2>
+<p>Pierwsza miara to zgodność kandydata z LIVE: tania i dostępna od pierwszego dnia, ale <em>to nie jest trafność</em>. Jeśli LIVE myli się w 9% przypadków, kandydat może się z nim nie zgadzać, bo ma rację. Dlatego patrzymy na <dfn data-t="confusion-matrix">macierz pomyłek</dfn> (5.2) „LIVE kontra kandydat”:</p>
+<script type="text/x-code" data-lang="sql" data-title="pary LIVE–SHADOW z tym samym wejściem, Acme, 14 dni">
+SELECT l.result->>'category' AS live_cat, s.result->>'category' AS cand_cat, count(*) AS n
+  FROM triage_runs s
+  JOIN triage_runs l ON l.ticket_id = s.ticket_id AND l.mode = 'LIVE' AND l.input_hash = s.input_hash
+ WHERE s.mode = 'SHADOW' AND s.config_version = :candidate AND s.tenant_id = :acme
+   AND s.created_at >= now() - interval '14 days' AND s.result IS NOT NULL AND l.result IS NOT NULL
+ GROUP BY 1, 2 ORDER BY 1, 2;
+</script>
+<script type="text/x-code" data-lang="plaintext" data-title="raport ShadowComparison – Acme, 25% ruchu, 10 dni roboczych (DANE ILUSTRACYJNE)">
+kandydat: triage/v2|helpdesk-fast-candidate|schema-v1|cfg-7c41d2e9   produkcja: triage/v1|helpdesk-fast|…
+pary z tym samym input_hash: 1 800 (odrzucone z innym hashem: 31)
+zgodność kategorii: 1 692 / 1 800 = 94,0% [92,8; 95,0]   priorytet dokł.: 88,4%   zespół: 93,1%
+
+największe rozbieżności (LIVE → kandydat): ACCOUNT → BILLING 41, BILLING → ACCOUNT 19, TECHNICAL → FEATURE_REQ 11
+
+rozbieżności przejrzane na ślepo: 100 z 108
+  rację ma kandydat: 58   rację ma LIVE: 35   oba źle: 7
+  McNemar: P(kandydat gorszy przypadkiem) = 0,99; P(lepszy przypadkiem) = 0,011
+
+FAILED: 0,2% (LIVE 0,3%)   naprawione: 1,1% (LIVE 1,7%)
+koszt runu: 0,00071 USD (LIVE 0,00070)   p95: 1,6 s (LIVE 1,9 s)
+</script>
+<p>Najważniejszy jest blok „na ślepo”. Gdy konfiguracje się zgadzają, obie mają rację albo obie się mylą, więc cała <em>różnica</em> siedzi w rozbieżnościach. Zamiast etykietować tysiące zgłoszeń, wystarczy 100 rozbieżności w przeglądzie BLIND z 5.3, bez pokazywania propozycji. To wprost <dfn data-t="mcnemar-test">test McNemara</dfn> z 3.7: b = 35 (rację ma tylko LIVE), c = 58 (tylko kandydat). Rozbieżności to 6% ruchu, kandydat wygrywa netto 23/100, więc trafność rośnie o ok. 1,4 p.p. Nie bierz za „prawdę” końcowego stanu zgłoszenia: ludzie rzadko poprawiają to, co już ustawione (<dfn data-t="automation-bias">automation bias</dfn>, 5.3), więc faworyzuje on LIVE.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/rollout/ShadowComparisonJob.kt">
+data class ShadowComparison(
+    val candidate: String, val tenantCode: String, val pairs: Int, val categoryAgree: Int, val hashMismatch: Int,
+    val liveOnlyCorrect: Int, val candidateOnlyCorrect: Int,              // z rozbieżności przejrzanych na ślepo
+    val failedRate: Double, val costPerRunUsd: BigDecimal, val p95Ms: Long, // + te same pola dla LIVE
+) {
+    val agreement get() = Stats.wilson(categoryAgree, pairs)
+    val pWorse get() = Stats.mcnemarOneSided(liveOnlyCorrect, candidateOnlyCorrect)   // 3.7
+}
+
+@Component
+class ShadowComparisonJob(private val rollout: TriageRolloutSettings, private val queries: ShadowQueries,
+                          private val reports: ShadowReportRepository,       // triage_shadow_reports(..., report jsonb)
+                          private val sampler: ShadowDisagreementSampler, private val metrics: TriageMetrics) {
+    @Scheduled(cron = "0 30 6 * * *")
+    fun daily() = rollout.shadowEntries().forEach { e ->
+        e.tenants.forEach { tenant ->
+            val c = queries.compare(e.configVersion, tenant, days = 14).also(reports::save)
+            metrics.shadowAgreement(e.configVersion, tenant, c.agreement.start)   // dolna granica, nie punkt
+            sampler.enqueueBlind(e.configVersion, tenant, maxPerDay = 20)          // nie zabiera pojemności kolejce 5.3
+        }
+    }
+}
+</script>
+
+<h2>Koszt shadow i ile go potrzeba</h2>
+<p>Shadow podwaja wywołania dla objętej części ruchu:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="koszt shadow (ceny ilustracyjne, 1 600 tok. wej. + 150 wyj. na run)">
+kandydat na helpdesk-fast:     1 600 × 0,40/1e6 + 150 × 1,60/1e6 = 0,00088 USD/run
+kandydat na helpdesk-default:  1 600 × 3,00/1e6 + 150 × 15,0/1e6 = 0,00705 USD/run
+
+2 000 zgłoszeń/dzień × 30 dni:   25% ruchu        100% ruchu
+helpdesk-fast                     13 USD/mies.      53 USD/mies.
+helpdesk-default                 106 USD/mies.     423 USD/mies.
+Globex (helpdesk-local): ≈ 0 USD, ale shadow zajmuje tę samą kartę GPU co LIVE → p95 LIVE rośnie
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml – limity shadow">
+helpdesk:
+  triage:
+    shadow:
+      max-percent: 50                    # suma percent kandydatów SHADOW u tenanta
+      daily-budget-usd: 20               # ShadowBudget: po przekroczeniu shadow nie powstają (metryka)
+      priority: 1                        # zawsze po LIVE (100) i imporcie (10)
+      local-route-hours: "20:00-06:00"   # Globex: shadow tylko poza szczytem GPU
+      virtual-key: LLM_SHADOW_API_KEY    # osobny klucz LiteLLM z własnym limitem TPM (1.3)
+</script>
+<p>Osobny <dfn data-t="virtual-key">klucz wirtualny</dfn> chroni lepiej niż limit USD. Shadow zużywa ten sam limit tokenów na minutę co produkcja, więc bez osobnego limitu kandydat w szczycie powoduje 429 dla LIVE. Klucz z limitem 20% TPM i osobny <dfn data-t="bulkhead">bulkhead</dfn> sprawiają, że przy przeciążeniu odpada shadow, a nie produkcja.</p>
+<p>Ile shadow wystarczy, wynika z kryteriów: co najmniej 7 dni (cykl tygodniowy ruchu), ok. 1 500 par (Wilson ±1–2 p.p.) i co najmniej 60 rozbieżności przejrzanych na ślepo. Przy 25% ruchu Acme (180 zgłoszeń, ok. 11 rozbieżności dziennie) to ok. 2 tygodnie, przy 5% dwa miesiące.</p>
+
+<h2>Rollout: konfiguracja i stabilne przypisanie</h2>
+<p><dfn data-t="progressive-rollout">Rollout stopniowy</dfn> to włączanie zmiany etapami, od małej części ruchu z ograniczonymi uprawnieniami, z jawnym warunkiem przejścia. Konfiguracja jest kluczowana pełną etykietą (<code>helpdesk.triage.rollout.&lt;configVersion&gt;</code>):</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml – rollout (wartości startowe; produkcja: system_settings 'triage.rollout')">
+helpdesk:
+  triage:
+    candidates:                                     # budowane przy starcie przez TriageConfigFactory (5.2)
+      - { prompt: triage/v2, alias: helpdesk-fast-candidate }
+    rollout:
+      # Klucz z "/" i "|" wymaga notacji [..], inaczej Spring Boot usunie te znaki z klucza mapy
+      "[triage/v2|helpdesk-fast-candidate|schema-v1|cfg-7c41d2e9]":
+        tenants: [acme]          # kody tenantów; pusta lista = nikt
+        percent: 25              # udział zgłoszeń 0–100, stabilny hash ticketId
+        max-mode: SHADOW         # etap: SHADOW | SUGGEST | AUTO
+    blocked-configs: []          # rollback awaryjny: runy tych wersji nie dochodzą do APPLY
+</script>
+<p>Hash w kluczu jest celowy: poprawka jednego zdania w <code>v2.st</code> po starcie zmienia etykietę, wpis przestaje pasować i kandydat się wyłącza (z alertem „wpis rolloutu dla nieznanej konfiguracji”). Rollout zatwierdza dokładnie te bajty, które przeszły evale. YAML to stan startowy; na produkcji wpisy żyją w <code>system_settings</code> (<code>triage.rollout</code>) z cache 15 s i LISTEN/NOTIFY jak kill switch z 3.2, a zmienia je <code>PUT /api/admin/triage/rollout</code> (ADMIN, audyt <code>TRIAGE_ROLLOUT_CHANGED</code>), więc etapy i rollback nie wymagają deployu. Zapis jest odrzucany (422), gdy etykiety nie ma w <code>TriageCandidateRegistry</code>, tenant miałby dwa wpisy z <code>max-mode</code> innym niż SHADOW, kandydat zewnętrzny trafiłby do tenanta z <code>external_llm_allowed = false</code> albo suma procentów SHADOW przekracza <code>shadow.max-percent</code>.</p>
+<p><dfn data-t="stable-bucketing">Stabilne przypisanie</dfn> oznacza, że to samo zgłoszenie zawsze trafia do tej samej grupy. <code>RolloutBucket.of(label, ticketId)</code> (SHA-256, 32 bity, modulo 100) daje trzy właściwości:</p>
+<ul>
+  <li><strong>Powtarzalność</strong>: ponowione <code>TicketCreated</code> (at-least-once, 5.1), restart i inna replika dają ten sam wynik. <code>Random</code> raz dałby kandydata, raz produkcję.</li>
+  <li><strong>Monotoniczność</strong>: przy <code>bucket &lt; percent</code> zwiększenie z 10 do 25 tylko dodaje zgłoszenia, więc porównania dzień do dnia dotyczą tej samej populacji.</li>
+  <li><strong>Niezależność kandydatów</strong>: etykieta w hashu daje każdemu kandydatowi inną próbkę. Do porównania A z B na tych samych zgłoszeniach użyj wspólnego klucza kohorty.</li>
+</ul>
+<p>W 2.4 <dfn data-t="ab-test">test A/B</dfn> czatu szedł per tenant, bo rozmowy nie wolno rozbić w połowie. Triage to jedno wywołanie, więc przydział per zgłoszenie daje dwie porównywalne grupy z tym samym miksem zgłoszeń jednego tenanta.</p>
+
+<h2>Etapy, kryteria przejścia i kto decyduje</h2>
+<p>Etapy to tryby z 5.1 użyte jako limit dla kandydata (<code>max-mode</code>), nie jako tryb tenanta:</p>
+<table>
+  <tr><th>Etap</th><th>Co robi kandydat</th><th>Co mierzymy</th></tr>
+  <tr><td>SHADOW 25%</td><td>Run SHADOW obok LIVE, nic nie stosuje</td><td>Zgodność, rozbieżności na ślepo, FAILED, koszt, p95</td></tr>
+  <tr><td>SUGGEST 25%</td><td>Run LIVE dla swojej grupy, każdy wynik do przeglądu</td><td>Korekty kandydata vs produkcji w tym samym trybie</td></tr>
+  <tr><td>AUTO 25 → 50 → 100%</td><td>Pełny tryb tenanta, decyduje <code>TriageScorer</code> (5.3)</td><td>Trafność AUDIT/BLIND, korekty w 24 h (5.7)</td></tr>
+  <tr><td>Promocja</td><td><code>helpdesk-fast</code> dostaje nowy snapshot, wpis rolloutu znika</td><td>Canary eval na nowym baseline</td></tr>
+</table>
+<p>Kryteria zapisuje się w repozytorium przed startem. Inaczej po dwóch tygodniach kandydat ma zwolenników, a 93% zgodności nagle wydaje się „prawie” 94%.</p>
+<script type="text/x-code" data-lang="yaml" data-title="rollouts/2026-11-triage-v2.yaml (zatwierdzony przed startem)">
+config: "triage/v2|helpdesk-fast-candidate|schema-v1|cfg-7c41d2e9"
+reason: "Snapshot fast-mini-2026-03-02 wycofywany 2027-03-01; v2 doprecyzowuje BILLING/ACCOUNT"
+owner: wlasciciel-triage                 # prowadzi, przełącza etapy w godzinach pracy
+approvers: [wlasciciel-triage, kierowniczka-rozliczen-acme]   # zgoda na AUTO: biznes + technika
+abort: "każdy dyżurny, bez pytania (runbook triage-rollback)"
+stages:
+  - stage: SHADOW
+    tenants: [acme]
+    percent: 25
+    min-days: 7
+    exit:
+      category-agreement-lower-bound: 0.92      # dolna granica Wilsona, nie punkt
+      blind-disagreements-min: 60
+      mcnemar-p-worse-min: 0.05                 # kandydat nie gorszy na rozbieżnościach
+      failed-rate-max: 0.005
+      cost-per-run-usd-max: 0.0010
+      p95-ms-max: 2500
+  - stage: SUGGEST
+    percent: 25
+    exit: { correction-rate-max-vs-production-pp: 2 }
+  - stage: AUTO
+    percent: [25, 50, 100]                      # min. 3 dni robocze na każdym kroku
+    exit: { audit-accuracy-lower-bound: 0.88, corrections-24h-max: 0.06 }
+  - stage: PROMOTE
+    action: "PR: helpdesk-fast → fast-mini-2026-10-06, expected-models, nowy baseline, usunięcie wpisu"
+</script>
+<p>Asymetria jest celowa: krok do przodu wymaga właściciela, a przy AUTO także biznesu, który odpowiada za kolejkę; krok wstecz robi każdy dyżurny sam, jak przy kill switchu (3.2). Wyniki etapów i decyzje z nazwiskiem trafiają jako komentarze do tego PR. Po promocji etykieta produkcji (<code>triage/v2|helpdesk-fast|…</code>) ma inny hash niż kandydat, bo alias jest w hashu, choć treść ta sama; zanotuj obie w changelogu.</p>
+
+<h2>Rollback bez deployu</h2>
+<p><dfn data-t="rollback">Rollback</dfn> to powrót do poprzedniej, sprawdzonej konfiguracji. Poziomy od najwęższego:</p>
+<table>
+  <tr><th>Poziom</th><th>Zmiana (bez deployu, ≤ 15 s)</th><th>Runy w toku</th></tr>
+  <tr><td>Kandydat</td><td>Wpis rolloutu: <code>percent: 0</code> albo usunięty</td><td>Kończą na swojej <code>config_version</code></td></tr>
+  <tr><td>Kandydat, awaryjnie</td><td><code>blocked-configs</code> += etykieta</td><td>Stop przed APPLY: SKIPPED <code>CONFIG_REVOKED</code></td></tr>
+  <tr><td>Tenant</td><td><code>ai_triage_mode</code> AUTO → SUGGEST albo OFF (5.1)</td><td>OFF: stop przed APPLY; SUGGEST: przegląd</td></tr>
+  <tr><td>Globalnie</td><td>Kill switch <code>TRIAGE_APPLY</code> (3.2), bez cache</td><td>SKIPPED <code>KILL_SWITCH</code></td></tr>
+  <tr><td>Model u dostawcy</td><td>PR ze snapshotem w <code>litellm.yaml</code> (minuty)</td><td>Nowe wywołania na przypiętym modelu</td></tr>
+</table>
+<p>Run po CLASSIFY na v2 ma wynik zgodny ze schematem v2. Gdyby VALIDATE albo DECIDE użyły v1, jeden wynik mieszałby dwie konfiguracje, a <code>config_version</code> w runie kłamałaby. Dlatego zwykły rollback nie dotyka runów w toku, a awaryjny zatrzymuje je przed jedynym krokiem ze skutkiem, APPLY.</p>
+<p>Zmiany już zastosowane zostają. Automatyczne cofanie byłoby drugą masową zmianą bez weryfikacji, nadpisującą korekty ludzi. Zamiast tego budujemy listę do przeglądu:</p>
+<script type="text/x-code" data-lang="sql" data-title="zmiany zastosowane przez wycofaną konfigurację, bez późniejszej zmiany przez człowieka">
+SELECT t.number, t.tenant_id, e.payload->>'category' AS triage_category, t.category AS current_category,
+       e.created_at AS applied_at, t.status
+  FROM ticket_events e
+  JOIN tickets t ON t.id = e.ticket_id
+ WHERE e.type = 'TRIAGE_APPLIED'
+   AND e.payload->>'configVersion' = :revokedConfig
+   AND e.created_at >= :rolloutStart
+   AND NOT EXISTS (SELECT 1 FROM ticket_events h            -- człowiek już poprawił: zostawiamy
+                    WHERE h.ticket_id = e.ticket_id AND h.actor_type = 'USER'
+                      AND h.type IN ('CATEGORY_CHANGED','PRIORITY_CHANGED','TEAM_CHANGED')
+                      AND h.created_at > e.created_at)
+   AND t.status NOT IN ('RESOLVED','CLOSED')                -- zamknięte: tylko do raportu
+ ORDER BY t.sla_due_at;                                     -- najpilniejsze najpierw
+</script>
+<p>Typy zdarzeń dopasuj do swojego <code>ticket_events</code>. Listę przeglądają ludzie w osobnym widoku: 400 pozycji w kolejce z 5.3 (<code>max_pending</code> 150) uruchomiłoby load shedding dla nowych zgłoszeń. <dfn data-t="runbook">Runbook</dfn> „rollback triage” jest podlinkowany z każdego alertu tej lekcji:</p>
+<table>
+  <tr><th>Krok</th><th>Kto</th><th>Co konkretnie</th></tr>
+  <tr><td>Wyzwalacz</td><td>Dyżurny</td><td><code>AiProviderModelUnexpected</code>, BLOCK z canary, <code>QualityDrop</code>, abort z planu rolloutu</td></tr>
+  <tr><td>Decyzja (≤ 5 min)</td><td>Dyżurny sam</td><td>Najwęższy poziom, który na pewno obejmuje problem: kandydat → tenant → kill switch</td></tr>
+  <tr><td>Wykonanie</td><td>Dyżurny</td><td><code>PUT /api/admin/triage/rollout</code> z <code>reason</code>; przy zmianie u dostawcy PR ze snapshotem (szybka ścieżka)</td></tr>
+  <tr><td>Weryfikacja (≤ 10 min)</td><td>Dyżurny</td><td>Nowe runy mają produkcyjną <code>config_version</code> i oczekiwany <code>provider_model</code>, APPLIED wycofanej wersji stoi</td></tr>
+  <tr><td>Ocena szkód</td><td>Właściciel triage</td><td>SQL zastosowanych zmian, przegląd według SLA</td></tr>
+  <tr><td>Powrót</td><td>Właściciel + biznes</td><td>Canary zielony, rollout od etapu SHADOW; potem postmortem i przypadki do <code>evals/triage</code></td></tr>
+</table>
+<p>Nieprzećwiczony rollback nie działa. Raz na kwartał zrób <dfn data-t="game-day">game day</dfn> na stagingu z kandydatem, który celowo myli BILLING z ACCOUNT, i zmierz czas od alertu do weryfikacji.</p>
+
+<h2>Testy: shadow, przypisanie, detektor</h2>
+<p>Najważniejszy test pilnuje, że shadow niczego nie zmienia. Używa fixture z <code>TriageWorkflowIT</code> (5.1: Testcontainers, atrapa klasyfikatora):</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ShadowRunHasNoSideEffectsIT.kt">
+class ShadowRunHasNoSideEffectsIT : TriageWorkflowFixture() {
+    @MockkBean(relaxed = true) lateinit var ticketApi: TicketApi
+    @MockkBean(relaxed = true) lateinit var reviewQueue: TriageReviewQueue
+
+    @Test
+    fun `run SHADOW kandydata konczy sie SKIPPED i nie wola TicketApi_classify`() {
+        givenTenant(ACME, mode = TriageMode.AUTO)
+        givenTicket(HD_3001, version = 3)
+        classifier.willReturn(TriageResult(TicketCategory.BILLING, TicketPriority.HIGH, "ACME-BILLING",
+            "pl", "Klient zgłasza podwójne naliczenie faktury.", needsHuman = false, reasons = listOf("podwójna faktura")))
+        accuracy.willReturn(ACME, TicketCategory.BILLING, lowerBound = 0.95)    // LIVE dostałby AUTO_APPLY
+
+        val run = insertRun(HD_3001, mode = RunMode.SHADOW, config = CANDIDATE, maxMode = TriageMode.SHADOW)
+        runToCompletion(run)
+
+        val done = reload(run)
+        assertThat(done.status).isEqualTo(RunStatus.SKIPPED)
+        assertThat(done.decision).isEqualTo(TriageDecision.AUTO_APPLY)            // decyzja „na sucho” zapisana
+        verify(exactly = 0) { ticketApi.classify(any(), any(), any(), any(), any()) }
+        verify { reviewQueue wasNot Called }
+        assertThat(ticketEvents(HD_3001)).noneMatch { it.type == "TRIAGE_APPLIED" }
+        assertThat(usageFeatures(run)).containsOnly("triage-shadow")
+    }
+    // + test: run SHADOW ustawiony ręcznie na krok APPLY kończy się FAILED, classify nadal 0 razy
+}
+</script>
+<p>Wartości wzorcowe w teście przypisania są wpisane na sztywno: „uproszczenie” hasha w połowie rolloutu przerzuciłoby część zgłoszeń do innej grupy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="RolloutBucketTest.kt">
+class RolloutBucketTest {
+    private val cfg = "triage/v2|helpdesk-fast-candidate|schema-v1|cfg-7c41d2e9"
+
+    @Test
+    fun `wartosci wzorcowe nie zmieniaja sie miedzy wersjami kodu`() {
+        assertThat(RolloutBucket.of(cfg, UUID.fromString("3f1c2a9e-5b7d-4e21-9a0c-6d8e4b2f1a07"))).isEqualTo(25)
+        assertThat(RolloutBucket.of(cfg, UUID.fromString("5d0a8e12-7f4b-4c39-8e21-b6f3a9d0c754"))).isEqualTo(8)
+        assertThat(RolloutBucket.of(cfg, UUID.fromString("9b2d7c41-0e3a-4f68-b5d1-27c9e8a4f310"))).isEqualTo(48)
+    }
+
+    @Test
+    fun `zwiekszenie procentu tylko dodaje zgloszenia, a rozklad jest rownomierny`() {
+        val ids = List(100_000) { UUID.randomUUID() }
+        val at10 = ids.filter { RolloutBucket.of(cfg, it) < 10 }.toSet()
+        val at25 = ids.filter { RolloutBucket.of(cfg, it) < 25 }.toSet()
+        assertThat(at25).containsAll(at10)
+        assertThat(at10.size / 100_000.0).isCloseTo(0.10, within(0.005))
+        assertThat(at25.size / 100_000.0).isCloseTo(0.25, within(0.006))
+    }
+
+}
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="ModelDriftDetectorTest.kt">
+class ModelDriftDetectorTest {
+    private val now = Instant.parse("2026-10-06T06:15:00Z")
+    private val detector = ModelDriftDetector(mockk(), DriftProperties(
+        expectedModels = mapOf("helpdesk-fast" to AliasModels(primary = setOf("fast-mini-2026-03-02")),
+                               "helpdesk-default" to AliasModels(setOf("sonnet-snap"), fallback = setOf("backup-snap"))),
+        fallbackAlertAfter = Duration.ofHours(6), minLabels = 40), mockk(relaxed = true), Clock.fixed(now, ZoneOffset.UTC))
+
+    @Test
+    fun `nowy snapshot pod aliasem to UnexpectedModel, oczekiwany fallback nie`() {
+        val s = detector.detect(observed = listOf(
+                ModelObservation("helpdesk-fast", "fast-mini-2026-10-06", 31),
+                ModelObservation("helpdesk-default", "backup-snap", 4)),
+            fallbackSince = emptyMap(), recent = emptyList(), reference = emptyList(), now = now)
+        assertThat(s).containsExactly(DriftSignal.UnexpectedModel("helpdesk-fast", "fast-mini-2026-10-06", 31))
+    }
+
+    @Test
+    fun `spadek trafnosci 91 do 79 procent na 75 etykietach to QualityDrop, na 25 jeszcze nie`() {
+        val ref = listOf(LabelWindow("acme", "helpdesk-fast", "fast-mini-2026-03-02", 637, 700))
+        val d3 = listOf(LabelWindow("acme", "helpdesk-fast", "fast-mini-2026-10-06", 59, 75))
+        val d1 = listOf(LabelWindow("acme", "helpdesk-fast", "fast-mini-2026-10-06", 20, 25))
+        assertThat(detector.detect(emptyList(), emptyMap(), d3, ref, now)).singleElement().isInstanceOf(DriftSignal.QualityDrop::class.java)
+        assertThat(detector.detect(emptyList(), emptyMap(), d1, ref, now)).isEmpty()   // 25 < minLabels i przedziały się nakładają
+    }
+}
+</script>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Co zrobić</th></tr>
+  <tr><td>Dostawca wycofuje snapshot (<dfn data-t="model-deprecation">deprecation</dfn>)</td><td>Data wycofania trafia do kalendarza i <code>litellm/deprecations.yaml</code>; test CI świeci na czerwono 90 dni wcześniej. Migracja to zwykły rollout (kandydat, evale, shadow, SUGGEST, AUTO, promocja), który trwa 4–6 tygodni. Start na 2 tygodnie przed datą zmusza do pominięcia shadow. Azure z <code>NoAutoUpgrade</code> po terminie przestaje działać: awaria głośna zamiast cichej.</td></tr>
+  <tr><td>Globex na modelu lokalnym</td><td>Nowy obraz vLLM czy Ollamy, inna karta GPU albo kwantyzacja to zmiana modelu przy tej samej nazwie. PR z rewizją lub digestem, canary na <code>helpdesk-local</code> z przypadkami syntetycznymi Globexu, shadow poza szczytem na aliasie self-hosted (np. <code>helpdesk-local-candidate</code> na drugiej instancji vLLM). Nie testuj modelu Globexu na danych Acme: inny rozkład i inne zespoły.</td></tr>
+  <tr><td>Dwa kandydaty jednocześnie</td><td>Oba w SHADOW: dozwolone, niezależne próbki, każdy porównywany z LIVE. Do SUGGEST/AUTO tylko jeden na tenanta. Decyduj według kryteriów z planu, nie według tego, który wypadł lepiej w tym tygodniu (wybór „lepszego z szumu”).</td></tr>
+  <tr><td>Rollback w trakcie importu masowego</td><td>Import 10 000 zgłoszeń (5.1) utworzył runy PENDING z wersją kandydata. „Runy w toku” to te, które zaczęły pracę. Pozostałe przepinamy: <code>UPDATE triage_runs SET config_version = :prod, model_alias = :prodAlias, max_mode = NULL WHERE config_version = :revoked AND mode = 'LIVE' AND status = 'PENDING' AND attempt = 0</code>. <code>blocked-configs</code> wysłałoby 8 000 zgłoszeń do ręcznej kolejki.</td></tr>
+  <tr><td>Zmiana sędziego (5.6)</td><td>Sędzia ma własny snapshot i wpis w <code>expected-models</code>; nowy model sędziego wymaga ponownej kalibracji. Inaczej skok ocen wygląda jak poprawa triage albo fałszywy <code>QualityDrop</code>.</td></tr>
+  <tr><td>Tenant zmienia tryb w trakcie rolloutu</td><td>Automat z 5.3 przełącza Acme na SUGGEST: kandydat w etapie AUTO dostaje SUGGEST (minimum). Wyłącz to okno z kryteriów etapu.</td></tr>
+</table>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Przejrzyj swój <code>litellm.yaml</code> (albo ten z 1.3). Dla każdego wpisu ustal, czy model jest snapshotem, i dopisz listę <code>helpdesk.ai.expected-models</code>. Napisz regułę CI odrzucającą zmianę <code>litellm_params.model</code> bez zmiany tej listy w tym samym PR.</li>
+  <li>Zaimplementuj <code>ModelDriftDetector.detect</code> z testami z lekcji. Dodaj sygnał dla modelu lokalnego: digest z <code>GET /api/tags</code> Ollamy (albo rewizja z nazwy serwowanej vLLM) różny od oczekiwanego. Zasymuluj ponowny <code>pull</code> i sprawdź, który alert zadziała, a który nie.</li>
+  <li>Uruchom na stagingu kandydata w SHADOW na 50% ruchu z atrapą, która z 20% prawdopodobieństwem zamienia BILLING na ACCOUNT. Policz <code>ShadowComparison</code>, wybierz 30 rozbieżności, oznacz je i sprawdź, czy McNemar wskazuje kandydata jako gorszego.</li>
+  <li>Napisz plan rolloutu nowej rewizji wag <code>helpdesk-local</code> dla Globexu (który nigdy nie przechodzi do AUTO, 5.1) i zrób game day: rollback z dyżurnym, który widzi runbook pierwszy raz.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego w incydencie z tej lekcji nie zadziałał żaden istniejący alert?</p>
+  <button>Bo alerty były wyłączone w weekend</button>
+  <button>Bo LiteLLM ukrył błędy przez retry i fallback</button>
+  <button>Bo alerty pilnowały błędów, latencji i formatu, a nowy model działał technicznie poprawnie, tylko trafiał gorzej</button>
+  <button>Bo structured output nie działał i model zwracał niepoprawny JSON</button>
+  <p class="explain">Błędy były zerowe, latencja lepsza, format zgodny ze schematem, <code>config_version</code> bez zmian. Spadek jakości widać tylko w sygnałach, które mówią, który model odpowiada (<code>provider_model</code>) i jak dobrze (canary eval, etykiety BLIND/AUDIT).</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Która droga cichej zmiany NIE zostawia śladu w <code>provider_model</code>?</p>
+  <button>Ponowny <code>ollama pull</code> nowych wag pod tym samym tagiem dla Globexu</button>
+  <button>Przesunięcie aliasu dostawcy na nowy snapshot, który zwraca nową nazwę w polu <code>model</code></button>
+  <button>Fallback na <code>helpdesk-default-backup</code> trwający trzy dni</button>
+  <button>Pula wdrożeń, w której jeden region ma nowszą wersję modelu</button>
+  <p class="explain">Ollama zwraca w odpowiedzi nazwę tagu, więc nowe wagi pod tym samym tagiem wyglądają identycznie. Pomaga tylko digest z <code>/api/tags</code> w konfiguracji i canary eval na <code>helpdesk-local</code>.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="3">
+  <p class="q">Kandydat ma 94% zgodności kategorii z LIVE. Co z tego wynika?</p>
+  <button>Kandydat ma trafność 94%</button>
+  <button>Kandydat jest gorszy o 6 p.p.</button>
+  <button>Można od razu przejść do AUTO na 100%</button>
+  <button>Różnica między konfiguracjami siedzi w 6% rozbieżności i trzeba je ocenić na ślepo, żeby wiedzieć, która ma rację</button>
+  <p class="explain">Zgodność to nie trafność: gdy obie konfiguracje się zgadzają, obie mają rację albo obie się mylą. Przegląd na ślepo samych rozbieżności i test McNemara (b = rację ma tylko LIVE, c = tylko kandydat) mówi, która konfiguracja jest lepsza, przy niewielkiej liczbie etykiet.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="1">
+  <p class="q">Dlaczego przypisanie do rolloutu liczymy jako <code>hash(etykieta:ticketId) mod 100 &lt; percent</code>, a nie losowo przy każdym zdarzeniu?</p>
+  <button>Bo losowanie jest wolniejsze od SHA-256</button>
+  <button>Bo ponowione zdarzenie, restart czy inna replika muszą dać tę samą grupę, a zwiększenie procentu ma tylko dodawać zgłoszenia</button>
+  <button>Bo Spring Boot nie pozwala używać <code>Random</code> w komponentach</button>
+  <button>Bo dzięki temu każdy tenant ma dokładnie ten sam procent zgłoszeń co inni</button>
+  <p class="explain"><code>TicketCreated</code> przychodzi co najmniej raz (5.1), więc przydział musi być powtarzalny. Warunek <code>bucket &lt; percent</code> daje monotoniczność: grupa z 10% jest podzbiorem grupy z 25%, więc porównania dzień do dnia dotyczą tej samej populacji.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="2">
+  <p class="q">Dyżurny wycofuje kandydata w trakcie rolloutu AUTO. Co dzieje się ze zmianami zgłoszeń, które kandydat już zastosował?</p>
+  <button>Automat cofa je w jednej transakcji do stanu sprzed triage</button>
+  <button>Wszystkie trafiają do kolejki przeglądu z 5.3</button>
+  <button>Zostają. Lista zmian bez późniejszej korekty człowieka (SQL po <code>config_version</code> w <code>ticket_events</code>) idzie do przeglądu w osobnym widoku, według terminu SLA</button>
+  <button>Znikają, bo rollback przywraca kopię bazy</button>
+  <p class="explain">Automatyczne cofanie byłoby drugą masową zmianą bez weryfikacji i nadpisałoby korekty ludzi. Wrzucenie setek pozycji do kolejki z <code>max_pending</code> uruchomiłoby load shedding dla nowych zgłoszeń. Lista do przeglądu w osobnym widoku nie blokuje produkcji.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

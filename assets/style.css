@@ -125,3 +125,28 @@ dfn.term { font-style: normal; border-bottom: 1.5px dotted var(--accent); cursor
 .gl { border-bottom: 1px solid var(--border); padding: 6px 0 10px; scroll-margin-top: 64px; }
 .gl h3 { margin-top: .6em; }
 .gl.hl { background: var(--accent-soft); border-radius: 10px; padding: 6px 12px; }
+
+/* checklisty (6.2) */
+ul.checklist { list-style: none; padding: 0; margin: .4em 0 1.2em; }
+ul.checklist > li { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; margin: 6px 0;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+ul.checklist > li > input { width: 22px; height: 22px; margin: 2px 0 0; flex: none; accent-color: var(--ok); }
+ul.checklist > li > label { flex: 1; min-width: 0; cursor: pointer; }
+ul.checklist > li.checked { background: var(--ok-soft); border-color: transparent; }
+ul.checklist > li[hidden] { display: none; }
+ul.checklist .how { display: block; font-size: 14px; color: var(--muted); margin-top: 2px; }
+ul.checklist .lvl { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 7px; border-radius: 999px; margin-left: 6px; vertical-align: 2px; }
+ul.checklist .lvl-pilot { background: var(--accent-soft); color: var(--accent); }
+ul.checklist .lvl-auto { background: var(--warn-soft); color: var(--warn); }
+.checklist-count { margin: .2em 0 0; }
+.checklist-panel { background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px; margin: 1em 0; }
+.checklist-panel .cl-sum { margin: 0 0 8px; font-size: 15px; }
+.checklist-panel .cl-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.checklist-panel .cl-tools button { font-size: 14px; padding: 6px 10px; }
+@media print {
+  .topbar, .progressline, .toc, .lesson-footer, .checklist-panel .cl-tools { display: none !important; }
+  ul.checklist > li { break-inside: avoid; }
+  ul.checklist > li[hidden] { display: none; }
+}

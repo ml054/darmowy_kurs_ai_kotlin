@@ -6,8 +6,8 @@
 
   // ---------- storage ----------
   function load() {
-    try { return Object.assign({ done: {}, quiz: {}, last: null }, JSON.parse(localStorage.getItem(KEY) || "{}")); }
-    catch (e) { return { done: {}, quiz: {}, last: null }; }
+    try { return Object.assign({ done: {}, quiz: {}, check: {}, last: null }, JSON.parse(localStorage.getItem(KEY) || "{}")); }
+    catch (e) { return { done: {}, quiz: {}, check: {}, last: null }; }
   }
   function save(p) { try { localStorage.setItem(KEY, JSON.stringify(p)); } catch (e) {} }
   let P = load();
@@ -91,6 +91,78 @@
     });
   }
 
+  // ---------- checklisty: <ul class="checklist" data-id="dane"><li data-id="d1" data-level="pilot|auto">…</li></ul> ----------
+  // Opcjonalnie <div class="checklist-panel"></div>: podsumowanie, filtr poziomu, druk, reset.
+  function renderChecklists(lessonId) {
+    const lists = [...document.querySelectorAll("ul.checklist")];
+    if (!lists.length) return;
+    const LEVELS = { pilot: "Minimum przed pilotażem", auto: "Przed trybem AUTO / pełnym ruchem" };
+    const items = [];
+    lists.forEach((ul, li) => {
+      const listId = ul.dataset.id || "l" + li;
+      const counter = el("p", { class: "checklist-count small" });
+      ul.before(counter);
+      const own = [];
+      [...ul.children].forEach((item, ii) => {
+        const key = `${lessonId}-${listId}-${item.dataset.id || ii}`;
+        const inputId = "chk-" + key.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const label = el("label", { for: inputId });
+        while (item.firstChild) label.appendChild(item.firstChild);
+        const box = el("input", { type: "checkbox", id: inputId });
+        box.checked = !!P.check[key];
+        const lvl = item.dataset.level;
+        if (LEVELS[lvl]) label.appendChild(el("span", { class: "lvl lvl-" + lvl }, lvl === "pilot" ? "pilotaż" : "AUTO"));
+        item.append(box, label);
+        item.classList.toggle("checked", box.checked);
+        box.addEventListener("change", () => {
+          if (box.checked) P.check[key] = Date.now(); else delete P.check[key];
+          save(P); item.classList.toggle("checked", box.checked); refresh();
+        });
+        const rec = { item, box, key, level: lvl };
+        own.push(rec); items.push(rec);
+      });
+      rec_lists.push({ counter, own });
+    });
+    const panel = document.querySelector(".checklist-panel");
+    let filter = "all";
+    function refresh() {
+      rec_lists.forEach(({ counter, own }) => {
+        const vis = own.filter(r => filter === "all" || r.level === filter);
+        counter.textContent = `Zaznaczone: ${vis.filter(r => r.box.checked).length}/${vis.length}`;
+      });
+      items.forEach(r => { r.item.hidden = filter !== "all" && r.level !== filter; });
+      if (panel) {
+        const sum = lvl => { const v = items.filter(r => !lvl || r.level === lvl); return `${v.filter(r => r.box.checked).length}/${v.length}`; };
+        panel.querySelector(".cl-sum").innerHTML =
+          `Razem: <strong>${sum()}</strong> · ${LEVELS.pilot}: <strong>${sum("pilot")}</strong> · ${LEVELS.auto}: <strong>${sum("auto")}</strong>`;
+      }
+    }
+    if (panel) {
+      panel.innerHTML = `<p class="cl-sum"></p>
+        <div class="cl-tools">
+          <button data-f="all" class="primary">Wszystko</button>
+          <button data-f="pilot">${LEVELS.pilot}</button>
+          <button data-f="auto">${LEVELS.auto}</button>
+          <button data-a="print">Drukuj / PDF</button>
+          <button data-a="reset">Wyczyść zaznaczenia</button>
+        </div>`;
+      panel.addEventListener("click", e => {
+        const b = e.target.closest("button"); if (!b) return;
+        if (b.dataset.f) {
+          filter = b.dataset.f;
+          panel.querySelectorAll("[data-f]").forEach(x => x.classList.toggle("primary", x === b));
+          refresh();
+        } else if (b.dataset.a === "print") window.print();
+        else if (b.dataset.a === "reset" && confirm("Wyczyścić zaznaczenia tej checklisty?")) {
+          items.forEach(r => { delete P.check[r.key]; r.box.checked = false; r.item.classList.remove("checked"); });
+          save(P); refresh();
+        }
+      });
+    }
+    refresh();
+  }
+  const rec_lists = [];
+
   // ---------- słowniczek: <dfn data-t="eval">evale</dfn> ----------
   function withGlossary(cb) {
     if (window.GLOSSARY) return cb(window.GLOSSARY);
@@ -161,7 +233,7 @@
     if (!l) return;
     topbar(`M${l.module.id} · ${l.module.title}`);
     P.last = id; save(P);
-    renderCode(); renderQuizzes(id); renderToc(); renderTerms();
+    renderCode(); renderQuizzes(id); renderChecklists(id); renderToc(); renderTerms();
 
     const prev = allLessons[i - 1], next = allLessons[i + 1];
     const link = (x, cls, label) => x && isAvailable(x)
@@ -238,11 +310,11 @@
       try {
         const data = JSON.parse(await f.files[0].text());
         if (!data.done) throw new Error();
-        P = Object.assign({ done: {}, quiz: {}, last: null }, data); save(P); location.reload();
+        P = Object.assign({ done: {}, quiz: {}, check: {}, last: null }, data); save(P); location.reload();
       } catch (e) { alert("Nieprawidłowy plik postępu."); }
     };
     document.getElementById("rst").onclick = () => {
-      if (confirm("Usunąć cały zapisany postęp?")) { P = { done: {}, quiz: {}, last: null }; save(P); location.reload(); }
+      if (confirm("Usunąć cały zapisany postęp?")) { P = { done: {}, quiz: {}, check: {}, last: null }; save(P); location.reload(); }
     };
   }
 

@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.3 Human-in-the-loop – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="5.3">
+<main>
+<p class="meta">Lekcja 5.3 · ok. 55 min</p>
+<h1>Human-in-the-loop: kolejka przeglądu, która nie rośnie</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zrozumieć błąd produkcyjny #3 (kolejka przeglądu bez limitu, terminu i właściciela) i policzyć prawem Little’a, kiedy kolejka rośnie bez końca.</li>
+  <li>Dobrać formę udziału człowieka: przegląd przed zastosowaniem, podpowiedź, przegląd po fakcie.</li>
+  <li>Liczyć sygnały pewności w kodzie (<code>TriageScorer</code>) i traktować próg jako decyzję biznesową.</li>
+  <li>Zbudować kolejkę <code>triage_reviews</code> z terminem, wygaszaniem, endpointami i UI odpornym na bezmyślne klikanie.</li>
+  <li>Monitorować kolejkę, łagodzić przepełnienie i mieć runbook „kolejka rośnie”.</li>
+</ul></div>
+
+<h2>Błąd produkcyjny #3: kolejka rośnie</h2>
+<p>W 5.1 i 5.2 triage nauczył się wyliczać kategorię, priorytet i zespół, a walidacja odsiewa wyniki niepoprawne formalnie. Zostaje wynik poprawny w formie, ale może błędny w treści. Odpowiedź „niech człowiek sprawdzi niepewne” to <dfn data-t="hitl">human-in-the-loop</dfn> (HITL): proces, w którym człowiek zatwierdza lub poprawia decyzje AI. Brzmi bezpiecznie, dopóki nie policzysz, ilu ludzi i ile czasu to wymaga.</p>
+<div class="box bug"><span class="label">Incydent: tysiące zgłoszeń w WAITING_REVIEW</span>
+<p>Acme przeszło z SUGGEST na AUTO. Próg pewności ustawiono ostrożnie („lepiej, żeby człowiek sprawdził”), więc do przeglądu trafiało ok. 60% zgłoszeń. Przeglądało dwóch agentów, piotr i marta@acme, „przy okazji” normalnej pracy. Dyspozytor, który wcześniej ręcznie przydzielał zgłoszenia, dostał inne zadania, bo „triage robi AI”. Widok „Do przydzielenia” ukrywał zgłoszenia z triage w toku, żeby nikt nie robił pracy dwa razy.</p>
+<ul>
+  <li>Acme: 720 zgłoszeń w dzień roboczy, 612 w godzinach 8–17, czyli <strong>λ ≈ 68/h</strong>. Do przeglądu 60%: <strong>41/h</strong>.</li>
+  <li>Przegląd trwa średnio 90 s, więc jedna osoba zajęta tylko tym robi 40/h. Piotr i marta poświęcali ok. 30% czasu: <strong>μ = 2 · 40 · 0,3 = 24/h</strong>.</li>
+  <li>W godzinach pracy kolejka rośnie o 41 − 24 = 17/h, czyli 153 dziennie. Po doliczeniu nocy (65 do przeglądu) i weekendu (144) przybywa ok. 1230 tygodniowo. Po trzech tygodniach: <strong>ok. 3700 runów WAITING_REVIEW</strong>.</li>
+  <li>Zgłoszenie dodane o 17:00 czekało za 153 innymi: 153 / 24 ≈ 6,4 h pracy przeglądających. Termin pierwszej reakcji dla HIGH to 2 h (1.1). Zgłoszenia bez zespołu nie trafiały do kolejki żadnego zespołu.</li>
+</ul>
+<p>Brak wyjątków, brak alertów, model działał dobrze. Klienci zaczęli dzwonić.</p>
+<p><strong>Błąd #3: kolejka HITL bez limitu, terminu i właściciela.</strong> Nikt nie zdefiniował, co się dzieje z przeglądem niezałatwionym na czas, ile pozycji może czekać ani kto odpowiada za obsłużenie kolejki.</p></div>
+<p>Lekcja naprawia te trzy braki: termin (<code>due_at</code> i wygaszanie), limit (próg, pojemność, odcinanie nadmiaru) i właściciela (ustawienia tenanta, alert, runbook).</p>
+
+<h2>Prawo Little’a: kiedy kolejka rośnie bez końca</h2>
+<p><dfn data-t="little-law">Prawo Little’a</dfn>: w systemie stabilnym średnia liczba pozycji L równa się tempu napływu λ razy średniemu czasowi pobytu W, czyli <strong>L = λ · W</strong>. Nie zależy od rozkładu napływu ani kolejności obsługi, ale wymaga stabilności: obsługa musi nadążać za napływem (λ &lt; μ, gdzie μ to przepustowość, czyli liczba pozycji obsłużonych na godzinę).</p>
+<table>
+  <tr><th>Pytanie</th><th>Obliczenie (Acme)</th></tr>
+  <tr><td>Ile pozycji czeka średnio, jeśli przegląd ma trwać ≤ 20 min?</td><td>L = 41/h · 1/3 h ≈ 14</td></tr>
+  <tr><td>Jaki czas oczekiwania przy kolejce 120 i napływie 41/h?</td><td>W = L / λ = 120 / 41 ≈ 2,9 h</td></tr>
+  <tr><td>Czy system jest stabilny?</td><td>ρ = λ / μ = 41 / 24 ≈ 1,7 &gt; 1: nie</td></tr>
+  <tr><td>Co dzieje się przy λ &gt; μ?</td><td>L(t) = (λ − μ) · t, W(t) ≈ L(t) / μ; po 3 h: 51 pozycji, ok. 2,1 h czekania</td></tr>
+</table>
+<p>Iloraz ρ = λ/μ to <dfn data-t="utilization">wykorzystanie</dfn> (utilization): jaki ułamek czasu obsługa jest zajęta. Przy ρ &gt; 1 żaden wysiłek nie pomoże. Mniej oczywiste jest to, co dzieje się poniżej 1: napływ jest losowy, więc zatory tworzą się już przy ρ = 0,9. W najprostszym modelu kolejki z jednym obsługującym (M/M/1) średnie czekanie to ρ/(1 − ρ) czasów obsługi:</p>
+<table>
+  <tr><th>ρ</th><th>0,50</th><th>0,75</th><th>0,90</th><th>0,95</th></tr>
+  <tr><td>ρ/(1 − ρ)</td><td>1</td><td>3</td><td>9</td><td>19</td></tr>
+  <tr><td>Czekanie przy obsłudze 90 s</td><td>1,5 min</td><td>4,5 min</td><td>13,5 min</td><td>28,5 min</td></tr>
+</table>
+<p>Dla kilku przeglądających dokładniejszy jest wzór Erlang C, ale wniosek jest ten sam: <strong>planuj ρ ≤ 0,75</strong>. Potrzebna obsada to λ<sub>REVIEW</sub> / (przeglądów na osobogodzinę · 0,75). W incydencie: 41 / (40 · 0,75) ≈ 1,4 etatu wyłącznie na przegląd, a było 0,6.</p>
+<div class="box tip"><span class="label">Prawo Little’a jako test dymny</span><p>Iloraz średniej długości kolejki i tempa dodawania pozycji to czas oczekiwania. Jeśli wyraźnie różni się od wieku z histogramu, któraś metryka kłamie (sekcja o monitoringu).</p></div>
+
+<h2>Trzy formy udziału człowieka w procesie</h2>
+<p>W 3.5 człowiek zatwierdzał akcję, o którą sam poprosił. W triage wyniki napływają w tle, setkami dziennie: to HITL na poziomie procesu. Pytanie brzmi, gdzie w przepływie stoi człowiek i co się dzieje, gdy go nie ma.</p>
+<table>
+  <tr><th>Forma</th><th>W HelpDesk</th><th>Kiedy</th><th>Koszt i ryzyko</th></tr>
+  <tr><td><strong>Przegląd przed zastosowaniem</strong> (<code>BEFORE_APPLY</code>)</td><td>Tryb AUTO: wynik niepewny czeka w kolejce, zmiana dopiero po akceptacji</td><td>Błąd drogi, widoczny dla klienta, trudny do cofnięcia</td><td>Najdroższy w czasie ludzi; bez terminu prowadzi do błędu #3</td></tr>
+  <tr><td><strong>Podpowiedź</strong> (<code>SUGGESTION</code>)</td><td>Tryb SUGGEST: zgłoszenie od razu w zwykłej kolejce, propozycja na karcie, zatwierdza osoba obsługująca</td><td>Nowy tenant, zbieranie etykiet, jakość niezmierzona</td><td>Nie przyspiesza procesu jak AUTO, ale go nie blokuje</td></tr>
+  <tr><td><strong>Przegląd po fakcie</strong> (<code>AFTER_APPLY</code>)</td><td>Wynik pewny stosowany od razu, losowa próbka (np. 5%) do kontroli, korekta zastępuje zmianę</td><td>Błąd tani i odwracalny (zła kategoria = przesunięcie między zespołami)</td><td>Tani; jedyny nieobciążony pomiar trafności AUTO</td></tr>
+  <tr><td><strong>Bez człowieka</strong></td><td>AUTO_APPLY bez próbki</td><td>W zasadzie nigdy dla procesu z LLM</td><td>Ciche pogorszenie (5.4) wykryjesz po skargach</td></tr>
+</table>
+<p>Kluczowa zmiana po incydencie: <strong>żadna forma przeglądu nie ukrywa zgłoszenia</strong>. Zgłoszenie w <code>WAITING_REVIEW</code> jest w zwykłej kolejce „Do przydzielenia” z etykietą „triage AI czeka na przegląd do 10:42”. Przegląd może obsługę przyspieszyć, nigdy zatrzymać.</p>
+<div class="box warn"><span class="label">CRITICAL zawsze z człowiekiem</span><p>Z kontraktu: <code>TriagePolicy</code> nie pozwala aktorowi systemowemu ustawić CRITICAL. Pomyłka w dół kosztuje naruszenie 30-minutowego SLA, pomyłka w górę budzi dyżurnego w nocy. Oszczędność kilkunastu przeglądów dziennie tego nie uzasadnia.</p></div>
+
+<h2>Sygnały pewności liczone przez kod</h2>
+<p>W 5.2 ustaliliśmy, że model nie podaje „pewności” jako podstawy decyzji: liczby generowane przez model są niekalibrowane, czyli „90%” nie znaczy, że 9 na 10 takich odpowiedzi jest trafnych. <code>TriageScorer</code> liczy pewność z sygnałów mierzalnych w kodzie:</p>
+<table>
+  <tr><th>Sygnał</th><th>Skąd</th><th>Skutek</th></tr>
+  <tr><td>Walidacja przeszła dopiero po naprawie</td><td><code>triage_steps</code>: VALIDATE z <code>attempt &gt; 1</code> (5.2)</td><td>REVIEW</td></tr>
+  <tr><td><code>needsHuman = true</code></td><td>Wynik modelu (groźba prawna, reklamacja, wieloznaczność)</td><td>REVIEW</td></tr>
+  <tr><td>Priorytet CRITICAL</td><td>Wynik modelu</td><td>REVIEW zawsze</td></tr>
+  <tr><td>Konflikt ze słowami kluczowymi</td><td>Reguły per kategoria („faktur”, „przelew” → BILLING; „RODO”, „wyciek”, „prawnik” → zawsze człowiek)</td><td>REVIEW</td></tr>
+  <tr><td>Historyczna trafność kategorii</td><td>Akceptacje w <code>triage_reviews</code> dla tenanta i kategorii, dolna granica <dfn data-t="wilson-interval">przedziału Wilsona</dfn> (3.7)</td><td>Liczba porównywana z progiem</td></tr>
+  <tr><td>Zgodność dwóch prób (opcja)</td><td>Drugie wywołanie modelu</td><td>Niezgodność → REVIEW; dodatkowy koszt</td></tr>
+</table>
+<p>Porównywanie kilku niezależnych odpowiedzi modelu na to samo pytanie to <dfn data-t="self-consistency">self-consistency</dfn>: gdy model „waha się”, kolejne próby dają różne wyniki. Robimy to tylko w pobliżu progu, więc w Acme dotyczy ok. 20% runów i podnosi koszt triage o ok. 20%, a nie o 100%.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/decide/TriageScorer.kt">
+  data class DecisionReason(val code: String, val detail: String)
+  data class TriageAssessment(
+      val decision: TriageDecision,
+      val score: Double?,                  // dolna granica trafności; null = brak danych
+      val reasons: List<DecisionReason>,   // → triage_runs.decision_reasons
+      val auditSample: Boolean = false,    // AUTO_APPLY + przegląd po fakcie
+  )
+
+  @Component
+  class TriageScorer(
+      private val steps: TriageStepRepository,
+      private val keywords: TriageKeywordRules,
+      private val accuracy: CategoryAccuracyStats,      // z triage_reviews, cache 10 min
+      private val secondOpinion: TriageSecondOpinion,
+      private val settings: TriageTenantSettingsRepository,
+      private val random: RandomGenerator,
+  ) {
+      /** Sygnatura z kontraktu; krok DECIDE woła assess(), żeby zapisać też powody. */
+      fun decide(run: TriageRun, result: TriageResult, mode: TriageMode) = assess(run, result, mode).decision
+
+      fun assess(run: TriageRun, result: TriageResult, mode: TriageMode): TriageAssessment {
+          if (mode == TriageMode.OFF) return TriageAssessment(TriageDecision.SKIP, null, listOf(r("MODE_OFF", "Triage wyłączony")))
+          val s = settings.get(run.tenantId)
+          val hard = buildList {
+              if (result.priority == TicketPriority.CRITICAL) add(r("CRITICAL_ALWAYS_REVIEW", "CRITICAL zawsze do przeglądu"))
+              if (steps.wasRepaired(run.id)) add(r("VALIDATION_REPAIRED", "Wynik poprawny dopiero po naprawie"))
+              if (result.needsHuman) add(r("MODEL_NEEDS_HUMAN", "Model oznaczył: wymaga człowieka"))
+              keywords.check(steps.loadedInput(run.id), result.category)?.let { add(r(it.code, it.detail)) }
+          }
+          if (mode == TriageMode.SUGGEST) return TriageAssessment(TriageDecision.REVIEW, null, hard + r("MODE_SUGGEST", "Tryb podpowiedzi"))
+          if (hard.isNotEmpty()) return TriageAssessment(TriageDecision.REVIEW, null, hard)   // SHADOW liczy jak AUTO (5.4)
+
+          val acc = accuracy.lowerBound(run.tenantId, result.category)
+              ?: return TriageAssessment(TriageDecision.REVIEW, null, listOf(r("COLD_START", "Za mało przeglądów: ${result.category}")))
+          val why = listOf(r("CATEGORY_ACCURACY", "Trafność ${result.category} ${pct(acc)}, próg ${pct(s.autoThreshold)}"))
+          if (acc < s.autoThreshold) return TriageAssessment(TriageDecision.REVIEW, acc, why)
+          if (s.secondOpinion && acc < s.autoThreshold + 0.03 && !secondOpinion.agrees(run, result))
+              return TriageAssessment(TriageDecision.REVIEW, acc, why + r("SECOND_OPINION_DISAGREES", "Druga próba dała inny wynik"))
+          return TriageAssessment(TriageDecision.AUTO_APPLY, acc, why, auditSample = random.nextDouble() < s.auditSampleRate)
+      }
+
+      private fun r(code: String, detail: String) = DecisionReason(code, detail)
+      private fun pct(x: Double) = "%.0f%%".format(x * 100)
+  }
+</script>
+<p>Trafność liczymy z przeglądów z 30 dni: ACCEPTED to trafienie, CORRECTED i REJECTED to pomyłka, EXPIRED pomijamy. Przykład: BILLING w Acme, 230 akceptacji na 250, czyli 92%, a dolna granica Wilsona ≈ 0,88. Dolna granica chroni przed decyzją na podstawie 9 trafień na 10; poniżej <code>min-labels</code> (np. 50) wynik to <code>COLD_START</code>.</p>
+<div class="box warn"><span class="label">Pułapka: trafność mierzona na przeglądanych</span><p>Do przeglądu trafiają przypadki niepewne, więc trafność policzona tylko z nich zaniża jakość całości, a o AUTO_APPLY bez próbki nie wiesz nic. To <dfn data-t="selection-bias">błąd selekcji</dfn>: wnioski z próbki nielosowej. Dlatego <code>CategoryAccuracyStats</code> opiera się przede wszystkim na losowej próbce <code>AFTER_APPLY</code> i przeglądach na ślepo (dalej). Porządną kalibrację progu robimy w 5.6.</p></div>
+<p>Zwróć uwagę na <code>COLD_START</code>: nowy tenant w AUTO wysyła do przeglądu wszystko, dopóki nie zbierze etykiet. Tak właśnie zaczął się incydent. Dlatego rollout (5.4) idzie SHADOW → SUGGEST → AUTO: etykiety zbiera tryb podpowiedzi, który nie blokuje procesu.</p>
+
+<h2>Próg jako decyzja biznesowa</h2>
+<p>Próg <code>auto_threshold</code> przesuwa pracę między maszyną a ludźmi. Inżynier dostarcza liczby, ale decyzję podejmuje właściciel procesu (kierownik wsparcia Acme), bo waży koszt pomyłki wobec kosztu pracy. Dane Acme z czterech tygodni w SUGGEST (ilustracyjne):</p>
+<table>
+  <tr><th>Próg</th><th>REVIEW</th><th>Błędy AUTO</th><th>Błędne AUTO / dzień</th><th>Przeglądy / h</th><th>Obsada przy ρ = 0,75</th></tr>
+  <tr><td>0,97</td><td>60%</td><td>1,0%</td><td>2,9</td><td>41</td><td>1,4 etatu</td></tr>
+  <tr><td>0,92</td><td>35%</td><td>2,0%</td><td>9,4</td><td>24</td><td>0,8 etatu</td></tr>
+  <tr><td>0,88</td><td>22%</td><td>3,0%</td><td>16,8</td><td>15</td><td>0,5 etatu</td></tr>
+  <tr><td>0,80</td><td>10%</td><td>5,5%</td><td>35,6</td><td>6,8</td><td>0,2 etatu</td></tr>
+</table>
+<p>Błędne AUTO / dzień = 720 · (1 − REVIEW) · błąd, np. 720 · 0,78 · 0,03 ≈ 16,8. Bez punktu odniesienia tabela nie daje decyzji: potrzebna jest jeszcze <strong>trafność ręcznego triage</strong>. Dyspozytor Acme mylił się w ok. 4% przypadków, więc przy progu 0,88 automat myli się rzadziej niż człowiek. Acme wybrało 0,92 na pierwszy miesiąc, z 0,8 etatu przeglądu w grafiku, i zapisało kryterium: „jeśli korekty w próbce AFTER_APPLY &lt; 3% przez 4 tygodnie, schodzimy do 0,88”.</p>
+<script type="text/x-code" data-lang="sql" data-title="V53__triage_tenant_settings.sql (numer przykładowy)">
+  CREATE TABLE triage_tenant_settings (
+      tenant_id          uuid PRIMARY KEY REFERENCES tenants(id),
+      auto_threshold     numeric(4,3) NOT NULL DEFAULT 0.950 CHECK (auto_threshold BETWEEN 0.5 AND 1),
+      audit_sample_rate  numeric(4,3) NOT NULL DEFAULT 0.050,
+      blind_sample_rate  numeric(4,3) NOT NULL DEFAULT 0.020,
+      second_opinion     boolean      NOT NULL DEFAULT false,
+      max_pending        int          NOT NULL DEFAULT 150,         -- limit kolejki BEFORE_APPLY
+      review_hours       text         NOT NULL DEFAULT 'MON-FRI 08:00-17:00 Europe/Warsaw',
+      queue_owner_id     uuid         NOT NULL,                    -- właściciel kolejki
+      updated_by         uuid         NOT NULL,
+      updated_at         timestamptz  NOT NULL DEFAULT now()
+  );
+</script>
+<p>Właściciel kolejki to kolumna <code>NOT NULL</code>, a przełączenie tenanta na AUTO odmawia, gdy brakuje wiersza ustawień. To najtańsza obrona przed błędem #3: automatu nie da się włączyć bez wskazania osoby odpowiedzialnej za jego kolejkę. Zmiany progu idą przez endpoint admina z audytem, jak kill switch w 3.2.</p>
+
+<h2>Tabela triage_reviews i termin przeglądu</h2>
+<p>Do kolumn z kontraktu M5 dokładamy rodzaj przeglądu, tryb na ślepo, miękkie zajęcie, czas decyzji i flagę zastosowania.</p>
+<script type="text/x-code" data-lang="sql" data-title="V54__triage_reviews.sql (numer przykładowy)">
+  CREATE TABLE triage_reviews (
+      run_id         uuid PRIMARY KEY REFERENCES triage_runs(id),
+      tenant_id      uuid NOT NULL,
+      ticket_id      uuid NOT NULL,
+      kind           text NOT NULL CHECK (kind IN ('BEFORE_APPLY','SUGGESTION','AFTER_APPLY')),
+      blind          boolean NOT NULL DEFAULT false,
+      reviewer_id    uuid NULL,
+      outcome        text NULL CHECK (outcome IN ('ACCEPTED','CORRECTED','REJECTED','EXPIRED')),
+      corrected      jsonb NULL,                  -- poprawione pola = etykieta
+      reject_reason  text NULL,
+      expire_reason  text NULL,                   -- TIMEOUT | TICKET_CHANGED | MODE_CHANGED
+      applied        boolean NULL,
+      sla_due_at     timestamptz NOT NULL,
+      enqueued_at    timestamptz NOT NULL,
+      due_at         timestamptz NOT NULL,
+      claimed_by     uuid NULL,
+      claimed_until  timestamptz NULL,
+      decision_ms    int NULL,                    -- od pokazania karty do decyzji
+      decided_at     timestamptz NULL,
+      CHECK ((outcome IS NULL) = (decided_at IS NULL))
+  );
+  CREATE INDEX ix_triage_reviews_open ON triage_reviews (tenant_id, kind, due_at) WHERE outcome IS NULL;
+  CREATE INDEX ix_triage_reviews_due  ON triage_reviews (due_at) WHERE outcome IS NULL;
+  ALTER TABLE triage_reviews ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE triage_reviews FORCE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON triage_reviews USING (
+      coalesce(current_setting('app.system_job', true), '') <> ''
+      OR tenant_id = ANY (string_to_array(current_setting('app.tenant_ids', true), ',')::uuid[]));
+</script>
+<p>Termin z kontraktu: <code>due_at = min(teraz + review-timeout, termin SLA pierwszej reakcji − bufor)</code>. Szczegół łatwy do przeoczenia: którego priorytetu SLA? Zgłoszenie ma jeszcze priorytet domyślny (NORMAL, 8 h), a model proponuje HIGH (2 h). Bierzemy termin <strong>surowszy</strong>: jeśli model ma rację, czekanie 8 h oznacza naruszenie.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/review/TriageReviewQueue.kt">
+  @ConfigurationProperties("helpdesk.triage.review")
+  data class ReviewProperties(
+      val timeout: Duration = Duration.ofMinutes(30),            // BEFORE_APPLY
+      val suggestionTimeout: Duration = Duration.ofHours(4),
+      val auditTimeout: Duration = Duration.ofDays(2),           // AFTER_APPLY: zmiana już zastosowana
+      val slaBuffer: Duration = Duration.ofMinutes(15),
+      val minWindow: Duration = Duration.ofMinutes(3),
+  )
+
+  @Component
+  class TriageReviewQueue(
+      private val repo: TriageReviewRepository, private val sla: SlaApi,
+      private val settings: TriageTenantSettingsRepository, private val hours: ReviewHoursCalendar,
+      private val props: ReviewProperties, private val metrics: TriageMetrics,
+      private val random: RandomGenerator, private val clock: Clock,
+  ) {
+      /** null = zakolejkowano; DecisionReason = odcięte (run → SKIPPED, zgłoszenie obsługiwane ręcznie). */
+      fun enqueue(run: TriageRun, ticket: TicketView, result: TriageResult, kind: ReviewKind): DecisionReason? {
+          val now = clock.instant()
+          val s = settings.get(run.tenantId)
+          val slaDue = minOf(sla.firstResponseDueAt(ticket, ticket.priority), sla.firstResponseDueAt(ticket, result.priority))
+          val dueAt = when (kind) {
+              ReviewKind.AFTER_APPLY -> now.plus(props.auditTimeout)
+              ReviewKind.SUGGESTION -> minOf(now.plus(props.suggestionTimeout), slaDue.minus(props.slaBuffer))
+              ReviewKind.BEFORE_APPLY -> minOf(now.plus(props.timeout), slaDue.minus(props.slaBuffer))
+          }
+          if (kind == ReviewKind.BEFORE_APPLY) {                     // tylko ta forma blokuje zmianę
+              val shed = when {
+                  dueAt < now.plus(props.minWindow) -> DecisionReason("NO_TIME_FOR_REVIEW", "Za mało czasu do SLA")
+                  !hours.isOpen(s.reviewHours, now) -> DecisionReason("OUTSIDE_REVIEW_HOURS", "Poza godzinami przeglądu")
+                  repo.countOpen(run.tenantId, kind) >= s.maxPending -> DecisionReason("QUEUE_FULL", "Kolejka pełna")
+                  else -> null
+              }
+              if (shed != null) { metrics.shed(run.tenantId, shed.code); return shed }
+          }
+          val blind = kind == ReviewKind.BEFORE_APPLY && random.nextDouble() < s.blindSampleRate
+          repo.insert(run.id, run.tenantId, run.ticketId, kind, blind, slaDue, now, dueAt)
+          return null
+      }
+  }
+</script>
+<p><code>SlaApi.firstResponseDueAt(ticket, priority)</code> to rozszerzenie <code>SlaApi</code> z 1.1: termin pierwszej reakcji przy danym priorytecie (ten sam <code>Clock</code>, te same pauzy). Odcięty run kończy się jako SKIPPED z powodem w <code>decision_reasons</code>. To <dfn data-t="load-shedding">odcinanie nadmiaru</dfn> (load shedding): przy przeciążeniu świadomie rezygnujemy z części pracy, zamiast pozwolić, by kolejka pogrążyła wszystkich. Przegląd, który z definicji nie zdąży przed SLA, tylko zajmuje uwagę ludzi.</p>
+
+<h2>Wygaszanie po due_at: fail open dla procesu</h2>
+<p>Po <code>due_at</code> przegląd i run przechodzą w <code>EXPIRED</code>, a zgłoszenie zostaje w zwykłej kolejce bez zmian z triage. Job działa co minutę na każdej instancji; <dfn data-t="skip-locked">FOR UPDATE SKIP LOCKED</dfn> sprawia, że instancje nie biorą tych samych wierszy, a <code>outcome IS NULL</code> chroni decyzję podjętą sekundę wcześniej.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/review/TriageReviewExpiryJob.kt">
+  @Component
+  class TriageReviewExpiryJob(private val jdbc: JdbcClient, private val tx: TransactionTemplate,
+                              private val metrics: TriageMetrics, private val clock: Clock) {
+      @Scheduled(fixedDelayString = "\${helpdesk.triage.review.expiry-interval:PT1M}")
+      fun expireDue() {
+          do { val n = tx.execute { expireBatch(200) }!! } while (n == 200)
+      }
+
+      private fun expireBatch(limit: Int): Int {
+          jdbc.sql("select set_config('app.system_job', 'triage-review-expiry', true)").query().singleValue()
+          val now = Timestamp.from(clock.instant())
+          val expired = jdbc.sql("""
+              WITH due AS (SELECT run_id FROM triage_reviews
+                           WHERE outcome IS NULL AND due_at <= :now
+                           ORDER BY due_at LIMIT :limit FOR UPDATE SKIP LOCKED)
+              UPDATE triage_reviews r SET outcome = 'EXPIRED', expire_reason = 'TIMEOUT', decided_at = :now, applied = false
+                FROM due WHERE r.run_id = due.run_id
+              RETURNING r.run_id, r.tenant_id, r.kind, r.enqueued_at""")
+              .param("now", now).param("limit", limit)
+              .query { rs, _ -> Expired(rs.getObject(1, UUID::class.java), rs.getObject(2, UUID::class.java),
+                                        ReviewKind.valueOf(rs.getString(3)), rs.getTimestamp(4).toInstant()) }.list()
+          if (expired.isEmpty()) return 0
+          jdbc.sql("UPDATE triage_runs SET status = 'EXPIRED', finished_at = :now, updated_at = :now " +
+                   "WHERE id = ANY(:ids) AND status = 'WAITING_REVIEW'")
+              .param("now", now).param("ids", expired.map { it.runId }.toTypedArray()).update()
+          expired.forEach { metrics.reviewDecided(it.tenantId, it.kind, "EXPIRED", Duration.between(it.enqueuedAt, now.toInstant())) }
+          return expired.size
+      }
+      private data class Expired(val runId: UUID, val tenantId: UUID, val kind: ReviewKind, val enqueuedAt: Instant)
+  }
+</script>
+<p>Dlaczego <dfn data-t="fail-open">fail open</dfn> (przy braku decyzji proces idzie dalej), skoro przy awarii Presidio w 2.7 wybraliśmy <dfn data-t="fail-closed">fail closed</dfn>? Bo chronimy co innego. Redakcja PII to zabezpieczenie: bez niej dane wyciekają. Przegląd triage to kontrola jakości usprawnienia: bez niego zgłoszenie jest obsługiwane tak jak przed AI. Trzeba rozdzielić dwie rzeczy:</p>
+<ul>
+  <li><strong>Zmiana z AI: fail closed.</strong> Nieprzejrzany wynik niepewny nigdy nie jest stosowany „bo minął czas”. Automatyczna akceptacja po terminie zamieniłaby przegląd w samo opóźnienie.</li>
+  <li><strong>Obsługa zgłoszenia: fail open.</strong> Brak triage nie blokuje pracy, a zgłoszenie jest w „Do przydzielenia” przez cały czas, nie dopiero po wygaśnięciu.</li>
+</ul>
+<p>Wygaśnięcie nie jest awarią, tylko sygnałem, że brakuje pojemności albo próg jest za wysoki. Pojedyncze są normalne, 10% to temat dla właściciela kolejki.</p>
+
+<h3>Kto przegląda i w jakiej kolejności</h3>
+<p>Przegląd to osobna pozycja w grafiku, nie praca „przy okazji”. Przeglądać może AGENT lub ADMIN z dostępem do tenanta: piotr widzi kolejki Acme i Globex, marta@acme tylko Acme. Kolejność wyznacza najbliższy <code>due_at</code>, bo ten wynika z SLA: propozycja HIGH (2 h − bufor) wyprzedza NORMAL, nawet jeśli przyszła później. Przycisk „Następne” (<code>POST /api/triage/reviews/next</code>) zajmuje najpilniejszą pozycję miękko na 3 minuty (<code>claimed_by</code>, <code>claimed_until</code>, <code>FOR UPDATE SKIP LOCKED</code>) i pomija te, którym do <code>due_at</code> została minuta. To podpowiedź dla UI, a nie blokada; decyzję rozstrzyga warunek <code>outcome IS NULL</code> przy zapisie.</p>
+<p>Pozycje <code>AFTER_APPLY</code> mają osobną zakładkę i termin 2 dni: nie konkurują z przeglądami blokującymi, ale bez nich znika pomiar jakości AUTO. <code>SUGGESTION</code> nie ma osobnej kolejki: rozpatruje ją osoba, która obsługuje zgłoszenie.</p>
+
+<h2>Endpointy przeglądu</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/web/TriageReviewController.kt">
+  @RestController
+  @RequestMapping("/api/triage/reviews")
+  @PreAuthorize("hasAnyRole('AGENT','ADMIN')")
+  class TriageReviewController(private val queries: TriageReviewQueries, private val service: TriageReviewService) {
+      @GetMapping
+      fun list(user: CurrentUser, @RequestParam(required = false) tenantId: UUID?,
+               @RequestParam(defaultValue = "BEFORE_APPLY") kind: ReviewKind) = queries.listOpen(user, tenantId, kind)
+
+      @PostMapping("/next")
+      fun next(user: CurrentUser, @RequestParam(required = false) tenantId: UUID?): ResponseEntity<ReviewItemView> =
+          queries.claimNext(user, tenantId)?.let { ResponseEntity.ok(it) } ?: ResponseEntity.noContent().build()
+
+      @PostMapping("/{runId}/accept")
+      fun accept(user: CurrentUser, @PathVariable runId: UUID, @Valid @RequestBody body: DecisionMeta) =
+          service.decide(user, runId, ReviewCommand.Accept, body)
+
+      @PostMapping("/{runId}/correct")
+      fun correct(user: CurrentUser, @PathVariable runId: UUID, @Valid @RequestBody body: CorrectRequest) =
+          service.decide(user, runId, ReviewCommand.Correct(body.category, body.priority, body.team, body.note), body.meta)
+
+      @PostMapping("/{runId}/reject")
+      fun reject(user: CurrentUser, @PathVariable runId: UUID, @Valid @RequestBody body: RejectRequest) =
+          service.decide(user, runId, ReviewCommand.Reject(body.reason), body.meta)
+  }
+
+  data class DecisionMeta(@field:Min(0) @field:Max(3_600_000) val viewedMs: Int?)
+  data class CorrectRequest(val category: TicketCategory?, val priority: TicketPriority?, val team: String?,
+                            @field:Size(max = 500) val note: String?, @field:Valid val meta: DecisionMeta = DecisionMeta(null)) {
+      @AssertTrue(message = "Podaj co najmniej jedno poprawione pole")
+      fun isAnyField() = category != null || priority != null || team != null
+  }
+  data class RejectRequest(@field:NotBlank @field:Size(max = 500) val reason: String, val meta: DecisionMeta = DecisionMeta(null))
+  data class ReviewResult(val runId: UUID, val outcome: ReviewOutcome, val applied: Boolean, val ticketVersion: Long?)
+</script>
+<table>
+  <tr><th>Sytuacja</th><th>HTTP</th><th><code>type</code> (sufiks)</th></tr>
+  <tr><td>Brak przeglądu albo tenant niedostępny dla przeglądającego</td><td>404</td><td><code>triage-review-not-found</code></td></tr>
+  <tr><td>Rozstrzygnięty przez kogoś innego albo inną decyzją</td><td>409</td><td><code>triage-review-already-decided</code></td></tr>
+  <tr><td>Zgłoszenie zmieniło się od LOAD</td><td>409</td><td><code>triage-review-stale</code> (+ <code>labelRecorded</code>)</td></tr>
+  <tr><td>Po <code>due_at</code></td><td>410</td><td><code>triage-review-expired</code></td></tr>
+  <tr><td>Kill switch <code>TRIAGE_APPLY</code> albo <code>ai.enabled = false</code></td><td>403</td><td><code>triage-apply-disabled</code></td></tr>
+  <tr><td>Zespół nieaktywny dla tenanta</td><td>422</td><td><code>business-rule</code></td></tr>
+</table>
+<p>Odrzucenie wymaga powodu („to spam”, „duplikat HD-2990”): powód jest najcenniejszą częścią etykiety.</p>
+
+<h2>TriageReviewService: zastosowanie przez fasady</h2>
+<p>Akceptacja i korekta stosują zmianę jak krok APPLY: przez fasady, z aktorem systemowym i <code>expectedVersion</code>. Różnica: w <code>ticket_events</code> zostaje <code>on_behalf_of = reviewer_id</code>, więc wiadomo, który człowiek zatwierdził decyzję automatu.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/review/TriageReviewService.kt">
+  @Service
+  class TriageReviewService(
+      private val reviews: TriageReviewRepository, private val runs: TriageRunRepository,
+      private val tickets: TicketApi, private val applier: TriageApplier,      // cienkie opakowanie na TicketApi.classify z 5.1
+      private val availability: AiAvailability, private val tenantSession: TenantSession,
+      private val metrics: TriageMetrics, private val tx: TransactionTemplate, private val clock: Clock,
+  ) {
+      fun decide(user: CurrentUser, runId: UUID, cmd: ReviewCommand, meta: DecisionMeta): ReviewResult = try {
+          tx.execute { decideInTx(user, runId, cmd, meta) }!!
+      } catch (e: TriageReviewStaleException) {
+          tx.executeWithoutResult { recordStaleLabel(user, runId, cmd, meta) }   // NOWA transakcja, jak FAILED w 3.5
+          throw e
+      }
+
+      private fun decideInTx(user: CurrentUser, runId: UUID, cmd: ReviewCommand, meta: DecisionMeta): ReviewResult {
+          tenantSession.bind(user)                                           // RLS: cudzy tenant → brak wiersza
+          val now = clock.instant()
+          val review = reviews.find(runId)?.takeIf { user.canSeeTenant(it.tenantId) } ?: throw TriageReviewNotFoundException(runId)
+          val run = runs.get(runId)
+          // 1) zajęcie: UPDATE ... WHERE outcome IS NULL AND due_at > :now – wygrywa jeden przeglądający
+          if (reviews.decide(runId, user.userId, cmd, meta.viewedMs, now) == 0) return replayOrExplain(review, user, cmd, now)
+
+          val applies = cmd !is ReviewCommand.Reject && !(review.kind == ReviewKind.AFTER_APPLY && cmd is ReviewCommand.Accept)
+          if (!applies) {
+              runs.finishWithoutApply(runId, cmd, now)                       // Reject → REJECTED; akceptacja próbki: bez zmian
+              return done(review, cmd, applied = false, version = null, now = now)
+          }
+          // 2) bieżący stan, nie stan z chwili kolejkowania
+          if (!availability.isActionTypeEnabled(TRIAGE_APPLY) || availability.status(review.tenantId) != AiStatus.AVAILABLE)
+              throw TriageApplyDisabledException()
+          val final = run.result!!.merge(cmd)
+          tickets.dryRun(user, review.ticketId, final.toIntent(), Actor.user(user)).decision.orThrow()  // 3.3
+          val expected = if (review.kind == ReviewKind.AFTER_APPLY) run.appliedTicketVersion!! else run.ticketVersion
+          if (tickets.currentVersion(user, review.ticketId) != expected) throw TriageReviewStaleException(runId)
+
+          // 3) zmiana: SYSTEM + on_behalf_of, expectedVersion, triageRunId i configVersion w payloadzie zdarzenia
+          val ticket = applier.apply(run, final, Actor.system(runId, reviewerId = user.userId), expected)
+          runs.markApplied(runId, final, ticket.version, now)
+          return done(review, cmd, applied = true, version = ticket.version, now = now)
+      }
+
+      private fun done(r: ReviewRow, cmd: ReviewCommand, applied: Boolean, version: Long?, now: Instant): ReviewResult {
+          reviews.markApplied(r.runId, applied)
+          metrics.reviewDecided(r.tenantId, r.kind, cmd.outcome.name, Duration.between(r.enqueuedAt, now))
+          return ReviewResult(r.runId, cmd.outcome, applied, version)
+      }
+  }
+</script>
+<ul>
+  <li><strong>Najpierw zajęcie, potem walidacja</strong>, jak <code>claim</code> w 3.5. Wyjątek z walidacji wycofuje zajęcie, więc pozycja wraca do kolejki.</li>
+  <li><strong>Idempotencja bez nagłówka.</strong> Zamiast <dfn data-t="idempotency-key">Idempotency-Key</dfn> z 3.5 wystarcza naturalna idempotencja stanu: <code>replayOrExplain</code> zwraca zapisany wynik, gdy ta sama osoba ponawia tę samą decyzję (timeout, podwójny skrót). Inna osoba albo inna decyzja dostaje 409.</li>
+  <li><strong>Uprawnienia przeglądającego.</strong> <code>dryRun</code> z <code>Actor.user(user)</code> sprawdza, czy przeglądający sam mógłby wprowadzić tę zmianę; aktor systemowy nie dodaje uprawnień. CRITICAL zaakceptowany przez człowieka przechodzi przez <code>TriagePolicy</code> tylko z ustawionym <code>onBehalfOf</code>.</li>
+  <li><strong>Stale.</strong> Ktoś zmienił zgłoszenie po LOAD (ręczna kategoria, komentarz podbijający <code>tickets.version</code>)? Nie stosujemy niczego: wynik powstał na innej treści.</li>
+  <li><strong>AFTER_APPLY.</strong> Korekta zastępuje zmianę automatu, a <code>expectedVersion</code> to wersja po APPLY. Jeśli agent coś już poprawił, korekta przeglądu nie nadpisze jego zmiany.</li>
+</ul>
+<p>W historii zgłoszenia UI pokazuje „Kategoria ustawiona przez triage AI, zatwierdziła Marta, 10:31”.</p>
+
+<h2>Korekty jako etykiety</h2>
+<p>Każda decyzja przeglądu to etykieta: para (wynik modelu, prawda według człowieka). To surowiec dla kalibracji progów i sędziego (5.6), monitoringu jakości (5.7) i <dfn data-t="eval-set">zbioru evali</dfn> triage. Wiarygodność etykiet jest różna:</p>
+<table>
+  <tr><th>Źródło</th><th>Wiarygodność</th><th>Uwagi</th></tr>
+  <tr><td>Przegląd na ślepo (<code>blind</code>)</td><td>Najwyższa</td><td>Człowiek klasyfikuje bez propozycji; ok. 150 s zamiast 90 s, więc 2% próbki</td></tr>
+  <tr><td>Próbka <code>AFTER_APPLY</code></td><td>Wysoka</td><td>Losowa, więc nieobciążona</td></tr>
+  <tr><td>Korekta w <code>BEFORE_APPLY</code></td><td>Wysoka</td><td>Tylko przypadki niepewne</td></tr>
+  <tr><td>Akceptacja w <code>BEFORE_APPLY</code></td><td>Średnia</td><td>Część to pośpiech, nie weryfikacja (automation bias)</td></tr>
+</table>
+<script type="text/x-code" data-lang="sql" data-title="V55__triage_review_labels.sql (numer przykładowy)">
+  CREATE VIEW triage_review_labels AS
+  SELECT r.run_id, r.tenant_id, t.config_version, t.provider_model, r.reviewer_id,
+         t.result->>'category' AS model_category,
+         coalesce(r.corrected->>'category', t.result->>'category') AS human_category,
+         coalesce(r.corrected->>'priority', t.result->>'priority') AS human_priority,
+         coalesce(r.corrected->>'team', t.result->>'team')         AS human_team,
+         r.outcome, r.kind, r.reject_reason, r.decision_ms, r.decided_at,
+         CASE WHEN r.blind THEN 'BLIND' WHEN r.kind = 'AFTER_APPLY' THEN 'AUDIT' ELSE 'REVIEW' END AS label_source
+  FROM triage_reviews r JOIN triage_runs t ON t.id = r.run_id
+  WHERE r.outcome IN ('ACCEPTED','CORRECTED','REJECTED');
+</script>
+<p>Etykieta zostaje zapisana także przy stale (<code>recordStaleLabel</code>), bo ocenia wynik modelu. Co tydzień korekty po redakcji PII (2.7) trafiają jako kandydaci do <code>evals/triage/cases.yaml</code>; człowiek wybiera reprezentatywne, żeby zbiór nie składał się z samych trudnych przypadków.</p>
+
+<h2>UI przeglądu w React/TS</h2>
+<p>Lista (tabela z nagłówkami <code>scope</code>, <code>&lt;caption&gt;</code>, sortowanie po terminie) pokazuje numer zgłoszenia, klienta, wiek pozycji i termin jako <code>&lt;time dateTime&gt;</code>, z napisem „wkrótce wygaśnie”, a nie tylko czerwonym kolorem. Wiek odświeżamy co 30 s, nie co sekundę. Karta pokazuje treść zgłoszenia, propozycję i powody w dwóch grupach: „Dlaczego do przeglądu” (powody z kodu) i „Uzasadnienie modelu” (<code>reasons</code> z <code>TriageResult</code>, oznaczone jako mogące się mylić).</p>
+<script type="text/x-code" data-lang="typescript" data-title="triage/review/ReviewCard.tsx">
+  export function ReviewCard({ item, onDone }: { item: ReviewItemView; onDone: () => void }) {
+    const shownAt = useRef(performance.now());                    // czas decyzji jak w 3.5, od pokazania karty
+    const [mode, setMode] = useState<"view" | "correct">(item.blind ? "correct" : "view");
+    const [status, setStatus] = useState("");
+    const decide = useReviewDecision(item.runId);                 // mutacja + mapowanie 409/410 jak ActionCard (3.5)
+
+    const send = useCallback(async (kind: "accept" | "correct" | "reject", body: object = {}) => {
+      if (decide.isPending) return;                               // podwójny skrót = jedno żądanie
+      const meta = { viewedMs: Math.round(performance.now() - shownAt.current) };
+      const res = await decide.mutateAsync({ kind, body: kind === "accept" ? meta : { ...body, meta } });
+      setStatus(res.ok ? (res.applied ? "Zastosowano." : "Zapisano decyzję.") : res.message);
+      if (res.ok) setTimeout(onDone, 600);                         // następna karta, gdy status już widać
+    }, [decide, onDone]);
+
+    useEffect(() => {
+      const onKey = (e: KeyboardEvent) => {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if ((e.target as HTMLElement).closest("input, textarea, select, [contenteditable]")) return;
+        if (e.key === "a" && mode === "view") { e.preventDefault(); void send("accept"); }
+        if (e.key === "k") { e.preventDefault(); setMode("correct"); }
+      };
+      window.addEventListener("keydown", onKey);
+      return () => window.removeEventListener("keydown", onKey);
+    }, [mode, send]);
+
+    return (
+      <article aria-labelledby={`rv-${item.runId}`} className="review-card">
+        <h2 id={`rv-${item.runId}`}>{item.ticket.displayNumber}: {item.ticket.title}</h2>
+        <p className="ticket-body">{item.ticket.description}</p>
+        {item.proposal && <dl className="proposal">
+          <dt>Kategoria</dt><dd>{item.proposal.category}</dd>
+          <dt>Priorytet</dt><dd>{item.proposal.priority}</dd>
+          <dt>Zespół</dt><dd>{item.proposal.team}</dd></dl>}
+        <section><h3>Dlaczego do przeglądu</h3><ul>{item.decisionReasons.map(r => <li key={r.code}>{r.detail}</li>)}</ul></section>
+        {item.proposal && <details><summary>Uzasadnienie modelu (może być błędne)</summary>
+          <ul>{item.modelReasons.map((r, i) => <li key={i}>{r}</li>)}</ul></details>}
+        {mode === "view"
+          ? <div className="actions">
+              <button onClick={() => send("accept")} aria-keyshortcuts="A" disabled={decide.isPending}>Akceptuj (A)</button>
+              <button onClick={() => setMode("correct")} aria-keyshortcuts="K">Koryguj (K)</button>
+            </div>
+          : <CorrectionForm item={item} onSubmit={b => send("correct", b)} onReject={reason => send("reject", { reason })} />}
+        <p aria-live="polite" className="review-status">{status}</p>
+      </article>
+    );
+  }
+</script>
+<p>Skróty są jednoliterowe, ale działają tylko poza polami formularza i bez modyfikatorów; ogłasza je <code>aria-keyshortcuts</code> i napis na przycisku. Na Enter nie ma skrótu, bo ludzie wciskają go odruchowo. Wynik trafia do regionu <dfn data-t="aria-live">aria-live</dfn>, a następna karta pojawia się dopiero, gdy status jest widoczny. W trybie <code>blind</code> serwer nie wysyła propozycji (<code>proposal: null</code>), a karta od razu pokazuje formularz.</p>
+
+<h2>Automation bias: ochrona przed bezmyślnym klikaniem</h2>
+<p><dfn data-t="automation-bias">Automation bias</dfn> to skłonność do nadmiernego ufania propozycjom automatu: ludzie akceptują je bez sprawdzenia i przestają szukać informacji, które im przeczą. W 3.5 opisaliśmy pokrewne <dfn data-t="confirmation-fatigue">zmęczenie potwierdzeniami</dfn>. W triage problem jest większy: 200 decyzji dziennie, model ma rację w 85–90% przypadków, więc po kilku dniach „Akceptuj” staje się odruchem. Przegląd daje wtedy złudzenie kontroli i fałszywe etykiety ACCEPTED.</p>
+<table>
+  <tr><th>Środek</th><th>Jak działa</th><th>Czego nie robić</th></tr>
+  <tr><td>Pomiar czasu decyzji</td><td><code>decision_ms</code> z UI; mediana per przeglądający</td><td>Wymuszać minimalny czas przed kliknięciem: ludzie czekają i klikają</td></tr>
+  <tr><td>Przegląd na ślepo</td><td>2% pozycji bez propozycji; porównanie mierzy, ile akceptacji to „echo” modelu</td><td>Traktować zgodność z propozycją jako dowód jakości</td></tr>
+  <tr><td>Kontrola krzyżowa</td><td>1% decyzji ocenia druga osoba; rozbieżności omawiane co tydzień (5.7)</td><td>Karać za rozbieżności: ludzie przestaną korygować</td></tr>
+</table>
+<script type="text/x-code" data-lang="sql" data-title="sygnały automation bias, ostatnie 14 dni">
+  SELECT reviewer_id, count(*) AS decisions,
+         round(100.0 * avg((outcome = 'ACCEPTED')::int), 1) AS accept_pct,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY decision_ms) / 1000.0 AS median_s,
+         round(100.0 * avg((human_category = model_category)::int) FILTER (WHERE label_source = 'BLIND'), 1) AS blind_agree_pct
+  FROM triage_review_labels
+  WHERE decided_at >= now() - interval '14 days' AND kind = 'BEFORE_APPLY'
+  GROUP BY reviewer_id HAVING count(*) >= 100;
+  -- marta  1240  86.2  38.0  81.0
+  -- piotr   910  98.9   4.1  79.5   ← akceptuje prawie wszystko w 4 s
+</script>
+<p>Piotr na ślepo zgadza się z modelem w 79,5% przypadków, a z propozycją przed oczami w 98,9%. Różnica to akceptacje, które nie były weryfikacją. Wniosek nie brzmi „Piotr źle pracuje”, tylko „przegląd Piotra nie niesie informacji”. Przyczyną jest zwykle przeciążenie, więc wracamy do rachunku pojemności.</p>
+
+<h2>Monitoring kolejki: metryki i alerty</h2>
+<p>Metryki z kontraktu: <code>helpdesk.triage.reviews.queue</code> (gauge otwartych pozycji), <code>helpdesk.triage.reviews.age</code> (<dfn data-t="histogram">histogram</dfn> wieku przy decyzji), <code>helpdesk.triage.decisions{decision}</code> i <code>helpdesk.triage.reviews.outcome{outcome}</code>. Dokładamy gauge wieku najstarszej otwartej pozycji, bo histogram ma ślepą plamkę: zapisuje wiek dopiero przy decyzji, więc pozycja zalegająca od 6 godzin nie pojawi się w nim, dopóki ktoś jej nie ruszy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/TriageMetrics.kt (fragment)">
+  private val queue = MultiGauge.builder("helpdesk.triage.reviews.queue").register(registry)
+  private val oldest = MultiGauge.builder("helpdesk.triage.reviews.oldest.age").baseUnit("seconds").register(registry)
+
+  fun reviewDecided(tenantId: UUID, kind: ReviewKind, outcome: String, age: Duration) {
+      val tags = Tags.of("tenant", tenants.code(tenantId), "kind", kind.name)
+      registry.counter("helpdesk.triage.reviews.outcome", tags.and("outcome", outcome)).increment()
+      Timer.builder("helpdesk.triage.reviews.age").tags(tags).publishPercentileHistogram()
+          .serviceLevelObjectives(Duration.ofMinutes(5), Duration.ofMinutes(15), Duration.ofMinutes(30))
+          .register(registry).record(age)
+  }
+
+  @Scheduled(fixedDelayString = "PT30S")          // z bazy co 30 s, nie przy każdym scrapie
+  fun refreshQueue() {
+      val rows = openQueueStats()                 // SELECT tenant_id, kind, count(*), now() - min(enqueued_at) … GROUP BY 1, 2
+      queue.register(rows.map { MultiGauge.Row.of(Tags.of("tenant", it.tenant, "kind", it.kind), it.count) }, true)
+      oldest.register(rows.map { MultiGauge.Row.of(Tags.of("tenant", it.tenant, "kind", it.kind), it.oldestSeconds) }, true)
+  }
+</script>
+<p>Tag <code>tenant</code> ma dziesiątki wartości, <code>kind</code> trzy, więc <dfn data-t="cardinality">kardynalność</dfn> jest bezpieczna; przeglądający i numer zgłoszenia to dane do SQL, nie do Prometheusa. <code>overwrite = true</code> usuwa serie tenantów z pustą kolejką.</p>
+<script type="text/x-code" data-lang="yaml" data-title="alerts/helpdesk-triage-reviews.rules.yml (Prometheus)">
+  groups:
+    - name: helpdesk-triage-reviews
+      rules:
+        - alert: TriageReviewAgeP95High              # p95 wieku przy decyzji > 20 min
+          expr: |
+            histogram_quantile(0.95, sum by (le, tenant) (
+              rate(helpdesk_triage_reviews_age_seconds_bucket{kind="BEFORE_APPLY"}[30m]))) > 1200
+          for: 15m
+          labels: { severity: ticket }
+          annotations: { runbook_url: "https://git.example/helpdesk/runbooks/triage-queue.md" }
+        - alert: TriageReviewOldestStuck             # ślepa plamka histogramu
+          expr: max by (tenant) (helpdesk_triage_reviews_oldest_age_seconds{kind="BEFORE_APPLY"}) > 1800
+          for: 5m
+          labels: { severity: page }
+        - alert: TriageReviewQueueWillOverflow       # trend: za godzinę przekroczy limit
+          expr: predict_linear(helpdesk_triage_reviews_queue{kind="BEFORE_APPLY"}[1h], 3600) > 150
+          for: 15m
+          labels: { severity: page, auto_degrade: tenant }
+        - alert: TriageReviewsExpiringOften          # > 10% przeglądów wygasa
+          expr: |
+            sum by (tenant) (rate(helpdesk_triage_reviews_outcome_total{kind="BEFORE_APPLY",outcome="EXPIRED"}[2h]))
+              / sum by (tenant) (rate(helpdesk_triage_reviews_outcome_total{kind="BEFORE_APPLY"}[2h])) > 0.10
+          for: 30m
+          labels: { severity: ticket }
+</script>
+<p>Stała 150 powinna pochodzić z <code>max_pending</code> (przy różnych limitach: osobny gauge limitu). Alerty trafiają do właściciela kolejki (trasa Alertmanagera po etykiecie <code>tenant</code>), nie tylko do dyżurnego od infrastruktury.</p>
+
+<h2>Automatyczne łagodzenie i runbook „kolejka rośnie”</h2>
+<p>Automat może łagodzić przeciążenie tylko w kierunku „mniej AI, więcej zwykłego trybu pracy”, tak jak kill switch z 3.2: automat wyłącza, włącza człowiek.</p>
+<table>
+  <tr><th>Dźwignia</th><th>Skutek</th><th>Automatycznie?</th></tr>
+  <tr><td>Odcinanie (<code>QUEUE_FULL</code>, poza godzinami)</td><td>Nowe niepewne runy → SKIP; AUTO dla pewnych działa dalej</td><td>Tak, zawsze</td></tr>
+  <tr><td>AUTO → SUGGEST dla tenanta</td><td>Koniec kolejki <code>BEFORE_APPLY</code> i zmian automatu; propozycje na kartach zgłoszeń</td><td>Tak, z alertu <code>WillOverflow</code> (webhook jak w 3.2); powrót ręczny</td></tr>
+  <tr><td>Wstrzymanie próbki <code>AFTER_APPLY</code></td><td>Uwalnia ok. 5% pojemności, ale znika pomiar jakości</td><td>Nie; decyzja właściciela, max 1 dzień</td></tr>
+  <tr><td>Obniżenie progu</td><td>Mniej przeglądów, więcej błędów AUTO</td><td>Nigdy automatycznie: zamienia problem pojemności w niewidoczny problem jakości. Ręcznie najwyżej na czas określony i z większą próbką <code>AFTER_APPLY</code> (np. 20%)</td></tr>
+</table>
+<p>Przy AUTO → SUGGEST otwarte pozycje <code>BEFORE_APPLY</code> job zamyka jako <code>EXPIRED</code> z <code>expire_reason = 'MODE_CHANGED'</code>; zgłoszenia i tak są w zwykłej kolejce.</p>
+<table>
+  <tr><th>Krok</th><th>Kto</th><th>Co konkretnie</th></tr>
+  <tr><td>Wyzwalacz</td><td>Alert lub właściciel kolejki</td><td><code>OldestStuck</code>, <code>WillOverflow</code>, <code>ExpiringOften</code>, skargi klientów</td></tr>
+  <tr><td>Diagnoza (≤ 10 min)</td><td>Właściciel kolejki</td><td>Napływ czy obsługa? Powody w <code>decision_reasons</code>: skok <code>COLD_START</code> = nowa kategoria lub konfiguracja (5.4); skok reguł słów kluczowych = awaria u klienta; spadek rozstrzygnięć = brak ludzi</td></tr>
+  <tr><td>Natychmiast</td><td>Właściciel</td><td>Dyspozytor bierze najstarsze HIGH z „Do przydzielenia” ręcznie</td></tr>
+  <tr><td>Pojemność</td><td>Kierownik zmiany</td><td>Dodatkowa osoba na 2 h; brakująca μ = λ<sub>REVIEW</sub>/0,75 − μ</td></tr>
+  <tr><td>Degradacja</td><td>Właściciel</td><td>Bez pojemności w ciągu godziny: AUTO → SUGGEST</td></tr>
+  <tr><td>Weryfikacja</td><td>Właściciel</td><td>Gauge spada, brak nowych <code>EXPIRED</code>, naruszenia SLA pierwszej reakcji wracają do normy</td></tr>
+  <tr><td>Powrót i wnioski</td><td>Właściciel + kierownik wsparcia</td><td>AUTO tylko z obsadą w grafiku; przegląd progu i <code>max_pending</code> na liczbach z incydentu</td></tr>
+</table>
+
+<h2>Testy: symulacja, wygaszanie, wyścigi, stale</h2>
+<p>Najpierw symulacja bez Springa: napływ losowy (rozkład Poissona) ze stałym ziarnem generatora, żeby wynik był powtarzalny, i obsługa ze stałym tempem (uproszczenie). Test dokumentuje intuicję z prawa Little’a.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="ReviewQueueSimulationTest.kt">
+  class ReviewQueueSimulationTest {
+      /** Długość kolejki po każdej godzinie; krok symulacji = 1 minuta. */
+      private fun simulate(arrivalsPerHour: Double, servicePerHour: Double, hours: Int, seed: Long = 42): List<Int> {
+          val rnd = SplittableRandom(seed)
+          var queue = 0; var credit = 0.0
+          return (1..hours).map {
+              repeat(60) {
+                  queue += poisson(rnd, arrivalsPerHour / 60)
+                  credit = minOf(credit + servicePerHour / 60, queue.toDouble() + 1)  // bezczynność nie „oszczędza” pracy
+                  val served = minOf(queue, credit.toInt()); queue -= served; credit -= served
+              }
+              queue
+          }
+      }
+      private fun poisson(rnd: SplittableRandom, mean: Double): Int {           // algorytm Knutha, małe średnie
+          val limit = exp(-mean); var k = 0; var p = 1.0
+          do { k++; p *= rnd.nextDouble() } while (p > limit)
+          return k - 1
+      }
+
+      @Test
+      fun `lambda wieksza od mu - kolejka rosnie liniowo`() {
+          val q = simulate(arrivalsPerHour = 41.0, servicePerHour = 24.0, hours = 9)   // incydent
+          assertThat(q.last()).isBetween(110, 200)                                    // oczekiwane (41 − 24) · 9 = 153
+          assertThat(q.zipWithNext().count { (a, b) -> b > a }).isGreaterThanOrEqualTo(7)
+      }
+
+      @Test
+      fun `rho 0,75 - kolejka ograniczona`() {
+          assertThat(simulate(arrivalsPerHour = 24.0, servicePerHour = 32.0, hours = 40).max()).isLessThan(20)
+      }
+  }
+</script>
+<p>Testy integracyjne (Testcontainers i seed Acme/Globex jak w 1.1) używają zegara przestawianego ręcznie (<code>MutableClock</code>, implementacja <code>java.time.Clock</code> z metodą <code>advance</code>). <code>TriageFixtures</code> tworzy run <code>WAITING_REVIEW</code> z wpisem w kolejce dla HD-3001.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageReviewIT.kt">
+  @Test
+  fun `po due_at przeglad wygasa, zgloszenie bez zmian i w zwyklej kolejce`() {
+      val run = fixtures.waitingReview(ticket = "HD-3001", proposed = TriageResult.billingHigh())
+      clock.advance(Duration.ofMinutes(31))
+      expiry.expireDue()
+      assertThat(fixtures.review(run.id).outcome).isEqualTo(ReviewOutcome.EXPIRED)
+      assertThat(tickets.get(PIOTR, run.ticketId).priority).isEqualTo(TicketPriority.NORMAL)   // nic z triage
+      assertThat(fixtures.unassignedQueue(ACME)).contains(run.ticketId)
+      assertThrows<TriageReviewExpiredException> { service.decide(MARTA, run.id, ReviewCommand.Accept, DecisionMeta(4000)) }
+  }
+
+  @Test
+  fun `dwoch przegladajacych naraz - wygrywa jeden, jedna zmiana w historii`() {
+      val run = fixtures.waitingReview(ticket = "HD-3001", proposed = TriageResult.billingHigh())
+      val start = CountDownLatch(1)
+      val pool = Executors.newFixedThreadPool(2)
+      val futures = listOf(PIOTR, MARTA).map { u ->
+          pool.submit<Result<ReviewResult>> { start.await(); runCatching { service.decide(u, run.id, ReviewCommand.Accept, DecisionMeta(5000)) } }
+      }
+      start.countDown()
+      val (ok, failed) = futures.map { it.get(10, TimeUnit.SECONDS) }.partition { it.isSuccess }
+      assertThat(ok).hasSize(1)
+      assertThat(failed.single().exceptionOrNull()).isInstanceOf(TriageReviewAlreadyDecidedException::class.java)
+      assertThat(fixtures.events(run.ticketId).count { it.payload["triageRunId"] == run.id.toString() }).isEqualTo(1)
+  }
+
+  @Test
+  fun `zgloszenie zmienione przed akceptacja - nic nie stosujemy, etykieta zapisana`() {
+      val run = fixtures.waitingReview(ticket = "HD-3001", proposed = TriageResult.billingHigh())
+      val v = tickets.currentVersion(PIOTR, run.ticketId)
+      tickets.changePriority(PIOTR, run.ticketId, TicketPriority.LOW, v, Actor.user(PIOTR))   // agent zmienia ręcznie
+      assertThrows<TriageReviewStaleException> {
+          service.decide(MARTA, run.id, ReviewCommand.Correct(null, TicketPriority.HIGH, null, null), DecisionMeta(9000))
+      }
+      assertThat(tickets.get(PIOTR, run.ticketId).priority).isEqualTo(TicketPriority.LOW)     // ręczna zmiana wygrywa
+      assertThat(fixtures.review(run.id).applied).isFalse()
+      assertThat(fixtures.review(run.id).corrected).isNotNull()
+  }
+</script>
+<p>Dopisz jeszcze dwa krótkie przypadki: ponowienie tej samej decyzji przez tę samą osobę zwraca identyczny <code>ReviewResult</code>, a marta@acme próbująca rozstrzygnąć przegląd HD-2077 (Globex) dostaje <code>TriageReviewNotFoundException</code>.</p>
+
+<h2>Przypadki brzegowe</h2>
+<ul>
+  <li><strong>Weekend i święta.</strong> Bez kalendarza każda pozycja <code>BEFORE_APPLY</code> wisi 30 minut i wygasa, zaśmiecając metryki. <code>review_hours</code> z listą świąt zamienia REVIEW na SKIP poza godzinami, a pewne AUTO_APPLY działa dalej. Strefa czasowa jest jawna, więc zmiana czasu nie przesuwa godzin.</li>
+  <li><strong>Nagły skok zgłoszeń.</strong> Awaria u klienta: 300 zgłoszeń „nie działa logowanie” w 20 minut. Kolejka dobija do <code>max_pending</code> w kwadrans, dalej działa odcinanie. Pokusa „zaznacz podobne i zaakceptuj wszystkie” to antywzorzec z 3.5; lepiej połączyć zgłoszenia ze zgłoszeniem nadrzędnym incydentu.</li>
+  <li><strong>Przeglądający bez uprawnień do tenanta.</strong> Lista filtruje po <code>user.tenantIds</code> i RLS, decyzja zwraca 404 (nie 403, jak w 1.1). Gdy piotr straci dostęp do Globex, jego zajęcia wygasną po 3 minutach, a nowy token nie przejdzie <code>canSeeTenant</code>.</li>
+  <li><strong>Korekta po ręcznej zmianie.</strong> Agent zmienił kategorię, zanim przeglądający kliknął „Koryguj”: 409 <code>triage-review-stale</code>, nic nie stosujemy, etykieta zostaje. UI pokazuje „Zgłoszenie zmienił ręcznie Jan o 10:31”. Zamknięcie zgłoszenia przez klienta w trakcie przeglądu to ten sam przypadek.</li>
+  <li><strong>Kill switch w trakcie.</strong> Przy wyłączonym <code>TRIAGE_APPLY</code> akceptacja zwraca 403, odrzucenie działa (to tylko etykieta), otwarte pozycje wygasają normalnie.</li>
+</ul>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Globex (triage na <code>helpdesk-local</code>) ma 240 zgłoszeń dziennie, 85% w godzinach 8–17, przegląd trwa 120 s, a przegląda tylko piotr przez 25% czasu. Policz λ, μ i ρ dla 45% REVIEW. Przy jakim odsetku REVIEW ρ ≤ 0,75? Czy AUTO ma tu sens, czy lepiej zostać przy SUGGEST?</li>
+  <li>Dodaj tag <code>kind</code> do licznika <code>helpdesk.triage.decisions</code> i napisz alert „napływ &gt; obsługa przez godzinę” dla tenantów w AUTO.</li>
+  <li>Zaimplementuj <code>ReviewHoursCalendar.isOpen(spec, instant)</code> dla formatu <code>MON-FRI 08:00-17:00 Europe/Warsaw</code> ze świętami i testami na zmianę czasu (ostatnia niedziela marca i października).</li>
+  <li>Porównaj per kategoria trafność z próbki <code>AFTER_APPLY</code> z trafnością z <code>BEFORE_APPLY</code>. Co różnica mówi o błędzie selekcji w <code>CategoryAccuracyStats</code>?</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Do przeglądu trafia 41 zgłoszeń na godzinę, a przeglądający rozpatrują łącznie 24 na godzinę. Co się stanie?</p>
+  <button>Kolejka ustabilizuje się na ok. 17 pozycjach</button>
+  <button>Czas oczekiwania wyniesie L/λ, czyli kilka minut</button>
+  <button>Kolejka będzie rosła o ok. 17 pozycji na godzinę bez końca, a czas oczekiwania liniowo</button>
+  <p class="explain">Przy λ &gt; μ (ρ ≈ 1,7) system nie jest stabilny i prawo Little’a dla stanu ustalonego nie ma zastosowania. Kolejka rośnie o λ − μ na godzinę, dopóki nie zmieni się napływ (próg, odcinanie) albo obsługa.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Co powinno się stać ze zgłoszeniem, którego przegląd triage wygasł po <code>due_at</code>?</p>
+  <button>Zostaje w zwykłej kolejce bez zmian z triage; wynik AI nie jest stosowany</button>
+  <button>Wynik AI jest stosowany automatycznie, bo nikt nie zgłosił sprzeciwu</button>
+  <button>Zgłoszenie jest blokowane, dopóki ktoś nie zrobi przeglądu</button>
+  <p class="explain">Zmiana z AI działa w trybie fail closed, a obsługa zgłoszenia w trybie fail open: brak triage nie blokuje pracy. Automatyczna akceptacja po czasie zamieniłaby przegląd w samo opóźnienie.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">Dlaczego trafność kategorii liczona wyłącznie z przeglądów <code>BEFORE_APPLY</code> jest myląca?</p>
+  <button>Bo przeglądający zawsze się mylą</button>
+  <button>Bo trafiają tam przypadki niepewne, więc to próbka nielosowa (błąd selekcji); potrzebna jest losowa próbka AUTO_APPLY</button>
+  <button>Bo przedział Wilsona nie działa dla małych prób</button>
+  <p class="explain">Próbka wybrana przez sam mechanizm decyzji jest obciążona. Losowa próbka <code>AFTER_APPLY</code> i przeglądy na ślepo dają pomiar nieobciążony; kalibracja w 5.6.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="3">
+  <p class="q">Kolejka przeglądu zbliża się do limitu. Której dźwigni NIE wolno uruchamiać automatycznie?</p>
+  <button>Odcinania nadmiaru: nowe niepewne runy jako SKIP</button>
+  <button>Przełączenia tenanta z AUTO na SUGGEST</button>
+  <button>Powiadomienia właściciela kolejki</button>
+  <button>Obniżenia progu pewności, żeby więcej zgłoszeń szło do AUTO</button>
+  <p class="explain">Obniżenie progu zamienia problem pojemności w niewidoczny problem jakości. Automat może tylko zmniejszać udział AI, tak jak kill switch tylko wyłącza.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Przeglądający akceptuje 99% propozycji z medianą 4 s, a na ślepo zgadza się z modelem w 80%. Co to oznacza?</p>
+  <button>Model jest bardzo dobry i można obniżyć próg</button>
+  <button>Automation bias: część akceptacji to odruch, a nie weryfikacja, więc te etykiety niewiele mówią</button>
+  <button>Przegląd na ślepo jest źle zaprojektowany</button>
+  <p class="explain">Różnica między zgodnością z propozycją a zgodnością na ślepo to akceptacje „echem” modelu. Przyczyną bywa przeciążenie; reakcją jest pojemność i rotacja, a nie wymuszanie minimalnego czasu.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

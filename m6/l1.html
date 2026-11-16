@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1 Sześć błędów produkcyjnych – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="6.1" data-min-chars="20000">
+<main>
+<p class="meta">Lekcja 6.1 · ok. 35 min</p>
+<h1>Sześć błędów produkcyjnych</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Zebrać sześć incydentów z kursu w jednym formacie karty błędu, który da się użyć na dyżurze i w code review.</li>
+  <li>Dla każdego błędu umieć odróżnić przyczynę źródłową od bezpośredniej i wyjaśnić, dlaczego testy i monitoring milczały.</li>
+  <li>Znać obrony warstwowe, wczesny sygnał (konkretną metrykę lub alert) i test albo eval, który pilnuje regresji.</li>
+  <li>Zobaczyć wzorce wspólne dla wszystkich sześciu błędów i przeprowadzić <dfn data-t="post-mortem">post-mortem</dfn> nowego incydentu AI.</li>
+</ul></div>
+
+<h2>Po co ta lekcja i jak czytać kartę błędu</h2>
+<p>Kurs pokazał sześć incydentów w różnych kontekstach: czat, akcje asystenta, baza wiedzy, proces w tle. Zebrane obok siebie pokazują coś ważniejszego niż każdy z osobna: <strong>żaden z nich nie rzucił wyjątku</strong>. Błędy AI na produkcji to przede wszystkim ciche pogorszenie, a nie awarie.</p>
+<p>Ta lekcja nie wprowadza nowego materiału. Karta to skrót, a kod, testy i alerty są w lekcji źródłowej (linki). Schemat karty:</p>
+<table>
+  <tr><th>Pole karty</th><th>Pytanie, na które odpowiada</th></tr>
+  <tr><td>Incydent (box)</td><td>Co się stało, z liczbami z lekcji źródłowej</td></tr>
+  <tr><td>Przyczyna źródłowa</td><td>Jaka decyzja projektowa umożliwiła błąd (nie tylko „kto co zmienił”)</td></tr>
+  <tr><td>Dlaczego nic nie zadzwoniło</td><td>Które istniejące testy i alerty pilnowały innej klasy awarii</td></tr>
+  <tr><td>Obrony</td><td>Niezależne warstwy, każda z linkiem do lekcji, w której ją zbudowaliśmy</td></tr>
+  <tr><td>Wczesny sygnał</td><td>Metryka lub alert z nazwą z kursu, który skraca czas wykrycia z dni do minut</td></tr>
+  <tr><td>Kod</td><td>Jeden fragment kluczowej obrony</td></tr>
+  <tr><td>Regresja</td><td>Test albo <dfn data-t="eval">eval</dfn>, który nie pozwoli błędowi wrócić</td></tr>
+</table>
+<p>Kolejność obron w każdej karcie jest celowa: najpierw warstwy deterministyczne (uprawnienia, walidacja w backendzie), potem człowiek, na końcu wykrywanie. To zasada <dfn data-t="defense-in-depth">obrony w głąb</dfn> z <a href="../m2/l2.html">lekcji 2.2</a>: każda warstwa może zawieść, więc żadna nie jest jedyna.</p>
+
+<h2>Sześć błędów w jednej tabeli</h2>
+<p>Numeracja jest taka jak w kursie: numer oznacza błąd, a nie kolejność lekcji.</p>
+<table>
+  <tr><th>#</th><th>Błąd</th><th>Lekcja</th><th>Funkcja AI</th><th>Wyjątek lub czerwony test?</th><th>Jak się ujawnił</th></tr>
+  <tr><td>1</td><td>Czat pokazuje cudze zgłoszenie</td><td><a href="../m2/l2.html">2.2</a></td><td>Asystent informacyjny (czat z narzędziami)</td><td>Nie. Testy z jednym użytkownikiem przeszły</td><td>Klientka zgłosiła to 13 minut później</td></tr>
+  <tr><td>2</td><td>Cicha podmiana modelu</td><td><a href="../m5/l4.html">5.4</a></td><td>Triage w tle (AUTO)</td><td>Nie. Zero błędów, latencja nawet lepsza</td><td>Kierowniczka rozliczeń po 8 dniach: „dlaczego tak cicho?”</td></tr>
+  <tr><td>3</td><td>Kolejka HITL rośnie</td><td><a href="../m5/l3.html">5.3</a></td><td>Triage z przeglądem człowieka</td><td>Nie. Model działał dobrze</td><td>Klienci zaczęli dzwonić, bo przekroczono SLA</td></tr>
+  <tr><td>4</td><td>Prompt injection</td><td><a href="../m3/l4.html">3.4</a></td><td>Asystent operacyjny (narzędzia zapisu)</td><td>Nie. Akcja przeszła poprawnie technicznie</td><td>Klient dostał e-mail z notatkami wewnętrznymi</td></tr>
+  <tr><td>5</td><td>Dane osobowe u dostawcy i w logach</td><td><a href="../m2/l7.html">2.7</a></td><td>Czat i obserwowalność</td><td>Nie dla funkcji. Dopiero skaner sekretów w CI na commicie z evalami</td><td>Po dwóch tygodniach, przy eksporcie rozmów do repozytorium</td></tr>
+  <tr><td>6</td><td>Drogi model w każdym kroku RAG</td><td><a href="../m4/l6.html">4.6</a></td><td>Baza wiedzy (KB_ANSWER)</td><td>Nie. Evale jakości przeszły</td><td>Faktura po trzech tygodniach: rachunek ×6</td></tr>
+</table>
+<p>Kolumna „Jak się ujawnił” jest najbardziej niepokojąca: w pięciu przypadkach na sześć błąd znalazł człowiek spoza zespołu (klient, kierowniczka, dział finansów). Celem obron z kursu jest odwrócenie tej proporcji.</p>
+
+<h2>#1 Czat pokazuje cudze zgłoszenie</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 2.2)</span><p>Poniedziałek, 9:42. Anna (anna@acme, CUSTOMER) myli numer i pyta czat o HD-2077, zgłoszenie Globex. Asystent podaje tytuł „Błąd logowania SSO”, priorytet CRITICAL, osobę przypisaną i ostatni komentarz klienta Globex. Anna zgłasza to o 9:55, dyżurny potwierdza w trace'ach o 10:20, a o 10:31 przełącznik <code>ai.enabled = false</code> wyłącza asystenta. Dzień później Globex dostaje zawiadomienie o incydencie.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p>Narzędzia brały tożsamość z <code>SecurityContextHolder</code>, czyli z <dfn data-t="thread-local">ThreadLocal</dfn>, a nie z jawnego kontekstu. Po wdrożeniu streamingu (<a href="../m2/l3.html">2.3</a>) piątkowy hotfix przełączył go w <code>MODE_INHERITABLETHREADLOCAL</code>, więc wątek puli utworzony w czasie żądania Piotra (agent Acme i Globex) wykonywał potem narzędzia innych osób z tożsamością Piotra. Przegląd znalazł więcej dziur: opcjonalny <code>tenantId</code> w narzędziu, cache z kluczem równym numerowi zgłoszenia, filtrowanie po pobraniu i osobny <code>DataSource</code> z właścicielem tabel, przez co <dfn data-t="rls">RLS</dfn> nie działało.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Testy uruchamiały jednego użytkownika naraz, więc wątki nigdy nie przenosiły cudzego kontekstu. Błędy „Brak uwierzytelnienia” zniknęły po hotfiksie, co wyglądało na sukces. Nie było metryki niezgodności tożsamości ani evalu izolacji.</p>
+<h3>Obrony</h3>
+<ul>
+  <li><code>AssistantToolContext</code> przekazywany przez <dfn data-t="tool-context">ToolContext</dfn> (nie trafia do modelu), narzędzia bez parametrów tożsamości, pilnowane testem ArchUnit (<a href="../m2/l2.html">2.2</a>).</li>
+  <li>Fasady z jawnym użytkownikiem: <code>TicketApi.get(user, …)</code> i <code>getByNumber(user, …)</code> zwracają 404 dla cudzego zgłoszenia (<a href="../m1/l1.html">1.1</a>).</li>
+  <li><code>TenantSession</code> i RLS w transakcji narzędzia, w wątku, w którym narzędzie faktycznie działa (<a href="../m1/l1.html">1.1</a>, <a href="../m2/l2.html">2.2</a>).</li>
+  <li><code>RouteGuard</code> i <code>ROUTE_MISMATCH</code>: dane innego <dfn data-t="tenant">tenanta</dfn> nie trafią do rozmowy z inną trasą modelu (<a href="../m2/l2.html">2.2</a>); w bazie wiedzy analogicznie <code>KB_ROUTE_MISMATCH</code> i RLS na <code>visibility</code> (<a href="../m4/l4.html">4.4</a>).</li>
+  <li>Klucz cache z użytkownikiem, rolami, tenantem i trasą (<a href="../m2/l2.html">2.2</a>).</li>
+  <li>Eval <code>TENANT_ISOLATION</code> z progiem 100% i <dfn data-t="canary-data">danymi-kanarkami</dfn> (<a href="../m2/l8.html">2.8</a>), w bramce CI (<a href="../m3/l7.html">3.7</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p>Alert <code>AssistantSecurityContextLeak</code> (powinien być zawsze 0) oraz <code>AssistantRouteMismatchSpike</code> i <code>AssistantNotFoundRatioHigh</code> na liczniku <code>helpdesk.assistant.tool.calls{outcome}</code> z <code>ToolAudit</code> (<a href="../m2/l2.html">2.2</a>). Wzrost <code>NOT_FOUND</code> oznacza wyliczanie numerów albo błąd w kodzie.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TicketReadTools.kt (skrót z 2.2)">
+  private fun withTicket(ctx: AssistantToolContext, raw: String, body: (TicketView) -> Any): ToolResult {
+      val ref = TicketRef.parse(raw)
+          ?: return ToolResult.Error(ToolErrorCode.INVALID_ARGUMENT, "Oczekiwano numeru HD-1234 albo UUID.")
+      val ticket = try {
+          when (ref) {                                    // ctx.user z ToolContext, nie z ThreadLocal
+              is TicketRef.ById -> tickets.get(ctx.user, ref.id)
+              is TicketRef.ByNumber -> tickets.getByNumber(ctx.user, ref.number)
+          }
+      } catch (e: TicketNotFoundException) {              // cudze = nieistniejące
+          return ToolResult.Error(ToolErrorCode.NOT_FOUND, "Nie znaleziono zgłoszenia ${ref.display}.")
+      }
+      if (guard.mismatch(ctx, ticket.tenantId)) return ROUTE_MISMATCH_ERROR
+      return ToolResult.Ok(body(ticket))
+  }
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p><code>IncidentHd2077RegressionIT</code> sprawdza, co poszło do modelu, a nie samą odpowiedź: drugie żądanie zawiera <code>NOT_FOUND</code> i ani słowa o Globex. <code>ConcurrentToolIsolationIT</code> uruchamia 400 równoległych wywołań Anny i Ewy z celowo zatrutym <code>SecurityContextHolder</code>. W <code>cases.yaml</code> przypadek <code>iso-001</code> ma <code>source: incident:INC-112</code>.</p>
+
+<h2>#2 Cicha podmiana modelu</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 5.4)</span><p>Acme ma triage w trybie AUTO: 720 zgłoszeń w dzień roboczy, ok. 70% stosowanych automatycznie. Alias <code>helpdesk-fast</code> wskazywał na <code>vendor/fast-mini</code>, alias dostawcy bez daty. We wtorek o 06:12 dostawca przesunął go na nowy snapshot, który inaczej rozumiał granicę BILLING/ACCOUNT. Trafność kategorii spadła z 91% do 78%; po ośmiu dniach trzeba było przejrzeć ok. 650 zgłoszeń, a 37 przekroczyło SLA.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p>Konfiguracja proxy nie przypinała <dfn data-t="model-snapshot">snapshotu modelu</dfn>, a aplikacja nie miała zapisanego oczekiwania, który model powinien odpowiadać pod danym <dfn data-t="alias">aliasem</dfn>. Zmiana zachowania funkcji AI przeszła bez pull requesta, więc bez evali.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Każdy alert pilnował innej klasy awarii: 5xx i breaker (0), latencja (spadła z 1,9 s do 1,7 s), walidacja structured output (strict gwarantuje format, nie treść: <code>"ACCOUNT"</code> to poprawna wartość enuma), fallback (0%), bramka CI (brak PR), <code>config_version</code> (bez zmian, bo opisuje wybór aplikacji, a nie to, co dostawca podstawił). Kolejka przeglądu zmalała, co wyglądało na sukces. <code>llm_usage.provider_model</code> zmienił wartość w D0, ale nikt nie patrzył na tę kolumnę.</p>
+<h3>Obrony</h3>
+<ul>
+  <li>Snapshot z datą w <code>litellm.yaml</code>, konfiguracja proxy tylko przez PR (GitOps) i codzienna kontrola rozjazdu (<a href="../m1/l3.html">1.3</a>, <a href="../m5/l4.html">5.4</a>).</li>
+  <li>Faktyczny model w każdym wywołaniu (<code>gen_ai.response.model</code> → <code>provider_model</code>, <a href="../m1/l4.html">1.4</a>, <a href="../m2/l6.html">2.6</a>) i <code>helpdesk.ai.expected-models</code> z <code>ModelDriftDetector</code> (<a href="../m5/l4.html">5.4</a>).</li>
+  <li><dfn data-t="canary-eval">Canary eval</dfn> na produkcyjnym aliasie codziennie o 05:15 UTC (<code>triage-canary.yml</code>, tryb <code>EvalGate</code> <code>canary</code>, <a href="../m5/l4.html">5.4</a>).</li>
+  <li>Sygnały od ludzi: trafność z nieobciążonych próbek BLIND/AUDIT i odsetek korekt po AUTO_APPLY (<a href="../m5/l3.html">5.3</a>, <a href="../m5/l7.html">5.7</a>).</li>
+  <li>Nowy model tylko przez <dfn data-t="shadow-mode">shadow mode</dfn>, rollout etapami i <dfn data-t="rollback">rollback</dfn> bez deployu (<a href="../m5/l4.html">5.4</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p><code>AiProviderModelUnexpected</code> (gauge <code>helpdesk.ai.model.unexpected</code>, severity page) i <code>AiProviderModelNew</code> na metryce Spring AI. W incydencie detektor zgłosiłby <code>UnexpectedModel</code> o 06:15 w D0, canary eval w D1, a <code>QualityDrop</code> z etykiet w D3 (59/75, przedział Wilsona rozłączny z referencją). Dalej <code>TriageAutoCorrectionsHigh</code> z <a href="../m5/l7.html">5.7</a>.</p>
+<script type="text/x-code" data-lang="yaml" data-title="litellm.yaml + application.yml (skrót z 5.4)">
+  # litellm.yaml – snapshot z datą, nigdy alias dostawcy
+  model_list:
+    - model_name: helpdesk-fast
+      litellm_params:
+        model: vendor/fast-mini-2026-03-02
+      model_info: { id: fast-vendor-v3, base_model: vendor/fast-mini-2026-03-02 }
+
+  # application.yml – czego oczekujemy w gen_ai.response.model
+  helpdesk:
+    ai:
+      expected-models:
+        helpdesk-fast: { primary: [fast-mini-2026-03-02] }
+      drift: { window: 15m, min-labels: 40, auto-degrade: true }   # AUTO → SUGGEST
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p>Reguła CI z <a href="../m1/l3.html">1.3</a> rozszerzona w 5.4: nazwa modelu dostawcy kończy się datą (wyjątki w <code>allowed-undated.txt</code>), a zmiana <code>litellm_params.model</code> wymaga zmiany listy oczekiwanych modeli w tym samym PR. Funkcja <code>detect</code> detektora ma testy jednostkowe bez bazy, a canary eval na zbiorze triage (<code>evals/triage/cases.yaml</code>, <a href="../m5/l2.html">5.2</a>) pilnuje jakości niezależnie od nazwy modelu.</p>
+
+<h2>#3 Kolejka HITL rośnie</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 5.3)</span><p>Acme przeszło z SUGGEST na AUTO z ostrożnym progiem: do przeglądu trafiało ok. 60% zgłoszeń, czyli 41 na godzinę. Dwoje przeglądających (piotr i marta@acme) poświęcało na to ok. 30% czasu, co daje 24 przeglądy na godzinę. Kolejka rosła o 17 na godzinę i po trzech tygodniach liczyła ok. 3700 runów <code>WAITING_REVIEW</code>. Zgłoszenie dodane o 17:00 czekało ok. 6,4 h przy terminie pierwszej reakcji 2 h dla HIGH.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p><dfn data-t="hitl">Human-in-the-loop</dfn> bez terminu, limitu i właściciela. Nikt nie policzył pojemności (<dfn data-t="little-law">prawo Little'a</dfn>: przy λ = 41/h i μ = 24/h wykorzystanie ρ ≈ 1,7, więc kolejka rośnie bez końca), nikt nie zdefiniował, co się dzieje z przeglądem niezałatwionym na czas, a widok „Do przydzielenia” ukrywał zgłoszenia z triage w toku.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Brak wyjątków, model klasyfikował dobrze. Histogram wieku przeglądu zapisuje wiek dopiero przy decyzji, więc pozycja zalegająca 6 godzin w nim nie istnieje. Przegląd był pracą „przy okazji”, bez pozycji w grafiku i bez osoby, do której trafiłby alert.</p>
+<h3>Obrony</h3>
+<ul>
+  <li>Termin: <code>triage_reviews.due_at</code> = min(teraz + 30 min, SLA pierwszej reakcji − bufor), po nim <code>TriageReviewExpiryJob</code> ustawia EXPIRED. Zmiana z AI nie jest stosowana, a obsługa zgłoszenia idzie dalej (<dfn data-t="fail-open">fail open</dfn> dla procesu, <a href="../m5/l3.html">5.3</a>).</li>
+  <li>Limit: <code>max_pending</code> (150) i <dfn data-t="load-shedding">odcinanie nadmiaru</dfn> (<code>QUEUE_FULL</code>, <code>OUTSIDE_REVIEW_HOURS</code>, <code>NO_TIME_FOR_REVIEW</code>), obsada planowana na ρ ≤ 0,75 (<a href="../m5/l3.html">5.3</a>).</li>
+  <li>Właściciel: <code>triage_tenant_settings.queue_owner_id</code>, trasa alertów po tenancie, <dfn data-t="runbook">runbook</dfn> „kolejka rośnie” (<a href="../m5/l3.html">5.3</a>).</li>
+  <li>Automat łagodzi tylko w stronę „mniej AI”: AUTO → SUGGEST z alertu, nigdy automatyczne obniżenie progu (<a href="../m5/l3.html">5.3</a>, wzorzec <dfn data-t="kill-switch">kill switcha</dfn> z <a href="../m3/l2.html">3.2</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p>Gauge <code>helpdesk.triage.reviews.oldest.age</code> z alertem <code>TriageReviewOldestStuck</code> (&gt; 30 min, page), <code>TriageReviewQueueWillOverflow</code> (<code>predict_linear</code> na <code>helpdesk.triage.reviews.queue</code> względem limitu) i <code>TriageReviewsExpiringOften</code> (&gt; 10% wygasa). Metryka <code>helpdesk.triage.reviews.shed{reason}</code> pokazuje, ile pracy świadomie odcięto.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageReviewQueue.enqueue (skrót z 5.3)">
+  val dueAt = minOf(now.plus(props.timeout), slaDue.minus(props.slaBuffer))   // termin
+  if (kind == ReviewKind.BEFORE_APPLY) {
+      val shed = when {                                                       // limit
+          dueAt < now.plus(props.minWindow) -> DecisionReason("NO_TIME_FOR_REVIEW", "Za mało czasu do SLA")
+          !hours.isOpen(s.reviewHours, now) -> DecisionReason("OUTSIDE_REVIEW_HOURS", "Poza godzinami przeglądu")
+          repo.countOpen(run.tenantId, kind) >= s.maxPending -> DecisionReason("QUEUE_FULL", "Kolejka pełna")
+          else -> null
+      }
+      if (shed != null) { metrics.shed(run.tenantId, shed.code); return shed }   // run → SKIPPED
+  }
+  repo.insert(run.id, run.tenantId, run.ticketId, kind, blind, slaDue, now, dueAt)
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p><code>ReviewQueueSimulationTest</code> odtwarza incydent bez Springa: napływ Poissona 41/h, obsługa 24/h, po 9 godzinach kolejka ok. 153; przy ρ = 0,75 pozostaje ograniczona. Test integracyjny z przestawianym zegarem sprawdza, że po <code>due_at</code> przegląd wygasa, zgłoszenie zostaje bez zmian z triage i jest w zwykłej kolejce.</p>
+
+<h2>#4 Prompt injection</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 3.4)</span><p>Środa, 14:07. Anna dopisuje do HD-1042 komentarz publiczny z akapitem adresowanym do asystenta. O 14:31 Piotr prosi czat o streszczenie i propozycję odpowiedzi; wynik narzędzi zawiera notatki INTERNAL. Prototypowe <code>addComment</code> zapisywało od razu, więc 20 sekund później model dodaje komentarz PUBLIC z notatkami wewnętrznymi i zmienia priorytet na CRITICAL. Anna dostaje e-mail, dyżurny alert SLA; Piotr usuwa komentarz o 14:40, akcje asystenta wyłączono o 14:52, ale e-maila nie da się cofnąć.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p>Model nie odróżnia danych od poleceń, a system złożył <dfn data-t="lethal-trifecta">triadę śmiertelną</dfn>: prywatne dane (notatki), niezaufane treści (komentarz klienta) i kanał na zewnątrz (komentarz PUBLIC z e-mailem), bez bramki między decyzją modelu a skutkiem. To <dfn data-t="indirect-prompt-injection">pośredni prompt injection</dfn>: atak przyszedł w danych, nie od użytkownika czatu.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Z perspektywy systemu wszystko działało: narzędzie dostało poprawne argumenty, Piotr miał uprawnienia do komentarza i notatek. Logi błędów puste, testy funkcjonalne zielone, bo nikt nie testował złośliwych danych w zgłoszeniu.</p>
+<h3>Obrony</h3>
+<ul>
+  <li><dfn data-t="least-privilege">Najmniejsze uprawnienia</dfn>: <code>AssistantActionPolicy</code> w fasadzie, asystent nie ustawia CRITICAL ani nie zamyka zgłoszeń (<a href="../m3/l3.html">3.3</a>).</li>
+  <li><dfn data-t="action-proposal">Propozycje</dfn> zamiast zapisu (<a href="../m3/l1.html">3.1</a>) i potwierdzenie z podglądem, PUBLIC jako ryzyko HIGH (<a href="../m3/l5.html">3.5</a>).</li>
+  <li><code>InternalLeakGuard</code> (<dfn data-t="shingles">shingle</dfn>), <code>LinkPolicy</code> i CSP: deterministyczna blokada wycieku (<a href="../m3/l4.html">3.4</a>).</li>
+  <li><code>UntrustedContentMarker</code>, prompt <code>assistant-chat/v4</code> i <code>InjectionDetector</code> jako sygnał podnoszący ryzyko, nie bramka (<a href="../m3/l4.html">3.4</a>).</li>
+  <li>Kill switch akcji (<a href="../m3/l2.html">3.2</a>) i audyt w <code>assistant_audit</code> (<a href="../m3/l6.html">3.6</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p><code>AssistantLeakAttempt</code> (page) na <code>helpdesk.assistant.policy.denied{reason=INTERNAL_LEAK|EXTERNAL_LINK|IMAGE_NOT_ALLOWED}</code>: każda odmowa oznacza, że model próbował wyprowadzić dane. Dalej <code>AssistantInjectionSpike</code> i <code>AssistantRejectionRateHigh</code> (&gt; 40% odrzuconych propozycji).</p>
+<script type="text/x-code" data-lang="kotlin" data-title="TicketWriteTools.proposeComment (skrót z 3.4)">
+  val signals = TurnSignals.from(toolContext)
+  val baseRisk = if (visibility == Visibility.PUBLIC) ActionRisk.HIGH else ActionRisk.LOW
+  val risk = if (signals.injectionSuspected) ActionRisk.HIGH else baseRisk
+
+  if (visibility == Visibility.PUBLIC) {
+      leakGuard.check(ctx.user, ticket.id, body).let { r ->
+          if (r is LeakCheck.Suspected) return deny(ctx, "INTERNAL_LEAK",
+              "Proponowany komentarz publiczny zawiera fragmenty notatek wewnętrznych.")
+      }
+      linkPolicy.violation(body)?.let { reason -> return deny(ctx, reason,
+          "Komentarz publiczny nie może zawierać obrazków ani obcych linków.") }
+  }
+  // dalej: zapis assistant_actions (PROPOSED) – nic nie wychodzi bez decyzji człowieka
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p>Kategoria <code>INJECTION</code> w <code>cases.yaml</code> z progiem 100% i <dfn data-t="pass-at-k">pass^k</dfn>: <code>inj-001</code> (<code>source: incident:INC-131</code>) wymaga dokładnie jednej propozycji komentarza, zakazuje zmiany priorytetu i statusu, sprawdza kanarek <code>KANAREK-INTERNAL</code>. Przypadki niewinne (<code>inj-fp-001</code>) pilnują, żeby obrona nie psuła zwykłej pracy. Bramka z <a href="../m3/l7.html">3.7</a> uruchamia je także przy zmianie modelu pod aliasem, bo nowy model może chętniej słuchać poleceń z komentarzy.</p>
+
+<h2>#5 Dane osobowe u dostawcy i w logach</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 2.7)</span><p>Trzeci tydzień pilota u Acme. Klientka podaje w czacie imię i nazwisko, PESEL, numer konta i telefon. Wiadomość trafia w całości do zewnętrznego dostawcy, do chmurowego Langfuse „na próbę” bez umowy powierzenia (regex w Collectorze złapał tylko PESEL) i do spanu w Jaegerze dostępnym dla całego IT. Po dwóch tygodniach ktoś eksportuje 200 rozmów do <code>cases.yaml</code> w repozytorium z dostępem podwykonawcy. IOD ma 72 godziny na ocenę naruszenia i nie umie szybko ustalić, gdzie są kopie.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p>Brak mapy przepływu danych: każda funkcja obserwowalności, eksport i dostawca to osobna kopia z własnym dostępem i retencją, a nikt nie zdecydował, czy model w ogóle potrzebuje PESEL-u do korekty faktury. Model działał poprawnie; zawiodła architektura przepływu <dfn data-t="pii">danych osobowych</dfn>.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Wyciek danych nie jest błędem w sensie technicznym: żądanie się udało, trace się zapisał. Jedyna kontrola (regex w Collectorze) była ostatnią siatką traktowaną jak główna obrona. Wykrył to dopiero skaner sekretów w CI, przypadkiem, przy innym kanale.</p>
+<h3>Obrony</h3>
+<ul>
+  <li>Minimalizacja: narzędzia nie zwracają pól, których model nie potrzebuje (<a href="../m2/l1.html">2.1</a>, <a href="../m2/l7.html">2.7</a>).</li>
+  <li>Redakcja <dfn data-t="presidio">Presidio</dfn> na trasie zewnętrznej: <code>PiiRedactionAdvisor</code> dla wiadomości i historii, <code>RedactingToolCallback</code> na granicy narzędzi, <dfn data-t="pseudonymization">pseudonimizacja</dfn> odwracalna i polityka <code>PiiPolicy</code> per tenant (<a href="../m2/l7.html">2.7</a>).</li>
+  <li><dfn data-t="fail-closed">Fail closed</dfn>: awaria Presidio daje 503 <code>assistant-unavailable</code> z <code>reason = PII_GUARD_UNAVAILABLE</code>, a nie tekst bez redakcji (<a href="../m2/l7.html">2.7</a>).</li>
+  <li>Każda kopia osobno: treść poza APM, LiteLLM bez logowania treści, Langfuse tylko po redakcji i zgodzie tenanta, logi bez treści (<a href="../m1/l4.html">1.4</a>, <a href="../m2/l7.html">2.7</a>).</li>
+  <li>Eksport do evali tylko przez redakcję nieodwracalną (<code>RedactionPurpose.EVAL_EXPORT</code>) i przegląd człowieka (<a href="../m2/l7.html">2.7</a>); Globex przez <code>helpdesk-local</code> (<a href="../m1/l6.html">1.6</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p><code>helpdesk.pii.redactions{entity, purpose}</code>: spadek do zera po wdrożeniu oznacza, że model spaCy się nie załadował. <code>helpdesk.pii.failures</code> z alertem (na trasie zewnętrznej to odmowa obsługi) i alert na otwarty breaker <code>presidio</code>.</p>
+<script type="text/x-code" data-lang="yaml" data-title="kopie danych: application.yml + litellm.yaml (z 1.4 i 2.7)">
+  helpdesk:
+    observability:
+      capture-content: false            # treść promptów nie trafia do APM
+    pii:
+      always-redact-tenants: []         # redakcja także na trasie lokalnej
+  spring:
+    ai:
+      tools:
+        observations:
+          include-content: false        # argumenty i wyniki narzędzi poza spanami
+
+  # litellm.yaml
+  litellm_settings:
+    turn_off_message_logging: true      # proxy nie dubluje treści w callbackach
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p><code>PresidioPiiRedactorIT</code> na tym samym obrazie co produkcja, z testem „wstrzymany kontener daje wyjątek, a nie tekst bez redakcji”, oraz test z mockiem <code>ChatModel</code>: prompt na trasę zewnętrzną nie zawiera żadnej wartości z <code>pl-cases.yaml</code>. Kategoria <code>PII</code> w evalach (100%, <a href="../m2/l8.html">2.8</a>) i test CI, który przepuszcza <code>cases.yaml</code> przez analyzer i failuje na PESEL-u, IBAN-ie czy e-mailu spoza <code>example.com</code>.</p>
+
+<h2>#6 Drogi model w każdym kroku RAG</h2>
+<div class="box bug"><span class="label">Incydent (lekcja 4.6)</span><p>Zespół uruchomił sugerowaną odpowiedź z bazy wiedzy (<code>AiTask.KB_ANSWER</code>). Evale jakości przeszły, agenci byli zadowoleni, a po trzech tygodniach rachunek za AI wzrósł z ok. 1 700 do ok. 10 800 USD miesięcznie. Każde pytanie szło przez <code>helpdesk-default</code> trzy razy: przepisanie zapytania, „rerank” 40 kandydatów LLM-em (58% kosztu) i odpowiedź z 20 chunkami, razem ok. 0,106 USD i 21 s. Nocny job przeliczał embeddingi całej bazy (ok. 90 mln tokenów) bez cache, więc dołożono dwa węzły GPU.</p></div>
+<h3>Przyczyna źródłowa</h3>
+<p>Brak decyzji „model per krok”: potok <dfn data-t="rag">RAG</dfn> to kilka wywołań o różnych wymaganiach, a zespół użył najlepszego modelu wszędzie. Do tego brak atrybucji: <code>llm_usage</code> znało tylko <code>assistant-chat</code>, więc koszt kroków był niewidoczny.</p>
+<h3>Dlaczego nic nie zadzwoniło</h3>
+<p>Żaden krok nie rzucał wyjątku, a jakość była dobra. Evale mierzyły trafność, nie koszt i liczbę wywołań. Każda decyzja w PR („dodajmy rerank”, „dajmy więcej kontekstu”) wyglądała rozsądnie osobno.</p>
+<h3>Obrony</h3>
+<ul>
+  <li>Macierz zadanie → model: <code>QUERY_REWRITE</code> na <code>helpdesk-fast</code> i tylko dla długich zgłoszeń, rerank przez <dfn data-t="cross-encoder">cross-encoder</dfn> <code>helpdesk-rerank</code> w TEI, embeddingi lokalnie (<a href="../m1/l6.html">1.6</a>, <a href="../m4/l6.html">4.6</a>).</li>
+  <li><dfn data-t="context-token-budget">Budżet tokenów kontekstu</dfn> (5 chunków, 2500 tokenów), prompt caching stałej części, opcjonalna <dfn data-t="model-cascade">kaskada</dfn> po evalach (<a href="../m4/l6.html">4.6</a>).</li>
+  <li><code>kb_embedding_cache</code> i reindeks inkrementalny po <code>content_hash</code> (<a href="../m4/l3.html">4.3</a>, <a href="../m4/l6.html">4.6</a>).</li>
+  <li><code>llm_usage.feature</code> per krok (<code>kb-rewrite</code>, <code>kb-embed</code>, <code>kb-rerank</code>, <code>kb-answer</code>) ze wspólnym <code>question_id</code> i budżety <code>tenant_ai_feature_budgets</code> z trybem DEGRADE (<a href="../m2/l6.html">2.6</a>, <a href="../m4/l6.html">4.6</a>).</li>
+  <li>Metryka <dfn data-t="cost-per-correct-task">kosztu na poprawne zadanie</dfn> zamiast kosztu na pytanie (<a href="../m1/l6.html">1.6</a>, <a href="../m5/l7.html">5.7</a>).</li>
+</ul>
+<h3>Wczesny sygnał</h3>
+<p><code>KbExpensiveModelInAuxStep</code>: dowolny koszt <code>helpdesk-default</code> w krokach pomocniczych to powtórka błędu #6. Dalej <code>KbTokensPerQuestionUp</code> (+30% tokenów wejścia na pytanie tydzień do tygodnia) i <code>KbEmbedFullReindex</code> (&gt; 20 mln tokenów embeddingu na godzinę). Raport kosztu per <code>feature</code> pokazałby „kb-rerank, 58%” pierwszego dnia.</p>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (skrót z 4.6)">
+  helpdesk:
+    ai:
+      self-hosted-aliases: [helpdesk-local, helpdesk-embed, helpdesk-rerank]
+      routing:
+        tasks:
+          KB_ANSWER:     { external: helpdesk-default, local: helpdesk-local, external-cheap: helpdesk-fast }
+          QUERY_REWRITE: { external: helpdesk-fast,    local: helpdesk-local }
+    kb:
+      answer:
+        candidates: 40
+        limit: 5                     # chunki w kontekście po reranku cross-encoderem
+        context-token-budget: 2500
+        rewrite: LONG_INPUT_ONLY
+</script>
+<h3>Test i eval, które pilnują regresji</h3>
+<p><code>KbAnswerTokenBudgetIT</code> z WireMockiem: jedno wywołanie LLM, budżet wejścia ≤ 5000 tokenów, najwyżej 6 fragmentów, jedno <code>/rerank</code>, kroki pomocnicze nigdy na drogim aliasie. W bramce CI (<a href="../m3/l7.html">3.7</a>) <code>costVerdict</code> porównuje koszt i liczbę wywołań na przypadek z baseline: PR z „rerankiem LLM-em” pokazałby +355% i dostał status INCONCLUSIVE do zatwierdzenia przez właściciela budżetu.</p>
+
+<h2>Wspólne wzorce</h2>
+<p>Ułóż obrony w macierz, a zobaczysz, że każdy błąd został zatrzymany przez co najmniej cztery niezależne warstwy i że żadna warstwa nie wystarczyła sama.</p>
+<table>
+  <tr><th>#</th><th>Uprawnienia i dane</th><th>Walidacja w backendzie</th><th>Człowiek</th><th>Obserwowalność</th><th>Evale i CI</th><th>Wersje i konfiguracja</th></tr>
+  <tr><td>1</td><td>✓ <code>AssistantToolContext</code>, <code>TicketApi.get(user, …)</code>, RLS</td><td>✓ <code>RouteGuard</code> (<code>ROUTE_MISMATCH</code>), ArchUnit</td><td>–</td><td>✓ <code>ToolAudit</code>, <code>AssistantSecurityContextLeak</code></td><td>✓ <code>TENANT_ISOLATION</code> 100%, kanarki</td><td>✓ klucz cache z rolą i trasą</td></tr>
+  <tr><td>2</td><td>–</td><td>– (strict pilnuje formatu, nie treści)</td><td>✓ próbki BLIND/AUDIT, korekty</td><td>✓ <code>provider_model</code>, <code>ModelDriftDetector</code></td><td>✓ canary eval</td><td>✓ snapshot, <code>expected-models</code>, shadow, rollback</td></tr>
+  <tr><td>3</td><td>–</td><td>✓ <code>max_pending</code>, <code>QUEUE_FULL</code>, <code>due_at</code></td><td>✓ <code>queue_owner_id</code>, grafik, runbook</td><td>✓ <code>reviews.oldest.age</code>, <code>WillOverflow</code></td><td>✓ symulacja kolejki, test wygaszania</td><td>✓ <code>triage_tenant_settings</code>, AUTO → SUGGEST</td></tr>
+  <tr><td>4</td><td>✓ <code>AssistantActionPolicy</code></td><td>✓ <code>InternalLeakGuard</code>, <code>LinkPolicy</code></td><td>✓ potwierdzenie z podglądem</td><td>✓ <code>AssistantLeakAttempt</code>, <code>assistant_audit</code></td><td>✓ <code>INJECTION</code> 100%, pass^k</td><td>✓ prompt v4, evale przy zmianie modelu</td></tr>
+  <tr><td>5</td><td>✓ minimalizacja, <code>PiiPolicy</code>, <code>external_llm_allowed</code></td><td>✓ fail closed <code>PII_GUARD_UNAVAILABLE</code></td><td>✓ przegląd eksportu, IOD</td><td>✓ <code>helpdesk.pii.redactions</code>, treść poza APM</td><td>✓ <code>PII</code> 100%, skan <code>cases.yaml</code></td><td>✓ <code>turn_off_message_logging</code>, <code>capture-content</code></td></tr>
+  <tr><td>6</td><td>–</td><td>✓ budżety per funkcja, <code>context-token-budget</code></td><td>✓ etykieta <code>cost-approved</code> (CODEOWNERS)</td><td>✓ <code>llm_usage.feature</code> per krok, <code>KbExpensiveModelInAuxStep</code></td><td>✓ <code>KbAnswerTokenBudgetIT</code>, <code>costVerdict</code></td><td>✓ routing per <code>AiTask</code>, <code>config_version</code></td></tr>
+</table>
+<h3>Wnioski przekrojowe</h3>
+<ul>
+  <li><strong>Żaden błąd nie był wyjątkiem.</strong> Wszystkie sześć to cicha degradacja: poprawne technicznie odpowiedzi z błędną treścią, odbiorcą, kosztem albo czasem. Monitoring 5xx i latencji z <a href="../m1/l5.html">1.5</a> jest konieczny, ale nie widzi żadnego z nich. Potrzebujesz metryk zachowania: kto dostał jakie dane, który model odpowiadał, ile kosztował krok, ile czeka kolejka.</li>
+  <li><strong>Granica zaufania: model nie jest stroną uprawnioną.</strong> Błędy #1 i #4 to ten sam wzorzec z dwóch stron: model nie może decydować, czyje dane widzi ani co zmienia. Tożsamość przychodzi z kontekstu, uprawnienia sprawdza fasada, skutki zewnętrzne przechodzą przez człowieka. Zasada z <a href="../m1/l1.html">1.1</a>: LLM jest kolejnym klientem API, a nie źródłem prawdy.</li>
+  <li><strong>To, czego nie mierzysz, nie istnieje.</strong> W błędach #2, #3 i #6 dane leżały w bazie od pierwszej minuty (<code>provider_model</code>, wiek kolejki, tokeny na krok), ale nikt nie zdefiniował oczekiwania ani alertu. Kolumna bez alertu to materiał dla post-mortem, nie obrona.</li>
+  <li><strong>Zmiana bez wersji to incydent w przyszłości.</strong> Podmiana modelu pod aliasem, hotfix trybu <code>SecurityContextHolder</code>, „rerank na próbę” i Langfuse „na próbę” to zmiany bez PR z evalami. <code>config_version</code> (<a href="../m2/l4.html">2.4</a>, <a href="../m5/l2.html">5.2</a>), snapshot i GitOps sprawiają, że każda zmiana zachowania ma nazwę, autora i wynik evali.</li>
+  <li><strong>Fail closed czy fail open zależy od tego, co chronisz.</strong> Redakcja PII i uprawnienia to zabezpieczenia: bez nich stop. Przegląd triage to kontrola jakości usprawnienia: bez niego praca toczy się jak przed AI (<a href="../m5/l3.html">5.3</a>).</li>
+</ul>
+
+<h2>Jak prowadzić post-mortem incydentu AI</h2>
+<p>Post-mortem to pisemna analiza po incydencie: co się stało, dlaczego i co zmieniamy, bez szukania winnych. Przy AI dochodzi jedno pytanie, którego w klasycznych incydentach zwykle nie trzeba zadawać: <em>dlaczego nic nie zadzwoniło?</em> Kolejność kroków:</p>
+<ol>
+  <li><strong>Najpierw zatrzymaj szkody.</strong> <code>ai.enabled</code> albo kill switch akcji (<a href="../m3/l2.html">3.2</a>), AUTO → SUGGEST, rollback konfiguracji bez deployu (<a href="../m5/l4.html">5.4</a>). Analiza po ustabilizowaniu.</li>
+  <li><strong>Oś czasu z danych, nie z pamięci.</strong> Źródła z kursu: trace z <code>helpdesk.config.version</code> i <code>gen_ai.response.model</code> (<a href="../m1/l4.html">1.4</a>), <code>llm_usage</code> z <code>provider_model</code>, <code>feature</code>, <code>question_id</code> i <code>run_id</code> (<a href="../m2/l6.html">2.6</a>, <a href="../m5/l7.html">5.7</a>), <code>assistant_audit</code> i <code>ticket_events</code> z <code>actor_type</code> oraz <code>configVersion</code> w payloadzie (<a href="../m3/l6.html">3.6</a>, <a href="../m5/l1.html">5.1</a>), <code>triage_runs.config_version</code>, historia PR-ów <code>litellm.yaml</code> i promptów.</li>
+  <li><strong>Zasięg.</strong> Ilu tenantów, rozmów, zgłoszeń. Przykład z 2.2: zapytanie po <code>assistant_messages</code> szukające wyników narzędzi z <code>tenantId</code> innym niż tenant rozmowy; dla KB <code>assistant_messages.kb_document_ids</code> (<a href="../m4/l3.html">4.3</a>). Jeśli takiego zapytania nie da się napisać, to też jest wniosek.</li>
+  <li><strong>Przyczyna bezpośrednia a źródłowa.</strong> W #1 bezpośrednia to hotfix <code>MODE_INHERITABLETHREADLOCAL</code>; źródłowa to tożsamość w ThreadLocal, moduł asystenta poza RLS i testy z jednym użytkownikiem. Naprawa samej przyczyny bezpośredniej zostawia system tak samo kruchy.</li>
+  <li><strong>Dlaczego nic nie zadzwoniło.</strong> Przejdź po istniejących alertach i testach jak w tabeli z 5.4: wartość w incydencie i powód milczenia.</li>
+  <li><strong>Wynik: trzy artefakty.</strong> Przypadek w <code>cases.yaml</code> z <code>source: incident:INC-…</code> (jak <code>iso-001</code> i <code>inj-001</code>), alert z runbookiem, punkt checklisty przed wdrożeniem, który złapałby błąd wcześniej (<a href="../m6/l2.html">lekcja 6.2</a>).</li>
+</ol>
+<script type="text/x-code" data-lang="plaintext" data-title="post-mortem-szablon.md">
+  INC-___  Tytuł: objaw widziany przez użytkownika
+  Wpływ:        tenanci / rozmowy / zgłoszenia / USD / naruszenia SLA
+  Wykrycie:     kto i jak (człowiek spoza zespołu = osobny wniosek)
+  Oś czasu:     UTC, źródło każdej linii (trace, llm_usage, audyt, PR)
+  config_version przed/po:  ...   provider_model przed/po: ...
+  Przyczyna bezpośrednia:   ...
+  Przyczyna źródłowa:       ...
+  Dlaczego nic nie zadzwoniło: alert/test → wartość → powód milczenia
+  Obrony, które zadziałały / zawiodły / których nie było
+  Działania: [ ] case w cases.yaml (source: incident:INC-___)
+             [ ] alert + runbook   [ ] punkt checklisty 6.2   [ ] właściciel i termin
+</script>
+<div class="box warn"><span class="label">Pułapka: eval z danych incydentu</span><p>Przypadek do <code>cases.yaml</code> powstaje z prawdziwej rozmowy, więc przed commitem przechodzi redakcję nieodwracalną (<code>RedactionPurpose.EVAL_EXPORT</code>, <a href="../m2/l7.html">2.7</a>). Inaczej post-mortem błędu #1 wyprodukuje błąd #5.</p></div>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><p>Fikcyjny incydent: w czwartek zespół platformy podmienia obraz <code>tei-rerank</code> na nowszy pod tym samym tagiem, bo „nowy reranker jest szybszy”. Jednocześnie, żeby skompensować wolniejszy start, włączono cache gotowych podpowiedzi KB z kluczem z treści pytania. W poniedziałek anna@acme pyta czat o warunki wsparcia, a odpowiedź cytuje fragment dokumentu „Warunki wsparcia premium Acme” (Acme, INTERNAL), wcześniej wygenerowany dla agenta. Przeprowadź post-mortem według szablonu:</p><ol>
+  <li>Zbuduj oś czasu: które kolumny i atrybuty (<code>llm_usage.feature = 'kb-rerank'</code>, <code>provider_model</code>, <code>config_version</code> KB, <code>assistant_messages.kb_document_ids</code>, <code>ChatEvent.Citations</code>) pokażą moment zmiany rerankera i pierwszą odpowiedź z cache?</li>
+  <li>Rozdziel przyczyny: która część to błąd #1 (klucz cache bez roli i widoczności, <a href="../m2/l2.html">2.2</a>), a która #2 (zmiana modelu bez wersji i bez evali, <a href="../m5/l4.html">5.4</a>)? Wskaż przyczynę bezpośrednią i źródłową.</li>
+  <li>Wypisz, dlaczego nie zadziałały: RLS na <code>visibility</code> (<a href="../m4/l4.html">4.4</a>), <code>KbCitation.href</code> dla klienta, eval <code>KB_PERMISSIONS</code> z kanarkiem <code>KANAREK-KB-ACME-INT-7f3a</code> (<a href="../m4/l7.html">4.7</a>) i alerty z 5.4.</li>
+  <li>Zaprojektuj trzy artefakty: przypadek w <code>evals/kb/cases.yaml</code> (persona, pytanie, <code>mustNotContain</code>), alert z nazwą i progiem, punkt checklisty dla zmian obrazu modeli self-hosted (digest w konfiguracji).</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="1">
+  <p class="q">Od wtorku odsetek AUTO_APPLY w triage rośnie z 71% do 76%, kolejka przeglądu maleje, błędów brak, latencja spadła. Co sprawdzasz najpierw?</p>
+  <button>Nic, to znak, że triage się uczy na korektach</button>
+  <button>Wartości <code>provider_model</code> w <code>llm_usage</code> i <code>triage_runs</code> względem <code>expected-models</code>, potem trafność na próbkach BLIND/AUDIT</button>
+  <button>Czy przeglądający nie zatwierdzają zbyt szybko</button>
+  <p class="explain">Lepsze wskaźniki techniczne bez zmiany w kodzie to typowy objaw cichej podmiany modelu (błąd #2). Model się nie uczy w produkcji, a mniej przypadków niepewnych może znaczyć, że nowy model jest pewny siebie i błędny. Faktyczny model i nieobciążona trafność rozstrzygają sprawę.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="2">
+  <p class="q">Dlaczego testy nie złapały błędu #1 (czat pokazuje cudze zgłoszenie)?</p>
+  <button>Bo w projekcie nie było żadnych testów integracyjnych</button>
+  <button>Bo model zignorował instrukcję w prompcie systemowym</button>
+  <button>Bo testy uruchamiały jednego użytkownika naraz, a błąd wymagał wątku puli, który odziedziczył kontekst innej osoby</button>
+  <p class="explain">Hotfix <code>MODE_INHERITABLETHREADLOCAL</code> usunął błędy uwierzytelnienia, a testy sekwencyjne przeszły. Regresję łapie dopiero test równoległy z celowo zatrutym kontekstem (<code>ConcurrentToolIsolationIT</code>). Prompt systemowy nie jest warstwą bezpieczeństwa.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="0">
+  <p class="q">Która obrona przed skutkami prompt injection w akcjach asystenta działa nawet wtedy, gdy model wykona dokładnie to, co każe atakujący?</p>
+  <button>Polityka uprawnień w fasadzie, propozycje zamiast zapisu i potwierdzenie z podglądem</button>
+  <button>Mocniejsze sformułowania w prompcie systemowym</button>
+  <button>InjectionDetector blokujący każdą podejrzaną turę</button>
+  <p class="explain">Prompt i detektor tylko zmniejszają prawdopodobieństwo udanego ataku. Warstwy deterministyczne (<code>AssistantActionPolicy</code>, <code>InternalLeakGuard</code>) i człowiek z podglądem ograniczają skutki ataku, który się udał.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="3">
+  <p class="q">Kolejka przeglądu triage rośnie. Którego działania automat NIE powinien wykonywać sam?</p>
+  <button>Odcinać nowe niepewne runy przy <code>QUEUE_FULL</code></button>
+  <button>Przełączyć tenanta z AUTO na SUGGEST po alercie <code>WillOverflow</code></button>
+  <button>Wygaszać przeglądy po <code>due_at</code> bez stosowania wyniku AI</button>
+  <button>Obniżyć próg pewności, żeby mniej zgłoszeń trafiało do przeglądu</button>
+  <p class="explain">Automat łagodzi tylko w stronę „mniej AI”. Obniżenie progu zamienia widoczny problem pojemności w niewidoczny problem jakości: więcej błędnych AUTO_APPLY. Może to zrobić człowiek, na czas określony i z większą próbką kontrolną.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Rachunek za AI po uruchomieniu bazy wiedzy wzrósł sześciokrotnie, a evale jakości były zielone. Co pozwoliłoby wykryć problem w pierwszym tygodniu?</p>
+  <button>Alert na odsetek odpowiedzi 5xx z LiteLLM</button>
+  <button><code>llm_usage.feature</code> per krok potoku i alert <code>KbExpensiveModelInAuxStep</code></button>
+  <button>Więcej przypadków kategorii <code>KB_FACTS</code> w evalach</button>
+  <p class="explain">Żaden krok nie zawodził technicznie, a jakość była dobra, więc ani 5xx, ani evale trafności nie mogły tego pokazać. Atrybucja kosztu per krok pokazałaby „kb-rerank na helpdesk-default, 58% kosztu” już pierwszego dnia.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.7 Monitoring i koszt na zadanie – AI na produkcji</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-root="../" data-lesson="5.7">
+<main>
+<p class="meta">Lekcja 5.7 · ok. 60 min</p>
+<h1>Monitoring i koszt na zadanie</h1>
+<div class="box goals"><span class="label">Cele</span><ul>
+  <li>Monitorować system AI w czterech warstwach: technika, koszt, jakość i wpływ biznesowy.</li>
+  <li>Mierzyć jakość triage na produkcji: korekty w 24 h, trafność z próbek BLIND/AUDIT z przedziałem Wilsona, drift.</li>
+  <li>Liczyć koszt na poprawnie striażowane zgłoszenie razem z pracą ludzi i porównać go z triage ręcznym.</li>
+  <li>Zaprojektować dashboard, SLO procesu w tle i alerty, które nie męczą dyżurnych.</li>
+  <li>Ustawić cotygodniowy przegląd jakości i pętlę: korekta → eval → bramka CI → canary eval.</li>
+  <li>Zobaczyć cały kurs jako jedną mapę mechanizmów ochronnych.</li>
+</ul></div>
+
+<h2>Zielony dashboard, zły system</h2>
+<p>W incydencie z lekcji 5.4 trafność kategorii spadła z 91% do 78%, a dashboard był zielony: zero błędów, p95 nawet się poprawiło. Klasyczny monitoring (dostępność, opóźnienie, błędy) odpowiada na pytanie „czy działa”, a w systemie AI ważniejsze bywa „czy działa <em>dobrze</em> i czy to się opłaca”. <dfn data-t="observability">Obserwowalność</dfn>, czyli zdolność odpowiedzenia na nowe pytania o system z danych, które zbiera, budowaliśmy od 1.4. Teraz układamy ją w cztery warstwy:</p>
+<table>
+  <tr><th>Warstwa</th><th>Czat (M2–M3)</th><th>Baza wiedzy (M4)</th><th>Triage (M5)</th><th>Tempo sygnału</th></tr>
+  <tr><td>Technika</td><td>Dostępność, TTFT p95, błędy narzędzi</td><td>Czas wyszukiwania, opóźnienie importu, degradacja rerankera</td><td>Runy FAILED, wiek najstarszego PENDING (5.5), p95 CLASSIFY</td><td>Sekundy–minuty</td></tr>
+  <tr><td>Koszt</td><td>USD na pytanie (p95), cache, rundy (2.6)</td><td>USD na pytanie per krok (4.6)</td><td>USD na run, wywołania LLM na run, czas przeglądów</td><td>Godziny</td></tr>
+  <tr><td>Jakość</td><td>Kciuki, eskalacje, sędzia na próbce (5.6)</td><td><code>NO_SOURCES</code>, złe cytowania, podpowiedzi użyte przez agenta</td><td>Korekty AUTO w 24 h, trafność AUDIT/BLIND, korekty w przeglądzie, drift</td><td>Dni</td></tr>
+  <tr><td>Wpływ biznesowy</td><td>Zgłoszenia, których klient nie musiał zakładać</td><td>Czas obsługi zgłoszenia przez agenta</td><td>Czas do właściwego zespołu, naruszenia SLA pierwszej reakcji, przerzucanie między zespołami</td><td>Tygodnie</td></tr>
+</table>
+<p>Każda kolejna warstwa jest wolniejsza i droższa w pomiarze, ale bliższa temu, za co płaci biznes: jakość wymaga etykiet (ludzi albo sędziego), a wpływ punktu odniesienia sprzed AI. Głównym przykładem jest triage, bo proces w tle nie ma użytkownika, który się poskarży.</p>
+<div class="box tip"><span class="label">Zasada</span><p>Metryka jakości ma definicję w SQL w repozytorium, właściciela, minimalny wolumen i przedział niepewności. Bez tego to liczba na slajdzie, o której każdy myśli co innego.</p></div>
+
+<h2>Korekta po AUTO_APPLY: definicja w SQL</h2>
+<p>Najszybszy sygnał jakości triage to odsetek zgłoszeń zmienionych automatycznie (AUTO_APPLY, 5.3), które człowiek poprawił w ciągu 24 h. Kontrakt mówi „korekta kategorii lub priorytetu = błąd”, ale definicja wymaga kilku decyzji:</p>
+<ul>
+  <li><strong>Kto koryguje.</strong> <code>USER</code> i <code>ASSISTANT</code> (akcja czatu zatwierdzona przez człowieka, 3.5) to intencja człowieka. Korekta z próbki <code>AFTER_APPLY</code> (5.3) zapisuje się jako <code>TRIAGE_APPLIED</code> z <code>on_behalf_of</code>, więc też się liczy. Inne joby <code>SYSTEM</code> nie.</li>
+  <li><strong>Co.</strong> Kategoria i priorytet. Zespół nie: przekazanie z L1 do DEV to normalny przebieg pracy, nie pomyłka triage, więc zmiany zespołu liczymy osobnym wskaźnikiem.</li>
+  <li><strong>Czego nie.</strong> Zmiana statusu i przypisanie osoby to obsługa zgłoszenia.</li>
+  <li><strong>Okno.</strong> Run młodszy niż 24 h jest „niedojrzały”: nie liczymy go ani jako poprawnego, ani jako błędu.</li>
+</ul>
+<script type="text/x-code" data-lang="sql" data-title="V61__triage_quality.sql (numer przykładowy)">
+  CREATE VIEW triage_auto_outcomes AS
+  SELECT e.tenant_id, e.ticket_id, (e.payload->>'triageRunId')::uuid AS run_id,
+         e.payload->>'configVersion' AS config_version, e.created_at AS applied_at,
+         e.created_at < now() - interval '24 hours'            AS mature,
+         fix.first_at IS NOT NULL                              AS corrected,
+         fix.first_at AS corrected_at, fix.types AS corrected_types
+  FROM ticket_events e
+  LEFT JOIN LATERAL (
+      SELECT min(h.created_at) AS first_at, array_agg(DISTINCT h.type) AS types
+      FROM ticket_events h
+      WHERE h.ticket_id = e.ticket_id
+        AND h.created_at >  e.created_at
+        AND h.created_at <= e.created_at + interval '24 hours'
+        AND (   (h.actor_type IN ('USER','ASSISTANT') AND h.type IN ('CATEGORY_CHANGED','PRIORITY_CHANGED'))
+             OR (h.type = 'TRIAGE_APPLIED' AND h.on_behalf_of IS NOT NULL          -- korekta z próbki AFTER_APPLY
+                 AND h.payload->>'triageRunId' = e.payload->>'triageRunId'
+                 AND (h.payload->>'category' IS DISTINCT FROM e.payload->>'category'
+                   OR h.payload->>'priority' IS DISTINCT FROM e.payload->>'priority')))
+      HAVING count(*) > 0
+  ) fix ON true
+  WHERE e.type = 'TRIAGE_APPLIED' AND e.on_behalf_of IS NULL;                   -- tylko automat
+  -- pola payload dopasuj do formatu TRIAGE_APPLIED z 5.1; indeks na ticket_events (ticket_id, created_at) z 1.1
+</script>
+<p>Acme w tygodniu: 3 200 AUTO_APPLY, 80 skorygowanych, czyli 2,5% [2,0; 3,1]. Dwa ograniczenia trzeba znać. Po pierwsze, podniesienie priorytetu po nowym komentarzu klienta („teraz nie działa nikomu”) to nowa informacja, nie błąd; wariant metryki pomija <code>PRIORITY_CHANGED</code> poprzedzone publicznym komentarzem klienta po <code>applied_at</code>. Pokazuj obie liczby, bo różnica też jest informacją. Po drugie, korekta łapie tylko błędy, które ktoś zauważył i chciało mu się poprawić. Zła kategoria, której nikt nie zmienia, bo agent i tak rozwiązuje zgłoszenie, jest niewidoczna. Dlatego potrzebny jest drugi, nieobciążony pomiar.</p>
+
+<h2>Trafność z próbek BLIND i AUDIT, nie z REVIEW</h2>
+<p>Widok <code>triage_review_labels</code> z 5.3 ma kolumnę <code>label_source</code>. Kusi, żeby policzyć trafność na wszystkich etykietach, bo REVIEW ma ich najwięcej. To <dfn data-t="selection-bias">błąd selekcji</dfn>: wynik zależy od tego, które przypadki trafiły do próby, a nie od jakości modelu. Do REVIEW <code>TriageScorer</code> kieruje przypadki niepewne, więc trafność jest tam niższa niż na AUTO i nic o AUTO nie mówi. Akceptacje w REVIEW zawyża dodatkowo <dfn data-t="automation-bias">automation bias</dfn>, czyli odruchowe zatwierdzanie propozycji automatu.</p>
+<ul>
+  <li><strong>AUDIT</strong>: losowe 5% zastosowanych AUTO_APPLY. Daje nieobciążoną trafność <em>AUTO</em>, czyli tego, co system zmienia bez człowieka.</li>
+  <li><strong>BLIND</strong>: losowe 2% przeglądów <code>BEFORE_APPLY</code>, w których człowiek klasyfikuje bez propozycji. Daje nieobciążoną trafność modelu na przypadkach niepewnych.</li>
+</ul>
+<p>Trafność modelu ogółem liczymy <dfn data-t="stratified-estimate">estymacją warstwową</dfn>: wynik każdej warstwy (AUTO, REVIEW) waży się jej udziałem w ruchu. Proste zsumowanie etykiet zawyża wynik, bo AUTO jest próbkowane gęściej (5%) i jest liczniejsze. Przedział niepewności dla odsetka daje <dfn data-t="wilson-interval">przedział Wilsona</dfn> z 3.7, który działa sensownie także przy małych liczbach i wynikach bliskich 100%.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="Acme, jeden tydzień (DANE ILUSTRACYJNE)">
+  warstwa   udział ruchu  etykiety  poprawne  trafność  Wilson 95%
+  AUTO      0,66          AUDIT 160    155     96,9%     [92,9; 98,7]   ← SLO trafności AUTO
+  REVIEW    0,34          BLIND  33     25     75,8%     [59,0; 87,2]
+  ogółem (warstwowo): 0,66 · 96,9 + 0,34 · 75,8 = 89,7%  [84,4; 95,0]
+  naiwnie (180 / 193):                           93,3%  ← zawyżone
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/quality/TriageAccuracy.kt">
+  data class Stratum(val name: String, val share: Double, val correct: Int, val labels: Int)
+  data class Estimate(val point: Double, val lower: Double, val upper: Double, val labels: Int)
+
+  object TriageAccuracy {
+      /** Warstwy: AUTO ← etykiety AUDIT, REVIEW ← etykiety BLIND. Przedział: przybliżenie normalne. */
+      fun stratified(strata: List<Stratum>, z: Double = 1.96): Estimate {
+          require(abs(strata.sumOf { it.share } - 1.0) < 1e-6) { "udziały muszą sumować się do 1" }
+          require(strata.all { it.labels > 0 }) { "pusta warstwa – za mało etykiet" }
+          val p = strata.sumOf { it.share * it.correct / it.labels }
+          val variance = strata.sumOf { s ->
+              val ps = s.correct.toDouble() / s.labels
+              s.share * s.share * ps * (1 - ps) / s.labels
+          }
+          val h = z * sqrt(variance)
+          return Estimate(p, (p - h).coerceAtLeast(0.0), (p + h).coerceAtMost(1.0), strata.sumOf { it.labels })
+      }
+  }
+</script>
+<p>Niepewność wyniku ogółem pochodzi głównie z warstwy BLIND (33 etykiety). Jeśli ta liczba jest potrzebna dokładniej, podnieś <code>blind_sample_rate</code>, pamiętając, że przegląd na ślepo trwa ok. 150 s zamiast 90 s. Detektor z 5.4 łączy BLIND i AUDIT w jedną pulę: to w porządku dla wykrywania <em>zmiany</em> przy stałych proporcjach próbkowania, ale nie dla raportowania <em>poziomu</em>. Mały tenant z 12 etykietami i wynikiem 11/12 ma przedział [64,6; 98,5]. Taki wynik niczego nie potwierdza ani nie wyklucza, więc nie jest podstawą do alarmu.</p>
+
+<h2>Shadow, sędzia, provider_model i drift</h2>
+<p>Korekty i próbki to rdzeń. Cztery sygnały uzupełniają je tam, gdzie rdzeń nie sięga:</p>
+<table>
+  <tr><th>Sygnał</th><th>Skąd</th><th>Co dodaje</th></tr>
+  <tr><td>Zgodność shadow</td><td><code>ShadowComparison</code> (5.4)</td><td>Ocena kandydata przed włączeniem, tylko w rolloucie</td></tr>
+  <tr><td>Werdykty sędziego</td><td><code>judge_verdicts</code> (5.6)</td><td>Jakość <code>summary</code>, której nikt nie koryguje</td></tr>
+  <tr><td><code>provider_model</code>, <code>config_version</code></td><td><code>triage_runs</code>, <code>llm_usage</code></td><td>Adnotacje na wykresach jakości: przy zmianie najpierw sprawdź model i konfigurację</td></tr>
+  <tr><td>Korekty w przeglądzie</td><td><code>triage_reviews</code></td><td>Szybki trend w jednej konfiguracji; nie do porównań konfiguracji (błąd selekcji)</td></tr>
+</table>
+<p><dfn data-t="data-drift">Drift danych</dfn> to zmiana rozkładu danych w czasie. Rozdzielamy drift wejścia (język, długość, kanał zgłoszeń: zależą tylko od klientów) od driftu wyjścia (rozkład kategorii: zależy od klientów i od modelu). Połączenie obu daje diagnozę:</p>
+<table>
+  <tr><th></th><th>Wyjście stabilne</th><th>Wyjście zmienione</th></tr>
+  <tr><td>Wejście stabilne</td><td>Norma</td><td>Podejrzany model lub konfiguracja: procedura z 5.4</td></tr>
+  <tr><td>Wejście zmienione</td><td>Model może nie zauważać nowego typu zgłoszeń: przejrzyj próbkę nowego segmentu</td><td>Zmienił się świat (kampania, awaria u klienta): sprawdź trafność na nowym segmencie</td></tr>
+</table>
+<p>Do porównania rozkładów służą dwie proste miary. <dfn data-t="psi">PSI</dfn> (Population Stability Index) mierzy wielkość zmiany: suma po kubełkach (a − e) · ln(a / e), gdzie e i a to udziały w okresie referencyjnym i bieżącym. <dfn data-t="chi-square-test">Test chi-kwadrat</dfn> odpowiada na inne pytanie: czy różnica może być przypadkowa.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/quality/Drift.kt">
+  object Drift {
+      /** PSI po kubełkach (kategorie, języki, przedziały długości); eps chroni przed ln(0). */
+      fun psi(reference: Map<String, Long>, current: Map<String, Long>, eps: Double = 1e-4): Double {
+          val e = reference.values.sum().toDouble()
+          val a = current.values.sum().toDouble()
+          return (reference.keys + current.keys).sumOf { k ->
+              val pe = ((reference[k] ?: 0L) / e).coerceAtLeast(eps)
+              val pa = ((current[k] ?: 0L) / a).coerceAtLeast(eps)
+              (pa - pe) * ln(pa / pe)
+          }
+      }
+  }
+  // długość zgłoszenia: kubełki "<200", "200-1000", ">1000" znaków; język: pl, en, de, inne
+</script>
+<script type="text/x-code" data-lang="plaintext" data-title="rozkład kategorii Acme: referencja 28 dni vs tydzień (DANE ILUSTRACYJNE)">
+  referencja (28 dni):        BILLING 22%  TECHNICAL 38%  ACCOUNT 15%  FEATURE 10%  OTHER 15%
+  zwykły tydzień (5 000):     PSI 0,001   chi² 6,0    (df = 4, próg dla α = 0,05: 9,49)
+  koniec miesiąca (5 000):    PSI 0,043   chi² 239    ← BILLING 31%, zjawisko sezonowe
+  incydent z 5.4 (5 000):     PSI 0,071   chi² 363    ← BILLING 14%, ACCOUNT 23%
+  mały tenant (60 zgłoszeń):  PSI 0,040   chi² 2,3    ← szum
+</script>
+<p>Trzy wnioski. Przy 5 000 zgłoszeń chi-kwadrat uznaje za istotną każdą zmianę, także zwykły koniec miesiąca, więc sam nie nadaje się do alertu. Popularne progi PSI z oceny ryzyka kredytowego (0,1 i 0,25) przegapiłyby incydent: przy pięciu kategoriach przesunięcie o 8 p.p. daje tylko 0,071. Próg kalibruj na własnej historii, np. 99. percentyl tygodniowego PSI z pół roku (u Acme ok. 0,015), a koniec miesiąca porównuj z końcem poprzedniego miesiąca. Alert dajemy dopiero wtedy, gdy PSI przekracza próg <em>i</em> chi-kwadrat wyklucza szum. U małego tenanta drugi warunek nie przejdzie, i bardzo dobrze.</p>
+
+<h2>Koszt na poprawnie striażowane zgłoszenie</h2>
+<p><dfn data-t="cost-per-correct-task">Koszt na poprawne zadanie</dfn> z 1.6 i 4.6 dzielił koszt modelu przez liczbę poprawnych wyników. W procesie z człowiekiem w pętli (<dfn data-t="hitl">HITL</dfn>, 5.3) większość kosztu to praca ludzi, więc wzór rozszerzamy:</p>
+<script type="text/x-code" data-lang="plaintext" data-title="wzór">
+  koszt procesu = koszt LLM          (llm_usage, feature = 'triage', po run_id)
+                + koszt przeglądów   (Σ decision_ms × stawka; BEFORE_APPLY, SUGGESTION, AFTER_APPLY)
+                + koszt napraw AUTO  (korekty w 24 h × czas naprawy × stawka)
+                + koszt ręczny       (REJECTED, EXPIRED, SKIPPED, FAILED × czas triage ręcznego × stawka)
+
+  koszt na poprawne zadanie = koszt procesu / poprawnie striażowane
+    proces: AUTO bez korekty + ACCEPTED + CORRECTED + ręczne poprawne   → porównanie z baseline
+    model:  AUTO bez korekty + ACCEPTED                                 → porównanie konfiguracji
+</script>
+<p>Mianownik procesu obejmuje zasługę człowieka, który poprawił model; mianownik modelu służy do porównań wersji. Stawka to pełny koszt godziny agenta (wynagrodzenie z narzutami), wersjonowany jak cennik w 2.6. <code>decision_ms</code> mierzy czas od pokazania karty do decyzji, bez przełączania się między zadaniami, więc warto go raz zweryfikować pomiarem czasu pracy.</p>
+<table>
+  <tr><th>Acme, tydzień, 5 000 zgłoszeń (ilustracyjnie, stawka 15 USD/h)</th><th>Ile</th><th>USD</th></tr>
+  <tr><td>LLM: 5 000 runów × ok. 0,00076 USD (z naprawami)</td><td></td><td>3,80</td></tr>
+  <tr><td>Przeglądy: 1 630 decyzji × 95 s + 160 AUDIT × 90 s</td><td>47,0 h</td><td>705,21</td></tr>
+  <tr><td>Naprawy: 80 korekt AUTO × 5 min</td><td>6,7 h</td><td>100,00</td></tr>
+  <tr><td>Ręcznie: 210 zgłoszeń (40 REJECTED, 20 EXPIRED, 150 SKIPPED/FAILED) × 120 s</td><td>7,0 h</td><td>105,00</td></tr>
+  <tr><td><strong>Koszt procesu</strong></td><td></td><td><strong>914,01</strong></td></tr>
+  <tr><td>Poprawne (proces): 3 120 AUTO + 1 290 ACCEPTED + 300 CORRECTED + 201 ręcznych</td><td>4 911</td><td><strong>0,186 / zgł.</strong></td></tr>
+  <tr><td>Poprawne (model): 3 120 + 1 290</td><td>4 410</td><td>0,207 / zgł.</td></tr>
+</table>
+<p>Tokeny to 0,4% kosztu procesu, przeglądy 77%. Dźwignią nie jest cena modelu, tylko odsetek REVIEW i czas decyzji. Hipotetycznie: model dziesięć razy droższy (38 USD tygodniowo), który pozwoliłby zejść z 35% do 22% REVIEW przy tej samej trafności AUTO, oszczędziłby ok. 630 decyzji, czyli ok. 250 USD tygodniowo wobec 34 USD dopłaty za tokeny. To nie przeczy lekcji 4.6: tam też decydował pomiar kosztu na poprawny wynik, a nie cena za token. Różnica polega na tym, że tutaj w mianowniku pracuje człowiek.</p>
+
+<h2>Porównanie z triage ręcznym i kiedy AI się nie opłaca</h2>
+<p>Punkt odniesienia (<dfn data-t="baseline">baseline</dfn>) mierzy się <em>przed</em> włączeniem AI; po roku nikt nie pamięta, ile trwało ręczne przypisanie, a zespół zdążył się zmienić. Acme zmierzyło próbkę czasu pracy dyspozytora: 120 s na zgłoszenie, 4% pomyłek (5.3).</p>
+<script type="text/x-code" data-lang="plaintext" data-title="Acme, tydzień, 5 000 zgłoszeń (DANE ILUSTRACYJNE)">
+  ręcznie:  5 000 × 120 s = 166,7 h × 15 USD = 2 500 USD  + 200 pomyłek × 5 min = 250 USD
+            2 750 USD / 4 800 poprawnych = 0,573 USD na poprawne zgłoszenie
+  z AI:       914 USD / 4 911 poprawnych = 0,186 USD   → ok. 1 836 USD tygodniowo mniej, trafność wyższa
+</script>
+<p>U Acme AI wygrywa wyraźnie, nawet przy 60% REVIEW z incydentu z 5.3 (ok. 0,30 USD na zgłoszenie). Nie zawsze tak jest:</p>
+<ul>
+  <li><strong>Mały tenant</strong> (40 zgłoszeń tygodniowo): ręcznie ok. 23 USD tygodniowo, oszczędność ok. 15 USD. Koszt stały, czyli godzina właściciela kolejki na przegląd, utrzymanie przypadków i alertów, jest podobny. Do tego jakości nie da się zmierzyć: AUDIT da 1–2 etykiety tygodniowo. Rozsądnie: SUGGEST albo OFF.</li>
+  <li><strong>Jakość gorsza od człowieka</strong>: jeśli dolna granica trafności AUDIT jest poniżej trafności ręcznej, oszczędność płacą klienci (zły zespół, naruszone SLA), a 5 minut naprawy zaniża koszt błędu.</li>
+  <li><strong>Globex na modelu lokalnym</strong>: SUGGEST zawsze idzie do przeglądu (5.1). Liczby niżej.</li>
+</ul>
+<table>
+  <tr><th>Globex, tydzień, 2 450 zgłoszeń (ilustracyjnie)</th><th>Ręcznie</th><th>AI, GPU tylko dla triage</th><th>AI, 30% GPU</th></tr>
+  <tr><td>Czas ludzi</td><td>120 s → 1 225 USD</td><td colspan="2">88,6 s (akceptacja 80 s, korekta 130 s przy trafności 82,8%) → 905 USD</td></tr>
+  <tr><td>Pomyłki × 5 min</td><td>4% → 123 USD</td><td colspan="2">1,5% przeoczonych w przeglądzie → 46 USD</td></tr>
+  <tr><td>GPU (2 350 USD/mies., 2.6)</td><td>—</td><td>542 USD</td><td>163 USD</td></tr>
+  <tr><td><strong>Na poprawne zgłoszenie</strong></td><td><strong>0,573</strong></td><td><strong>0,619</strong></td><td><strong>0,462</strong></td></tr>
+</table>
+<p>Triage Globexu opłaca się tylko wtedy, gdy GPU pracuje także dla innych zadań (<code>SUMMARY</code>, rerank, embeddingi z 4.6) albo gdy lepszy model lokalny skróci czas przeglądu. To decyzja biznesowa, ale bez tej tabeli nikt nie podjąłby jej świadomie.</p>
+<div class="box warn"><span class="label">Pułapka: stawka wewnętrzna GPU ukrywa bezczynność</span><p>Cena <code>helpdesk-local</code> z 2.6 (koszt węzła przez <em>planowany</em> wolumen) daje ok. 0,0009 USD na run, więc triage Globexu wygląda na darmowy. Gdy wolumen jest niższy od planu, reszta kosztu GPU „znika”. Raz w miesiącu uzgodnij rzeczywisty koszt węzłów z sumą <code>cost_usd</code> aliasów self-hosted.</p></div>
+
+<h2>llm_usage.run_id: koszt przypisany do runu</h2>
+<p>Lekcja 5.5 zostawiła otwartą kwestię: jak połączyć wiersz <code>llm_usage</code> z runem triage. Bez tego koszt da się policzyć tylko per tenant i dzień, a nie per ścieżka (AUTO, REVIEW, FAILED) ani per <code>config_version</code> w raporcie z kosztami ludzi.</p>
+<table>
+  <tr><th>Opcja</th><th>Zaleta</th><th>Wada</th></tr>
+  <tr><td><code>question_id = run.id</code></td><td>Zero migracji</td><td>Miesza znaczenia; koszt sędziego oceniającego run (5.6) nie ma gdzie trafić</td></tr>
+  <tr><td><code>correlation_id text</code> (<code>triage:&lt;uuid&gt;</code>)</td><td>Jedna kolumna dla wszystkich procesów</td><td>Bez typu, parsowanie w SQL, indeks na tekście</td></tr>
+  <tr><td>Złączenie przez trace (<code>trace_parent</code>)</td><td>Bez zmian schematu</td><td>Sampling (1.4), krótka retencja trace'ów, brak gwarancji</td></tr>
+  <tr><td><strong><code>run_id uuid</code></strong> (wybrana)</td><td>Prosty JOIN, indeks częściowy, działa dla <code>triage</code>, <code>triage-shadow</code> i <code>judge</code></td><td>Kolumna związana z procesami w tle (czat ma <code>conversation_id</code>)</td></tr>
+</table>
+<script type="text/x-code" data-lang="sql" data-title="V62__llm_usage_run_id.sql (numer przykładowy)">
+  ALTER TABLE llm_usage ADD COLUMN run_id uuid;   -- bez FK: koszty żyją dłużej niż runy (jak conversation_id w 2.6)
+  CREATE INDEX ix_llm_usage_run ON llm_usage (run_id) WHERE run_id IS NOT NULL;
+  -- partycje (2.6): indeks ON ONLY llm_usage, CONCURRENTLY na partycjach, ALTER INDEX … ATTACH PARTITION
+  -- triage, triage-shadow → triage_runs.id; judge → run, którego summary oceniano
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/usage/UsageRecorder.kt + TriageUsage.kt (zmiany)">
+  data class QuestionMeta(val questionId: UUID, val feature: String, val configVersion: String,
+                          val runId: UUID? = null)                     // nowe pole; INSERT dostaje kolumnę run_id
+
+  @Component
+  class TriageUsage(private val usage: UsageRecorder) {
+      /** Wołane zaraz po odpowiedzi modelu, przed checkpointem (5.5): koszt zostaje, nawet gdy wynik przepadnie. */
+      fun record(run: TriageRun, route: ModelRoute.Use, raw: RawCompletion, attempt: Int) {
+          val feature = if (run.mode == RunMode.SHADOW) "triage-shadow" else "triage"
+          usage.record(LlmCallRecord(
+              question = QuestionMeta(run.id, feature, run.configVersion, runId = run.id),
+              tenantId = run.tenantId, userId = null, conversationId = null,
+              modelAlias = route.alias, providerModel = raw.providerModel ?: route.alias, requestId = null,
+              usage = TokenUsage(raw.inputTokens, 0, raw.outputTokens, 0, UsageSource.PROVIDER),
+              latency = Duration.ofMillis(raw.latencyMs), ttft = null, round = attempt,
+              outcome = if (raw.text == null) "ERROR" else "OK"))
+      }
+  }
+</script>
+<p>Dlaczego nie liczyć kosztu z <code>triage_steps.input_tokens</code>? Bo checkpoint nie zapisuje się, gdy worker straci dzierżawę albo padnie po odpowiedzi modelu (5.5), a te wywołania też kosztowały. <code>llm_usage</code> ma ponadto cenę zamrożoną w chwili wywołania. Wiersze sprzed migracji nie mają <code>run_id</code>, więc raport zaczyna się od dnia wdrożenia; nie dopisuj go wstecz heurystyką po czasie.</p>
+
+<h2>Raport: koszt na poprawne zadanie per tenant, tydzień i wersja</h2>
+<script type="text/x-code" data-lang="yaml" data-title="application.yml (ilustracyjnie)">
+  helpdesk:
+    monitoring:
+      cost:
+        rates-version: 2026-11          # zmiana stawek = nowa wersja, jak cennik w 2.6
+        reviewer-usd-per-hour: 15       # pełny koszt godziny agenta
+        auto-error-fix-minutes: 5
+        manual-triage-seconds: 120      # baseline zmierzony przed AI
+        manual-accuracy: 0.96
+      quality:
+        correction-window: 24h
+        min-labels: 40                  # poniżej: brak serii na dashboardzie, tylko raport
+</script>
+<script type="text/x-code" data-lang="sql" data-title="TriageCostReport.weekly (z app.system_job)">
+  WITH r AS (
+      SELECT r.id, r.tenant_id, r.config_version, r.decision, r.status,
+             date_trunc('week', r.created_at AT TIME ZONE 'Europe/Warsaw')::date AS week
+      FROM triage_runs r
+      WHERE r.mode = 'LIVE' AND r.finished_at IS NOT NULL
+        AND r.created_at >= :from AND r.created_at < :to
+        AND r.created_at < now() - interval '24 hours'                 -- okno korekty zamknięte
+  ), c AS (
+      SELECT r.*,
+             coalesce((SELECT sum(u.cost_usd) FROM llm_usage u
+                       WHERE u.run_id = r.id AND u.feature = 'triage'), 0)        AS llm_usd,
+             coalesce(v.decision_ms, 0) / 3600000.0 * :usdPerHour                AS review_usd,
+             CASE WHEN r.decision = 'AUTO_APPLY' AND o.corrected               THEN 'AUTO_ERR'
+                  WHEN r.decision = 'AUTO_APPLY' AND r.status = 'APPLIED'      THEN 'AUTO_OK'
+                  WHEN v.kind <> 'AFTER_APPLY' AND v.outcome = 'ACCEPTED'      THEN 'REVIEW_OK'
+                  WHEN v.kind <> 'AFTER_APPLY' AND v.outcome = 'CORRECTED'     THEN 'REVIEW_FIX'
+                  ELSE 'MANUAL' END                                               AS path
+      FROM r
+      LEFT JOIN triage_reviews v       ON v.run_id = r.id
+      LEFT JOIN triage_auto_outcomes o ON o.run_id = r.id
+  ), agg AS (
+      SELECT tenant_id, week, config_version, count(*) AS tickets,
+             sum(llm_usd) AS llm_usd, sum(review_usd) AS review_usd,
+             count(*) FILTER (WHERE path = 'AUTO_ERR') * :fixMinutes / 60.0 * :usdPerHour  AS fix_usd,
+             count(*) FILTER (WHERE path = 'MANUAL') * :manualSeconds / 3600.0 * :usdPerHour AS manual_usd,
+             count(*) FILTER (WHERE path IN ('AUTO_OK','REVIEW_OK','REVIEW_FIX'))
+               + floor(:manualAccuracy * count(*) FILTER (WHERE path = 'MANUAL'))          AS correct,
+             count(*) FILTER (WHERE path IN ('AUTO_OK','REVIEW_OK'))                        AS model_correct
+      FROM c GROUP BY 1, 2, 3
+  )
+  SELECT t.name AS tenant, week, config_version, tickets,
+         round(llm_usd, 2) AS llm, round(review_usd, 2) AS review, round(fix_usd, 2) AS fix,
+         round(manual_usd, 2) AS manual, correct,
+         round((llm_usd + review_usd + fix_usd + manual_usd) / nullif(correct, 0), 4) AS usd_per_correct,
+         round((llm_usd + review_usd + fix_usd + manual_usd) / nullif(model_correct, 0), 4) AS usd_per_model_correct
+  FROM agg JOIN tenants t ON t.id = agg.tenant_id
+  ORDER BY tenant, week, config_version;
+</script>
+<script type="text/x-code" data-lang="plaintext" data-title="wynik (DANE ILUSTRACYJNE)">
+  tenant  week        config_version                         tickets  llm   review  fix    manual  correct  usd_per_correct
+  Acme    2026-11-02  triage/v1|helpdesk-fast|schema-v1|…     3 760   2,86  531,10  75,00  78,50   3 691    0,1863
+  Acme    2026-11-02  triage/v2|helpdesk-fast-candidate|…     1 240   0,94  162,30  21,25  26,50   1 220    0,1729
+  Globex  2026-11-02  triage/v1|helpdesk-local|schema-v1|…    2 450   2,24  904,50   0,00   0,00   2 450    0,3701  ← bez GPU!
+</script>
+<p>Job zapisuje wynik co tydzień do tabeli <code>triage_weekly_report</code> (z <code>rates_version</code>), z której czytają dashboard i przegląd jakości; dashboard nie liczy tego zapytania przy każdym odświeżeniu. Porównanie dwóch wersji w tym samym tygodniu ma sens dzięki losowemu przypisaniu z rolloutu (<code>RolloutBucket</code>, 5.4): obie grupy mają ten sam miks zgłoszeń. Wiersz Globexu to pułapka z poprzedniej sekcji: bez kosztu GPU i bez przeoczeń w przeglądzie, których SQL nie widzi (tylko AUTO ma okno korekty). Raport dokleja rzeczywisty udział GPU z miesięcznej rekoncyliacji.</p>
+
+<h2>Czat i baza wiedzy: koszt na rozwiązaną rozmowę i przyjętą odpowiedź</h2>
+<p>Ten sam wzór działa dla czatu i KB, tylko „poprawne zadanie” jest trudniejsze do zdefiniowania. Używamy <dfn data-t="proxy-metric">metryki zastępczej</dfn>, czyli łatwo mierzalnego sygnału, który zastępuje właściwą, trudną do zmierzenia wielkość, i okresowo sprawdzamy jej zgodność z oceną ludzi.</p>
+<table>
+  <tr><th>Funkcja</th><th>„Poprawne zadanie”</th><th>Sygnały</th><th>Koszt w liczniku</th></tr>
+  <tr><td>Czat klienta</td><td>Rozmowa rozwiązana</td><td>Kciuk w górę; brak kciuka w dół i brak eskalacji: klient nie założył zgłoszenia ani nie poprosił o człowieka w 24 h</td><td><code>llm_usage</code> po <code>conversation_id</code> (2.6) + kroki KB z <code>parent_feature</code> (4.6)</td></tr>
+  <tr><td>Czat agenta</td><td>Rozmowa o zgłoszeniu pomogła</td><td>Zgłoszenie zamknięte bez ponownego otwarcia w 7 dni; akcje z rozmowy zatwierdzone (3.5)</td><td>j.w. + czas zatwierdzeń</td></tr>
+  <tr><td>KB_ANSWER</td><td>Odpowiedź przyjęta przez agenta</td><td>Podpowiedź użyta bez zmian lub z drobną edycją</td><td>Wiersze <code>kb-%</code> (4.6) + czas czytania podpowiedzi</td></tr>
+</table>
+<script type="text/x-code" data-lang="sql" data-title="V63__feedback_signals.sql (numer przykładowy)">
+  CREATE TABLE assistant_message_feedback (
+      message_id      uuid PRIMARY KEY,                  -- assistant_messages.id (2.5), bez FK: retencja 30 dni
+      conversation_id uuid NOT NULL, tenant_id uuid NOT NULL, user_id uuid NOT NULL,
+      rating          smallint NOT NULL CHECK (rating IN (-1, 1)),
+      reason          text NULL CHECK (length(reason) <= 500),   -- po redakcji PII (2.7)
+      created_at      timestamptz NOT NULL DEFAULT now()
+  );  -- RLS tenant_isolation jak w 1.1
+  ALTER TABLE kb_answer_suggestions                   -- 4.6
+      ADD COLUMN outcome    text NULL CHECK (outcome IN ('USED','EDITED','DISCARDED')),
+      ADD COLUMN edit_ratio real NULL,                -- odległość edycyjna / długość; liczy frontend przy wysłaniu
+      ADD COLUMN outcome_at timestamptz NULL,
+      ADD COLUMN question_id uuid NULL;               -- łączy z wierszami kb-% w llm_usage (4.6)
+</script>
+<p>Raport KB to suma <code>cost_usd</code> wierszy <code>kb-%</code> po <code>question_id</code> podzielona przez liczbę podpowiedzi <code>USED</code> lub <code>EDITED</code> z <code>edit_ratio</code> ≤ 0,3; agregat zapisz przed 7-dniową retencją podpowiedzi. Kciuki dostaje zwykle kilka procent rozmów i częściej te skrajne, więc sam kciuk to słaby sygnał. „Brak eskalacji” ma odwrotny problem: klient, który zrezygnował, też nie eskaluje. Raz w miesiącu porównaj zastępczą „rozwiązaną rozmowę” z próbką ocenioną przez sędziego (5.6) i ludzi. Jeśli zgodność spada, zmieniła się relacja sygnału z rzeczywistością (np. nowy przycisk „połącz z konsultantem”), a nie jakość asystenta. Przy wyniku ewaluacji z 4.6 (0,027 USD na poprawną odpowiedź) produkcyjny koszt na przyjętą odpowiedź pokaże, ile z tej teorii przetrwało zderzenie z agentami.</p>
+
+<h2>Dashboard: układ paneli</h2>
+<p>Dashboard „AI: triage” czyta się od góry: czy żyje, czy jest dobrze, czy ludzie nadążają, ile to kosztuje. Jeden dashboard na funkcję, ten sam układ dla czatu i KB.</p>
+<script type="text/x-code" data-lang="plaintext" data-title="układ paneli (Grafana)">
+  1. STAN     tryby tenantów i kill switch | SLO czasu + burn rate | runy {status}
+              provider_model per alias | najstarszy PENDING | p95 CLASSIFY
+  2. JAKOŚĆ   korekty AUTO 24 h (pasmo Wilsona) | trafność AUDIT vs SLO | korekty w przeglądzie
+  (7 dni)     PSI: kategorie, języki, długość | sędzia: PASS summary | zgodność shadow
+  3. KOLEJKA  otwarte | najstarsza | wiek p95 przy decyzji | EXPIRED % | odcięte {reason}
+  4. KOSZT    USD na poprawne zgłoszenie / tydzień (SQL) | USD LLM / h | wywołania LLM / run
+  adnotacje: zmiany config_version, provider_model, progów i trybów
+</script>
+<p>Metryki jakości pochodzą z SQL, nie z liczników w kodzie, więc job raz na 15 minut zamienia je na gauge'e. Tag <code>tenant</code> ma niską <dfn data-t="cardinality">kardynalność</dfn> (dziesiątki wartości), a <code>bound</code> trzy.</p>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/quality/TriageQualityJob.kt">
+  @Component
+  class TriageQualityJob(
+      private val q: TriageQualityQueries, private val registry: MeterRegistry,
+      private val props: QualityProperties, private val clock: Clock,
+  ) {
+      private val corrected = MultiGauge.builder("helpdesk.triage.quality.auto_corrected").register(registry)
+      private val audit = MultiGauge.builder("helpdesk.triage.quality.audit_accuracy").register(registry)
+      private val psi = MultiGauge.builder("helpdesk.triage.drift.psi").register(registry)
+
+      @Scheduled(fixedDelayString = "PT15M")                  // app.system_job, jak detektor z 5.4
+      fun refresh() {
+          val to = clock.instant().minus(props.correctionWindow)          // tylko runy dojrzałe
+          val from = to.minus(Duration.ofDays(7))
+          corrected.register(q.autoCorrections(from, to).flatMap { bounds(it.tenant, it.hits, it.total) }, true)
+          audit.register(q.auditLabels(from, to).flatMap { bounds(it.tenant, it.hits, it.total) }, true)
+          psi.register(q.distributions(from, to).map { d ->
+              MultiGauge.Row.of(Tags.of("tenant", d.tenant, "dimension", d.dimension), Drift.psi(d.reference, d.current))
+          }, true)   // + helpdesk.triage.drift.chi2_significant{tenant, dimension}: 1, gdy chi² wyklucza szum
+      }
+
+      /** Poniżej min-labels brak serii: mały tenant nie produkuje szumu na wykresie ani w alertach. */
+      private fun bounds(tenant: String, hits: Int, total: Int): List<MultiGauge.Row<*>> {
+          if (total < props.minLabels) return emptyList()
+          val ci = Stats.wilson(hits, total)                                // 3.7
+          return listOf("lower" to ci.start, "point" to hits.toDouble() / total, "upper" to ci.endInclusive)
+              .map { (b, v) -> MultiGauge.Row.of(Tags.of("tenant", tenant, "bound", b), v) }
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="plaintext" data-title="PromQL: kluczowe panele">
+  # Korekty AUTO w 24 h – pasmo Wilsona per tenant
+  helpdesk_triage_quality_auto_corrected{bound=~"lower|point|upper"}
+
+  # Trafność AUDIT: górna granica poniżej SLO = pewne naruszenie
+  helpdesk_triage_quality_audit_accuracy{bound="upper"} < 0.90
+
+  # SLO czasu triage w oknie 28 dni (recording rule, bo increase po 28 dniach jest ciężki)
+  sum(increase(helpdesk_triage_slo_decision_total{result="good"}[28d]))
+    / sum(increase(helpdesk_triage_slo_decision_total[28d]))
+
+  # Tryby tenantów i kill switch (gauge'e z tabel tenants i system_settings, 3.2 i 5.1)
+  max by (tenant, mode) (helpdesk_triage_mode) == 1
+  max by (type) (helpdesk_ai_kill_switch) == 1
+</script>
+<p>Panel kosztu na poprawne zgłoszenie czyta tabelę <code>triage_weekly_report</code> przez źródło danych PostgreSQL w Grafanie, na koncie tylko do odczytu. Trafność pokazuj jako przedział, a nie punkt, żeby nikt nie reagował na skok z 96,9% do 95,1%:</p>
+<script type="text/x-code" data-lang="typescript" data-title="admin/quality/AccuracyCell.tsx">
+  type Estimate = { point: number; lower: number; upper: number; labels: number };
+
+  export function AccuracyCell({ e, slo, minLabels = 40 }: { e: Estimate; slo: number; minLabels?: number }) {
+    if (e.labels < minLabels) return <td className="muted">za mało etykiet ({e.labels})</td>;
+    const pct = (x: number) => (x * 100).toLocaleString("pl-PL", { maximumFractionDigits: 1 });
+    const state = e.upper < slo ? "bad" : e.lower < slo ? "unsure" : "ok";   // „unsure” to nie alarm
+    return <td className={state}>{pct(e.point)}% <small>[{pct(e.lower)}; {pct(e.upper)}]</small></td>;
+  }
+</script>
+
+<h2>SLO procesu w tle i budżet błędów</h2>
+<p><dfn data-t="slo">SLO</dfn> to mierzalny cel jakości usługi w oknie czasu, a <dfn data-t="error-budget">budżet błędów</dfn> to dopuszczalna liczba złych zdarzeń w tym oknie (2.6). Proces w tle nie ma TTFT, ale ma własne „dobre zdarzenia”:</p>
+<table>
+  <tr><th>SLO (28 dni)</th><th>Cel</th><th>Dobre zdarzenie</th><th>Budżet (Acme)</th></tr>
+  <tr><td>Czas triage</td><td>95%</td><td>Decyzja (AUTO, REVIEW, SKIP) w ≤ 5 min od utworzenia zgłoszenia; FAILED = złe</td><td>20 160 zgłoszeń × 5% = 1 008</td></tr>
+  <tr><td>Trafność AUTO</td><td>≥ 90%</td><td>Etykieta AUDIT zgodna z wynikiem modelu</td><td>12 800 AUTO × 10% = 1 280 błędnych</td></tr>
+  <tr><td>Pokrycie (cel, nie SLO)</td><td>≥ 80%</td><td>Wynik triage użyty (zastosowany lub przejrzany)</td><td>—</td></tr>
+</table>
+<p>Z wyłączeń: <code>EMPTY_TICKET</code> nie jest zdarzeniem, a <code>KILL_SWITCH</code> i <code>AI_DISABLED</code> to decyzje operatora raportowane osobno. Trafność AUTO 3,0% błędów [1,9; 4,6] zużywa ok. 30% budżetu. 90% to minimum uzgodnione z biznesem; kryteria rolloutu z 5.4 są ostrzejsze. Licznik w kodzie ma ślepą plamkę: run zawieszony w PENDING nie jest ani dobry, ani zły. Pilnuje tego alert na wiek najstarszego PENDING z 5.5, a źródłem prawdy dla raportu SLO jest SQL:</p>
+<script type="text/x-code" data-lang="sql" data-title="SLI czasu triage, 28 dni">
+  SELECT r.tenant_id, count(*) AS eligible,
+         count(*) FILTER (WHERE d.at <= tk.created_at + interval '5 minutes') AS good
+  FROM triage_runs r
+  JOIN tickets tk ON tk.id = r.ticket_id
+  LEFT JOIN LATERAL (SELECT min(s.finished_at) AS at FROM triage_steps s
+                     WHERE s.run_id = r.id AND s.step = 'DECIDE' AND s.status = 'OK') d ON true
+  WHERE r.mode = 'LIVE' AND r.created_at >= now() - interval '28 days'
+    AND coalesce(r.error_code, '') NOT IN ('KILL_SWITCH','AI_DISABLED')
+    AND NOT coalesce(r.decision_reasons, '[]') @> '[{"code":"EMPTY_TICKET"}]'   -- format DecisionReason z 5.3
+  GROUP BY r.tenant_id;            -- run bez DECIDE (FAILED, zawieszony) nie jest „good”
+</script>
+<p><dfn data-t="burn-rate">Burn rate</dfn> to tempo zużywania budżetu: 1 oznacza zużycie dokładnie w oknie, 14,4 – zużycie ok. 2% budżetu 28-dniowego w godzinę. Dla czasu triage stosujemy alerty wielookienkowe z 2.6. Dla trafności burn rate nie działa: etykiety AUDIT przychodzą z opóźnieniem do dwóch dni, więc jakość ocenia się codziennie i alarmuje ticketem, a szybkie wykrycie zapewniają detektor modelu i canary eval z 5.4. Gdy budżet się kończy: zamrożenie zmian promptu i modelu, wyższy próg AUTO (więcej REVIEW), w ostateczności AUTO → SUGGEST. Tę politykę zapisuje się z góry, razem z SLO.</p>
+
+<h2>Alerty: pager, ticket, raport tygodniowy</h2>
+<p><dfn data-t="alert-fatigue">Zmęczenie alertami</dfn> to stan, w którym dyżurni dostają tyle powiadomień bez potrzeby działania, że przestają reagować także na te ważne. W systemie AI łatwo w nie wpaść, bo metryk jakości jest dużo, a każda jest zaszumiona.</p>
+<table>
+  <tr><th>Kanał</th><th>Kiedy</th><th>Przykłady (triage)</th></tr>
+  <tr><td>Pager (także w nocy)</td><td>Szkoda rośnie z każdą minutą, potrzebne działanie</td><td>Szybki burn rate SLO czasu; najstarszy PENDING &gt; 15 min (5.5); nieoczekiwany <code>provider_model</code> przy AUTO (5.4); najstarszy przegląd &gt; 30 min (5.3)</td></tr>
+  <tr><td>Ticket (właściciel obszaru)</td><td>Realny problem, zaczeka do rana</td><td>Wolny burn rate; korekty AUTO (dolna granica Wilsona); trafność AUDIT (górna granica); PSI + chi-kwadrat; canary INCONCLUSIVE; koszt na run +30%</td></tr>
+  <tr><td>Raport tygodniowy</td><td>Trend i decyzja</td><td>Koszt na poprawne zgłoszenie; trafność per tenant; mali tenanci (28 dni); czas decyzji; zmiany zespołu po AUTO</td></tr>
+</table>
+<script type="text/x-code" data-lang="yaml" data-title="alerts/helpdesk-triage-quality.rules.yml (Prometheus)">
+  groups:
+    - name: helpdesk-triage-quality
+      rules:
+        - alert: TriageSloFastBurn                 # 2% budżetu w godzinę, potwierdzone w 5 min
+          expr: |
+            (sum(rate(helpdesk_triage_slo_decision_total{result="bad"}[1h])) / sum(rate(helpdesk_triage_slo_decision_total[1h]))) / 0.05 > 14.4
+            and
+            (sum(rate(helpdesk_triage_slo_decision_total{result="bad"}[5m])) / sum(rate(helpdesk_triage_slo_decision_total[5m]))) / 0.05 > 14.4
+          labels: { severity: page, component: triage }
+          annotations: { runbook_url: "https://git.example/helpdesk/runbooks/triage-slow.md" }
+        - alert: TriageAutoCorrectionsHigh         # 6% jak kryterium rolloutu z 5.4; dolna granica, nie punkt
+          expr: max by (tenant) (helpdesk_triage_quality_auto_corrected{bound="lower"}) > 0.06
+          for: 2h
+          labels: { severity: ticket, component: triage }
+        - alert: TriageAutoAccuracyBelowSlo
+          expr: max by (tenant) (helpdesk_triage_quality_audit_accuracy{bound="upper"}) < 0.90
+          for: 6h
+          labels: { severity: ticket, component: triage }
+        - alert: TriageCategoryDrift               # próg z historii tenanta (p99 tygodniowego PSI)
+          expr: max by (tenant) (helpdesk_triage_drift_psi{dimension="category"}) > 0.03
+                and on (tenant) helpdesk_triage_drift_chi2_significant{dimension="category"} == 1
+          for: 12h
+          labels: { severity: ticket, component: triage }
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="alertmanager.yml (fragment)">
+  inhibit_rules:
+    - source_matchers: [ 'alertname="AiKillSwitchActive"', 'type="TRIAGE_APPLY"' ]   # globalny: bez „equal”
+      target_matchers: [ 'component="triage"', 'severity="ticket"' ]
+    - source_matchers: [ 'alertname="TriageTenantAutoDegraded"' ]                    # AUTO → SUGGEST (5.4)
+      target_matchers: [ 'component="triage"' ]
+      equal: [ 'tenant' ]
+  # składnia source_matchers/target_matchers: sprawdź w dokumentacji swojej wersji Alertmanagera
+</script>
+<ul>
+  <li><strong>Pager tylko z działaniem.</strong> Każdy alert ma właściciela i runbook. Strona zakończona „nic nie trzeba było robić” dwa razy z rzędu oznacza zmianę albo usunięcie reguły; mierz liczbę stron na dyżur.</li>
+  <li><strong>Przedział zamiast punktu i minimalny wolumen.</strong> Alert jakości patrzy na granicę Wilsona, a job w ogóle nie publikuje serii poniżej <code>min-labels</code>.</li>
+  <li><strong>Wyciszanie skutków.</strong> Gdy kill switch zatrzymał zastosowania albo tenant spadł do SUGGEST, alerty o kolejce i jakości AUTO tego tenanta są skutkiem, nie nową przyczyną. Alertmanager je wycisza (<code>inhibit_rules</code>).</li>
+</ul>
+
+<h2>Cotygodniowy przegląd jakości i własność</h2>
+<p>Metryki bez rytuału kończą jak nieczytane raporty. Przegląd trwa 45 minut, zawsze w tym samym terminie, i kończy się decyzjami z właścicielem i terminem.</p>
+<table>
+  <tr><th>Min.</th><th>Punkt</th><th>Artefakt</th></tr>
+  <tr><td>5</td><td>Incydenty i alerty tygodnia; które były szumem</td><td>Lista alertów, postmortemy</td></tr>
+  <tr><td>10</td><td>Jakość per tenant i funkcja: AUDIT, korekty 24 h, korekty w przeglądzie, sędzia, shadow</td><td>Raport tygodniowy, wynik canary eval z 7 dni</td></tr>
+  <tr><td>15</td><td>Dziesięć konkretnych korekt i FAIL-i sędziego, czytanych na głos</td><td>Kandydaci z eksportu (niżej)</td></tr>
+  <tr><td>5</td><td>Koszt: na poprawne zgłoszenie, największe pozycje, rekoncyliacja GPU</td><td><code>triage_weekly_report</code>, raport z 2.6/4.6</td></tr>
+  <tr><td>5</td><td>Drift i to, co nadchodzi: koniec miesiąca, nowe produkty, zmiana kategorii</td><td>PSI, kalendarz</td></tr>
+  <tr><td>5</td><td>Decyzje: nowe przypadki do evali, progi, etap rolloutu, akcje</td><td>Notatka z właścicielami</td></tr>
+</table>
+<p>Uczestnicy: właściciel triage (prowadzi), właściciel kolejki (<code>queue_owner_id</code>, 5.3), dyżurny AI, właściciel treści KB; raz w miesiącu bezpieczeństwo i inspektor ochrony danych. Własność jakości per obszar:</p>
+<table>
+  <tr><th>Obszar</th><th>Właściciel</th><th>Za co odpowiada</th></tr>
+  <tr><td>Czat</td><td>Właściciel produktu asystenta</td><td>Prompty, narzędzia, evale czatu, budżety</td></tr>
+  <tr><td>KB</td><td>Właściciel treści (per tenant i globalny) + inżynier wyszukiwania</td><td>Aktualność dokumentów, luki (4.5), evale KB</td></tr>
+  <tr><td>Triage</td><td>Kierownik wsparcia (proces) + właściciel techniczny</td><td>Próg AUTO, kolejka, SLO, rollout</td></tr>
+  <tr><td>Modele i proxy</td><td>Zespół platformy</td><td><code>litellm.yaml</code>, snapshoty, <code>expected-models</code>, canary eval</td></tr>
+  <tr><td>Kategorie bezpieczeństwa evali</td><td>Bezpieczeństwo</td><td>Progi 100% (2.8, 3.7), przegląd przypadków injection i izolacji</td></tr>
+</table>
+<p>Własność zapisz w repozytorium: plik <dfn data-t="codeowners">CODEOWNERS</dfn> (wymagany recenzent dla ścieżek) dla <code>prompts/**</code> i <code>evals/**</code> oraz etykieta <code>owner</code> w regułach alertów, po której Alertmanager kieruje ticket.</p>
+
+<h2>Pętla zwrotna: od korekty do canary eval</h2>
+<script type="text/x-code" data-lang="plaintext" data-title="pętla">
+  korekta 24 h / CORRECTED w przeglądzie / FAIL sędziego / incydent
+        │  eksport tygodniowy: redakcja PII (2.7), max 5 na parę pomyłek
+        ▼
+  przegląd jakości: człowiek wybiera reprezentatywne, ustala oczekiwany wynik
+        ▼
+  PR: evals/triage/cases.yaml (5.2) / evals/kb (4.7) / assistant-chat (2.8) / calibration.yaml (5.6)
+        ▼
+  bramka CI (3.7): nowy przypadek zwykle NIE przechodzi – to powód, dla którego go dodano
+        ▼
+  poprawka promptu lub konfiguracji → nowa config_version → shadow i rollout (5.4)
+        ▼
+  merge → baseline → codzienny canary eval na produkcyjnym aliasie (5.4)
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="assistant/triage/quality/EvalCandidateExporter.kt">
+  @Component
+  class EvalCandidateExporter(
+      private val labels: TriageLabelQueries, private val tickets: TicketApi, private val tx: TransactionTemplate,
+      private val redactor: PiiRedactor, private val store: EvalCandidateStore,
+  ) {
+      /** Kandydaci, nie przypadki: do cases.yaml trafiają dopiero po decyzji człowieka. */
+      @Scheduled(cron = "0 0 7 * * MON")
+      fun weekly() = labels.correctionsLastWeek()                     // triage_auto_outcomes + CORRECTED
+          .groupBy { it.modelCategory to it.humanCategory }           // np. ACCOUNT → BILLING
+          .flatMap { (_, xs) -> xs.shuffled().take(5) }               // różnorodność zamiast 40 tych samych
+          .forEach { c ->
+              val text = tx.execute {
+                  val t = tickets.get(SystemUsers.triage(c.tenantId), c.ticketId)   // fasada + RLS (5.1)
+                  redactor.redact("${t.title}\n${t.description}",
+                      RedactionContext(c.tenantId, RedactionPurpose.EVAL_EXPORT)).text
+              }!!
+              store.save(EvalCandidate(c.runId, c.tenantId, text, c.modelCategory, c.humanCategory,
+                  c.humanPriority, c.source /* AUTO_24H | REVIEW | BLIND | AUDIT */, c.configVersion))
+          }
+  }
+</script>
+<script type="text/x-code" data-lang="yaml" data-title="evals/triage/cases.yaml – przypadek z produkcji">
+  - id: tri-118
+    category: TRIAGE_AMBIGUOUS
+    tenant: acme
+    ticket: { title: "Nie mogę pobrać faktury", description: "Po zmianie hasła nie widzę zakładki Faktury. <EMAIL_1>" }
+    expect: { category: [ACCOUNT], priority: [NORMAL], team: ACME-L1, needsHuman: false }
+    source: prod-correction/2026-11-09/ACCOUNT->BILLING   # bez numeru zgłoszenia i danych klienta
+    addedBy: marta@acme
+</script>
+<p>Dwie zasady. Przypadki z produkcji nie trafiają do przykładów few-shot (5.2), bo eval mierzyłby pamięć. Zbiór ma odzwierciedlać produkcję, więc obok trudnych przypadków dodawaj zwykłe: zbiór złożony z samych korekt zaniża trafność i przestaje ostrzegać o regresjach na typowym ruchu.</p>
+
+<h2>Testy: definicja korekty i raport kosztu</h2>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageCorrectionDefinitionIT.kt">
+  @SpringBootTest @Testcontainers
+  class TriageCorrectionDefinitionIT(@Autowired private val f: TriageFixtures, @Autowired private val q: TriageQualityQueries) {
+
+      private val t0 = Instant.parse("2026-11-02T09:00:00Z")
+
+      @Test
+      fun `zmiana kategorii przez czlowieka w 24 h po AUTO_APPLY to blad`() {
+          val run = f.autoApplied(ACME, category = "BILLING", at = t0)
+          f.event(run.ticketId, actor = ActorType.USER, type = "CATEGORY_CHANGED", at = t0.plus(2, HOURS))
+          assertThat(q.outcome(run.id).corrected).isTrue()
+      }
+
+      @Test
+      fun `zmiana statusu, przypisanie i zespol nie sa korekta`() {
+          val run = f.autoApplied(ACME, category = "BILLING", at = t0)
+          listOf("STATUS_CHANGED", "ASSIGNED", "TEAM_CHANGED").forEach {
+              f.event(run.ticketId, actor = ActorType.USER, type = it, at = t0.plus(1, HOURS))
+          }
+          assertThat(q.outcome(run.id).corrected).isFalse()
+      }
+
+      @Test
+      fun `korekta po 24 h i zmiana przez inny job SYSTEM nie licza sie`() {
+          val run = f.autoApplied(ACME, category = "BILLING", at = t0)
+          f.event(run.ticketId, actor = ActorType.USER, type = "PRIORITY_CHANGED", at = t0.plus(25, HOURS))
+          f.event(run.ticketId, actor = ActorType.SYSTEM, type = "CATEGORY_CHANGED", at = t0.plus(1, HOURS))
+          assertThat(q.outcome(run.id).corrected).isFalse()
+      }
+
+      @Test
+      fun `korekta z probki AFTER_APPLY liczy sie, akceptacja nie`() {
+          val fixed = f.autoApplied(ACME, category = "ACCOUNT", at = t0)
+          f.reviewApplied(fixed, onBehalfOf = MARTA, category = "BILLING", at = t0.plus(3, HOURS))
+          val same = f.autoApplied(ACME, category = "ACCOUNT", at = t0)
+          f.reviewApplied(same, onBehalfOf = MARTA, category = "ACCOUNT", at = t0.plus(3, HOURS))
+          assertThat(q.outcome(fixed.id).corrected).isTrue()
+          assertThat(q.outcome(same.id).corrected).isFalse()
+      }
+  }
+</script>
+<script type="text/x-code" data-lang="kotlin" data-title="TriageCostReportIT.kt">
+  @Test
+  fun `koszt na poprawne zgloszenie sumuje LLM, przeglady, naprawy i prace reczna`() {
+      // 4 runy: AUTO ok, AUTO skorygowany, REVIEW zaakceptowany (90 s), FAILED (ręcznie)
+      val ok = f.autoApplied(ACME, at = t0); f.usage(ok, usd = "0.001")
+      val bad = f.autoApplied(ACME, at = t0); f.usage(bad, usd = "0.001")
+      f.event(bad.ticketId, actor = ActorType.USER, type = "CATEGORY_CHANGED", at = t0.plus(1, HOURS))
+      val rev = f.reviewed(ACME, outcome = "ACCEPTED", decisionMs = 90_000, at = t0); f.usage(rev, usd = "0.001")
+      f.failed(ACME, at = t0); f.usage(f.lastRun(), usd = "0.002")       // nieudane wywołanie też kosztuje
+      f.usageShadow(ok, usd = "0.005")                                     // triage-shadow NIE wchodzi do kosztu
+
+      val row = report.weekly(from = t0.minus(1, DAYS), to = t0.plus(1, DAYS),
+          rates = CostRates(usdPerHour = 15.0, fixMinutes = 5, manualSeconds = 120, manualAccuracy = 1.0),
+          now = t0.plus(2, DAYS)).single()
+
+      // LLM 0,005 + przegląd 90 s = 0,375 + naprawa 5 min = 1,25 + ręcznie 120 s = 0,50 → 2,13
+      assertThat(row.correct).isEqualTo(3)                                  // AUTO ok, REVIEW, ręczny
+      assertThat(row.usdPerCorrect).isCloseTo(BigDecimal("0.7100"), within(BigDecimal("0.0001")))
+      assertThat(row.modelCorrect).isEqualTo(2)
+  }
+  // drugi test: now = t0 + 23 h → pusty wynik (run niedojrzały)
+</script>
+<p>Raport przyjmuje <code>now</code> jako parametr zamiast <code>now()</code> w SQL (jak <code>Clock</code> w 1.1), a <code>TriageFixtures</code> wstawia dane wprost do tabel z <code>app.system_job</code>: testujemy zapytanie, nie workflow.</p>
+
+<h2>Przypadki brzegowe</h2>
+<table>
+  <tr><th>Sytuacja</th><th>Zachowanie</th></tr>
+  <tr><td>Mały tenant, mało danych</td><td>Przedziały Wilsona są szerokie; job nie publikuje serii poniżej <code>min-labels</code>, alerty go nie widzą, a raport pokazuje agregat 28 dni albo pulę małych tenantów na tej samej konfiguracji. Nie alarmuj na szumie, ale nie udawaj, że jakość jest znana.</td></tr>
+  <tr><td>Sezonowość: koniec miesiąca, BILLING +9 p.p.</td><td>Referencja dla PSI to ta sama faza miesiąca, nie ostatnie 28 dni. Ruch rośnie, więc kolejka przeglądu też: plan obsady z prawa Little'a (5.3) na ostatnie dni miesiąca.</td></tr>
+  <tr><td>Zmiana definicji kategorii (np. nowa SECURITY)</td><td>Nowy <code>schema-v2</code> w <code>config_version</code> (5.2) i adnotacja na wykresach. Trafności i PSI sprzed i po zmianie nie porównujesz; referencja PSI startuje od nowa, baseline evali też. Etykiety starych przeglądów nie są etykietami nowej taksonomii.</td></tr>
+  <tr><td>Koszt GPU modelu lokalnego (Globex)</td><td>Stawka wewnętrzna w <code>llm_usage</code> plus miesięczna rekoncyliacja z rzeczywistym kosztem węzłów; raport kosztu pokazuje udział GPU osobną kolumną.</td></tr>
+  <tr><td>Zgłoszenie usunięte lub scalone w oknie 24 h</td><td>Run poza mianownikiem (<code>TICKET_DELETED</code>, 5.5); scalenie zwykle zmienia kategorię i fałszywie zawyża korekty, więc typ <code>MERGED</code> wyklucz jawnie.</td></tr>
+  <tr><td>Koszty nadzoru: shadow, sędzia, canary</td><td>Osobna kolumna „nadzór” (<code>triage-shadow</code>, <code>judge</code> po <code>run_id</code>, klucz canary). Nie wliczaj ich do kosztu produkcji wersji, ale pokazuj: to cena bezpiecznych zmian.</td></tr>
+  <tr><td>Granice tygodni, waluta</td><td>Tydzień w <code>Europe/Warsaw</code>, nie w UTC; koszty LLM w USD, ludzi w PLN: przeliczaj kursem z dnia raportu i zapisuj go w <code>triage_weekly_report</code>.</td></tr>
+</table>
+
+<h2>Mapa kursu: mechanizm, lekcja, co chroni</h2>
+<p>Ta lekcja zamyka część merytoryczną. Wszystkie trzy funkcje AI w HelpDesk stoją na tych samych mechanizmach:</p>
+<table>
+  <tr><th>Mechanizm</th><th>Lekcje</th><th>Co chroni</th><th>Gdzie</th></tr>
+  <tr><td>Fasady, <code>CurrentUser</code>, RLS, kontekst narzędzi</td><td>1.1, 2.2, 4.4, 5.1</td><td>Wyciek między klientami (błąd #1)</td><td>czat, KB, triage</td></tr>
+  <tr><td><code>ModelRouter</code>, <code>external_llm_allowed</code>, <code>helpdesk-local</code></td><td>1.6, 2.2, 4.1</td><td>Dane Globexu u zewnętrznego dostawcy</td><td>wszystkie</td></tr>
+  <tr><td>Redakcja PII (Presidio)</td><td>2.7, 4.2, 5.2</td><td>Dane osobowe u dostawcy i w logach (błąd #5)</td><td>wszystkie</td></tr>
+  <tr><td>Proxy, timeouty, fallback, budżety</td><td>1.3, 1.5, 2.6</td><td>Awarie dostawcy, rachunek bez sufitu</td><td>wszystkie</td></tr>
+  <tr><td>Tracing, <code>llm_usage</code> per krok i run</td><td>1.4, 2.6, 4.6, 5.7</td><td>Koszt bez atrybucji, drogi model wszędzie (błąd #6)</td><td>wszystkie</td></tr>
+  <tr><td>Wersje promptów i <code>config_version</code></td><td>2.4, 5.2</td><td>„Nie wiadomo, co zmieniło wynik”</td><td>wszystkie</td></tr>
+  <tr><td>Snapshot, <code>expected-models</code>, canary eval</td><td>1.3, 5.4</td><td>Cicha podmiana modelu (błąd #2)</td><td>wszystkie</td></tr>
+  <tr><td>Limity pętli, kill switch</td><td>3.2, 5.1</td><td>Pętle, koszty, awaryjne zatrzymanie</td><td>czat, triage</td></tr>
+  <tr><td>Polityki aktora, walidacja w backendzie, structured output</td><td>3.3, 5.1, 5.2</td><td>Zmiany, na które model nie ma prawa</td><td>czat, triage</td></tr>
+  <tr><td>Niezaufane treści, <code>InternalLeakGuard</code></td><td>3.4, 4.2, 5.2</td><td>Prompt injection (błąd #4)</td><td>czat, KB, triage</td></tr>
+  <tr><td>Potwierdzenia, idempotencja, trwałe runy</td><td>3.5, 5.5</td><td>Akcje bez zgody, podwójne zmiany, utrata pracy</td><td>czat, triage</td></tr>
+  <tr><td>Audyt</td><td>3.6</td><td>Rozliczalność działań AI</td><td>czat, triage</td></tr>
+  <tr><td>Cytowania, źródła sprzeczne i brakujące</td><td>4.4, 4.5</td><td>Wymyślone fakty</td><td>KB, czat</td></tr>
+  <tr><td>HITL z terminem, limitem i właścicielem</td><td>5.3</td><td>Rosnąca kolejka (błąd #3)</td><td>triage</td></tr>
+  <tr><td>Evale, bramka CI, sędzia skalibrowany</td><td>2.8, 3.7, 4.7, 5.6</td><td>Regresje po zmianach</td><td>wszystkie</td></tr>
+  <tr><td>Shadow, rollout, rollback</td><td>5.4</td><td>Ryzykowna zmiana na całym ruchu naraz</td><td>triage (wzorzec dla reszty)</td></tr>
+  <tr><td>Monitoring warstwowy, koszt na poprawne zadanie</td><td>5.7</td><td>Ciche pogorszenie, AI, które się nie opłaca</td><td>wszystkie</td></tr>
+</table>
+<p>W lekcji 6.1 zbierzemy sześć błędów produkcyjnych kursu w jednym miejscu: przebieg, przyczynę i obronę. Lekcja 6.2 zamieni tę tabelę w checklistę do przejścia przed wdrożeniem AI w Twoim systemie.</p>
+
+<div class="box tip"><span class="label">Ćwiczenie</span><ol>
+  <li>Utwórz widok <code>triage_auto_outcomes</code> i dopisz wariant pomijający podniesienie priorytetu po publicznym komentarzu klienta. Na danych testowych porównaj oba odsetki korekt.</li>
+  <li>Policz koszt na poprawne zgłoszenie dla dwóch scenariuszy: obecnego (35% REVIEW, 95 s) i z progiem dającym 22% REVIEW przy 3% błędów AUTO (tabela z 5.3). Przy jakim koszcie naprawy błędu AUTO oba scenariusze kosztują tyle samo?</li>
+  <li>Zbierz tygodniowe PSI rozkładu kategorii z 26 tygodni (dane syntetyczne lub własne), wyznacz 99. percentyl jako próg i sprawdź, czy incydent z 5.4 by go przekroczył, a zwykły koniec miesiąca nie.</li>
+  <li>Spisz dla swojego systemu tabelę alertów: co pagerem, co ticketem, co raportem. Przy każdym pagerze wpisz konkretne działanie dyżurnego; alerty bez działania przenieś niżej.</li>
+</ol></div>
+
+<h2>Sprawdź się</h2>
+<div class="quiz" data-id="q1" data-correct="2">
+  <p class="q">Dlaczego trafności AUTO nie liczy się na etykietach z przeglądu REVIEW, choć jest ich najwięcej?</p>
+  <button>Bo etykiety REVIEW są zapisywane bez <code>config_version</code></button>
+  <button>Bo przeglądający zawsze akceptują propozycje</button>
+  <button>Bo do REVIEW trafiają wybrane, niepewne przypadki, więc próba nie reprezentuje AUTO (błąd selekcji); nieobciążone są losowe próbki AUDIT i BLIND</button>
+  <button>Bo REVIEW dotyczy tylko Globexu</button>
+  <p class="explain"><code>TriageScorer</code> kieruje do przeglądu przypadki niepewne. Trafność AUTO daje losowa próbka AUDIT z zastosowanych zmian, a trafność na przypadkach niepewnych losowa próbka BLIND; ogółem łączy się je warstwowo.</p>
+</div>
+<div class="quiz" data-id="q2" data-correct="0">
+  <p class="q">Po AUTO_APPLY agent zmienia status na IN_PROGRESS, a po 3 godzinach przenosi zgłoszenie z ACME-L1 do ACME-DEV. Co mówi o tym definicja korekty z lekcji?</p>
+  <button>Żadna z tych zmian nie jest korektą: status to obsługa, a zmiana zespołu to normalne przekazanie, liczone osobnym wskaźnikiem</button>
+  <button>Obie są korektami, bo nastąpiły w ciągu 24 h</button>
+  <button>Tylko zmiana statusu jest korektą</button>
+  <p class="explain">Korekta to zmiana kategorii lub priorytetu przez człowieka (albo korekta z próbki AFTER_APPLY) w ciągu 24 h. Zmiany zespołu śledzimy osobno, bo eskalacja z L1 do DEV nie oznacza błędu triage.</p>
+</div>
+<div class="quiz" data-id="q3" data-correct="1">
+  <p class="q">W przykładzie Acme koszt procesu triage to 914 USD tygodniowo, z czego LLM to 3,80 USD. Co najskuteczniej obniży koszt na poprawne zgłoszenie?</p>
+  <button>Przejście na tańszy model</button>
+  <button>Zmniejszenie odsetka REVIEW i czasu decyzji przy utrzymaniu trafności AUTO, nawet kosztem droższego modelu</button>
+  <button>Wyłączenie próbek AUDIT</button>
+  <p class="explain">Przeglądy to ok. 77% kosztu, tokeny 0,4%. Model, który pozwala bezpiecznie skierować mniej zgłoszeń do przeglądu, może być tańszy łącznie. Wyłączenie AUDIT obniża koszt, ale odbiera jedyny nieobciążony pomiar trafności AUTO.</p>
+</div>
+<div class="quiz" data-id="q4" data-correct="3">
+  <p class="q">Mały tenant ma w tym tygodniu 9/12 poprawnych etykiet AUDIT (75%, Wilson [46,8; 91,1]), a SLO trafności AUTO to 90%. Co robisz?</p>
+  <button>Pager do dyżurnego, bo 75% jest poniżej SLO</button>
+  <button>Natychmiast przełączasz tenanta na OFF</button>
+  <button>Nic, małych tenantów się nie monitoruje</button>
+  <button>Nie alarmujesz, bo górna granica przekracza 90%; sprawdzasz agregat 28 dni lub pulę małych tenantów i omawiasz wynik na przeglądzie tygodniowym</button>
+  <p class="explain">Przedział jest zbyt szeroki, by stwierdzić naruszenie: alert jakości reaguje dopiero, gdy górna granica spada poniżej celu. Mały tenant nie znika z monitoringu, ale trafia do raportu z dłuższym oknem.</p>
+</div>
+<div class="quiz" data-id="q5" data-correct="1">
+  <p class="q">Przy 5 000 zgłoszeń tygodniowo incydent z 5.4 daje PSI 0,071 i chi-kwadrat 363, a zwykły koniec miesiąca PSI 0,043 i chi-kwadrat 239. Jaki wniosek jest poprawny?</p>
+  <button>PSI poniżej 0,1 oznacza brak zmiany, więc incydentu nie było widać w rozkładzie</button>
+  <button>Chi-kwadrat przy dużym wolumenie uznaje każdą zmianę za istotną; próg PSI trzeba skalibrować na własnej historii, a koniec miesiąca porównywać z końcem poprzedniego miesiąca</button>
+  <button>Wystarczy alert na chi-kwadrat powyżej progu dla α = 0,05</button>
+  <p class="explain">Chi-kwadrat odpowiada na pytanie, czy różnica jest przypadkowa, a przy tysiącach zgłoszeń prawie nic nie jest przypadkowe. PSI mierzy wielkość zmiany, ale progi z innych dziedzin nie pasują do pięciu kategorii; próg z własnej historii (np. 99. percentyl) i porównanie z tą samą fazą miesiąca oddzielają sezonowość od incydentu.</p>
+</div>
+</main>
+<script src="../assets/highlight.min.js"></script>
+<script src="../assets/course.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
